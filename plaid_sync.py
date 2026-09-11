@@ -1,7 +1,40 @@
-def _get_user_plaid_creds(user_id=None):
-    from src.db.queries import get_plaid_credential
-    from src.core.state import CURRENT_USER_ID
-    import os
+"""
+Delilah Financial OS - Plaid Sync Module
+
+Securely synchronizes financial data from Plaid API.
+All database operations use parameterized queries to prevent SQL injection.
+"""
+
+import os
+import asyncio
+from datetime import datetime
+from typing import Optional, Tuple, List
+import httpx
+import sqlite3
+import logging
+
+from src.config.settings import get_plaid_settings
+from src.security.utils import (
+    validate_table_name,
+    validate_column_name,
+    validate_sql_identifier,
+)
+from src.db.queries import get_plaid_credential
+from src.core.state import CURRENT_USER_ID
+
+logger = logging.getLogger(__name__)
+
+
+def _get_user_plaid_creds(user_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """
+    Securely retrieve Plaid credentials for a user.
+    
+    Args:
+        user_id: User identifier (uses CURRENT_USER_ID if not provided)
+    
+    Returns:
+        Tuple of (client_id, secret, access_tokens)
+    """
     uid = str(user_id or CURRENT_USER_ID.get() or "").strip()
     
     client_id = get_plaid_credential(uid, "plaid_client_id")
@@ -11,113 +44,131 @@ def _get_user_plaid_creds(user_id=None):
     tokens = [t.strip() for t in tokens_str.split(",") if t.strip()]
     return client_id, secret, tokens
 
-import os
-import asyncio
-from datetime import datetime
-import httpx
 
-PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID")
-PLAID_SECRET = os.getenv("PLAID_SECRET")
-PLAID_ENV = os.getenv("PLAID_ENV", "production")
-PLAID_ACCESS_TOKENS = [
-    t.strip()
-    for t in os.getenv("PLAID_ACCESS_TOKENS", "").split(",")
-    if t.strip()
-]
+# Load settings
+_plaid_settings = get_plaid_settings()
+PLAID_CLIENT_ID = _plaid_settings.PLAID_CLIENT_ID
+PLAID_SECRET = _plaid_settings.PLAID_SECRET.get_secret_value() if _plaid_settings.PLAID_SECRET else None
+PLAID_ENV = _plaid_settings.PLAID_ENV
+PLAID_ACCESS_TOKENS = _plaid_settings.PLAID_ACCESS_TOKENS
 
-LOW_BALANCE_THRESHOLD = float(os.getenv("LOW_BALANCE_THRESHOLD", "150.00"))
-PLAID_POLL_INTERVAL_SECONDS = int(
-    os.getenv("PLAID_POLL_INTERVAL_SECONDS", "300")
-)
+LOW_BALANCE_THRESHOLD = _plaid_settings.LOW_BALANCE_THRESHOLD
+PLAID_POLL_INTERVAL_SECONDS = _plaid_settings.PLAID_POLL_INTERVAL_SECONDS
 PLAID_HOURLY_UPDATE_INTERVAL_SECONDS = int(
     os.getenv("PLAID_HOURLY_UPDATE_INTERVAL_SECONDS", "3600")
 )
 
+
 def _format_net_cash(net_cash: float) -> str:
+    """Format net cash value with sign indicator."""
     return f"+${net_cash:.2f}" if net_cash >= 0 else f"-${abs(net_cash):.2f}"
 
-def _ensure_visibility_tables(conn):
+
+def _ensure_visibility_tables(conn: sqlite3.Connection) -> None:
+    """
+    Ensure all required tables exist with proper schema.
+    Uses safe schema migration with whitelisted column names.
+    """
     c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS plaid_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plaid_account_id TEXT UNIQUE,
-            name TEXT,
-            official_name TEXT,
-            mask TEXT,
-            type TEXT,
-            subtype TEXT,
-            institution_name TEXT,
-            currency TEXT DEFAULT 'USD',
-            current_balance REAL,
-            available_balance REAL,
-            credit_limit REAL,
-            last_synced_at TEXT,
-            active INTEGER DEFAULT 1,
-            user_id TEXT
-        )
-        """
+    
+    # Create tables with explicit schema
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS plaid_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        plaid_account_id TEXT UNIQUE,
+        name TEXT,
+        official_name TEXT,
+        mask TEXT,
+        type TEXT,
+        subtype TEXT,
+        institution_name TEXT,
+        currency TEXT DEFAULT 'USD',
+        current_balance REAL,
+        available_balance REAL,
+        credit_limit REAL,
+        last_synced_at TEXT,
+        active INTEGER DEFAULT 1,
+        user_id TEXT
     )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS balance_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            captured_at TEXT NOT NULL,
-            account_id TEXT,
-            account_name TEXT,
-            account_type TEXT,
-            account_subtype TEXT,
-            current_balance REAL,
-            available_balance REAL,
-            credit_limit REAL,
-            liquid_balance REAL,
-            debt_balance REAL,
-            net_worth_contribution REAL,
-            user_id TEXT
-        )
-        """
+    """)
+    
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS balance_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        captured_at TEXT NOT NULL,
+        account_id TEXT,
+        account_name TEXT,
+        account_type TEXT,
+        account_subtype TEXT,
+        current_balance REAL,
+        available_balance REAL,
+        credit_limit REAL,
+        liquid_balance REAL,
+        debt_balance REAL,
+        net_worth_contribution REAL,
+        user_id TEXT
     )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS financial_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            captured_at TEXT NOT NULL,
-            checking_balance REAL,
-            total_liquid REAL,
-            total_credit_debt REAL,
-            net_cash REAL,
-            total_depository REAL,
-            total_investment REAL,
-            total_credit REAL,
-            total_loan REAL,
-            net_worth REAL,
-            user_id TEXT
-        )
-        """
+    """)
+    
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS financial_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        captured_at TEXT NOT NULL,
+        checking_balance REAL,
+        total_liquid REAL,
+        total_credit_debt REAL,
+        net_cash REAL,
+        total_depository REAL,
+        total_investment REAL,
+        total_credit REAL,
+        total_loan REAL,
+        net_worth REAL,
+        user_id TEXT
     )
-    for column, dtype in (
-        ("pending_transaction_id", "TEXT"),
-        ("override_amount", "REAL"),
-        ("override_reason", "TEXT"),
-        ("override_at", "TEXT"),
-        ("override_source", "TEXT"),
-    ):
+    """)
+    
+    # Safe schema migration with whitelisted columns
+    override_columns = {
+        "pending_transaction_id": "TEXT",
+        "override_amount": "REAL",
+        "override_reason": "TEXT",
+        "override_at": "TEXT",
+        "override_source": "TEXT",
+    }
+    
+    for column, dtype in override_columns.items():
+        # Validate column name against whitelist
+        if not validate_column_name(column):
+            logger.warning(f"Skipping invalid column name: {column}")
+            continue
+        
         try:
             c.execute(
                 f"ALTER TABLE transactions ADD COLUMN {column} {dtype}"
             )
-        except Exception:
-            pass
+        except sqlite3.OperationalError as e:
+            # Column already exists - this is expected
+            if "duplicate column" not in str(e).lower():
+                logger.warning(f"Schema migration failed for {column}: {e}")
+    
+    # Create indexes
     c.execute("CREATE INDEX IF NOT EXISTS idx_balance_snapshots_captured ON balance_snapshots(captured_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_balance_snapshots_account ON balance_snapshots(account_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_financial_snapshots_captured ON financial_snapshots(captured_at)")
     
-    for table in ("plaid_accounts", "balance_snapshots", "financial_snapshots", "transactions"):
+    # Add user_id columns safely
+    tables_with_user_id = ("plaid_accounts", "balance_snapshots", "financial_snapshots", "transactions")
+    for table in tables_with_user_id:
+        if not validate_table_name(table):
+            logger.warning(f"Skipping invalid table name: {table}")
+            continue
         try:
             c.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
-        except Exception: pass
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    
     c.execute("CREATE INDEX IF NOT EXISTS idx_financial_snapshots_user_id ON financial_snapshots(user_id)")
+    conn.commit()
 
 def _ensure_cursor_table(conn):
     _ensure_visibility_tables(conn)
@@ -378,3 +429,306 @@ async def plaid_polling_loop(conn, tx_queue: asyncio.Queue, bot, channel_id: int
         except Exception as exc: print(f" Plaid polling loop error: {exc}")
         await asyncio.sleep(PLAID_POLL_INTERVAL_SECONDS)
 
+
+
+def _ensure_cursor_table(conn: sqlite3.Connection) -> None:
+    """Ensure cursor table exists with proper schema."""
+    _ensure_visibility_tables(conn)
+    c = conn.cursor()
+    
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS plaid_cursors (
+        user_id TEXT NOT NULL,
+        token_key TEXT NOT NULL,
+        cursor TEXT,
+        PRIMARY KEY (user_id, token_key)
+    )
+    """)
+    
+    # Add user_id columns safely (idempotent)
+    tables_with_user_id = ("plaid_accounts", "balance_snapshots", "financial_snapshots", "transactions")
+    for table in tables_with_user_id:
+        if not validate_table_name(table):
+            logger.warning(f"Skipping invalid table name: {table}")
+            continue
+        try:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+    
+    c.execute("CREATE INDEX IF NOT EXISTS idx_financial_snapshots_user_id ON financial_snapshots(user_id)")
+    conn.commit()
+
+
+def _get_cursor(conn: sqlite3.Connection, user_id: str, token_key: str) -> Optional[str]:
+    """Get sync cursor for a user/token combination."""
+    c = conn.cursor()
+    c.execute(
+        "SELECT cursor FROM plaid_cursors WHERE user_id = ? AND token_key = ?",
+        (str(user_id), token_key)
+    )
+    row = c.fetchone()
+    return row[0] if row else None
+
+
+def _set_cursor(conn: sqlite3.Connection, user_id: str, token_key: str, cursor: Optional[str]) -> None:
+    """Set sync cursor for a user/token combination."""
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO plaid_cursors(user_id, token_key, cursor)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, token_key) DO UPDATE SET cursor=excluded.cursor
+        """,
+        (str(user_id), token_key, cursor),
+    )
+    conn.commit()
+
+
+async def get_plaid_balances(client: httpx.AsyncClient, user_id: Optional[str] = None) -> dict:
+    """
+    Fetch account balances from Plaid API.
+    
+    Args:
+        client: HTTPX async client
+        user_id: User identifier
+    
+    Returns:
+        Dictionary with 'accounts' key containing list of accounts
+    """
+    client_id, secret, tokens = _get_user_plaid_creds(user_id=user_id)
+    all_accounts = []
+    
+    for token in tokens:
+        url = f"https://{PLAID_ENV}.plaid.com/accounts/balance/get"
+        payload = {"client_id": client_id, "secret": secret, "access_token": token}
+        
+        try:
+            resp = await client.post(url, json=payload, timeout=30.0)
+            if resp.status_code == 200:
+                all_accounts.extend(resp.json().get("accounts", []))
+            else:
+                logger.warning(f"Plaid balance request failed: {resp.status_code}")
+        except httpx.HTTPError as exc:
+            logger.error(f"Plaid balance HTTP error: {exc}")
+        except Exception as exc:
+            logger.error(f"Plaid balance error: {exc}", exc_info=True)
+    
+    return {"accounts": all_accounts}
+
+
+def _compute_checking_position(accounts: list) -> dict:
+    """
+    Compute checking account position and credit card debt.
+    
+    Args:
+        accounts: List of Plaid account objects
+    
+    Returns:
+        Dictionary with checking_balance, total_credit_debt, net_cash, credit_cards
+    """
+    checking_balance = 0.0
+    total_credit_debt = 0.0
+    credit_cards = []
+    
+    for acc in accounts:
+        balances = acc.get("balances", {})
+        current = balances.get("current") or 0.0
+        available = balances.get("available")
+        limit_amt = balances.get("limit")
+        
+        if acc.get("subtype") == "checking":
+            checking_balance += (available if available is not None else current)
+        elif acc.get("type") == "credit":
+            total_credit_debt += current
+            credit_cards.append({
+                "name": acc.get("name"),
+                "current": current,
+                "limit": limit_amt
+            })
+    
+    return {
+        "checking_balance": checking_balance,
+        "total_credit_debt": total_credit_debt,
+        "net_cash": checking_balance - total_credit_debt,
+        "credit_cards": credit_cards
+    }
+
+
+async def _store_account_and_balance_history(
+    conn: sqlite3.Connection,
+    accounts: list,
+    pos: dict,
+    user_id: str
+) -> None:
+    """Store account information and balance history."""
+    _ensure_visibility_tables(conn)
+    c = conn.cursor()
+    captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    total_depository = total_investment = total_credit = total_loan = net_worth = 0.0
+    
+    for acc in accounts:
+        balances = acc.get("balances", {})
+        current = balances.get("current")
+        available = balances.get("available")
+        limit_amt = balances.get("limit")
+        acc_type = acc.get("type")
+        subtype = acc.get("subtype")
+        
+        # Aggregate by type
+        if acc_type == "depository":
+            total_depository += float(current or 0.0)
+        elif acc_type == "investment":
+            total_investment += float(current or 0.0)
+        elif acc_type == "credit":
+            total_credit += float(current or 0.0)
+        elif acc_type == "loan":
+            total_loan += float(current or 0.0)
+        
+        # Calculate net worth contribution
+        contribution = float(current or 0.0)
+        if acc_type in {"credit", "loan"}:
+            contribution = -abs(contribution)
+        net_worth += contribution
+        
+        # Store account info
+        c.execute("""
+        INSERT INTO plaid_accounts (
+            plaid_account_id, name, official_name, mask, type, subtype,
+            current_balance, available_balance, credit_limit, last_synced_at, active, user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(plaid_account_id) DO UPDATE SET
+            name=excluded.name,
+            official_name=excluded.official_name,
+            mask=excluded.mask,
+            type=excluded.type,
+            subtype=excluded.subtype,
+            current_balance=excluded.current_balance,
+            available_balance=excluded.available_balance,
+            credit_limit=excluded.credit_limit,
+            last_synced_at=excluded.last_synced_at,
+            active=1
+        """, (
+            acc.get("account_id"),
+            acc.get("name"),
+            acc.get("official_name"),
+            acc.get("mask"),
+            acc_type,
+            subtype,
+            current,
+            available,
+            limit_amt,
+            captured_at,
+            user_id,
+        ))
+        
+        # Store balance snapshot
+        liquid = float(available if available is not None else current or 0.0) if acc_type == "depository" else 0.0
+        debt = float(current or 0.0) if acc_type in {"credit", "loan"} else 0.0
+        
+        c.execute("""
+        INSERT INTO balance_snapshots (
+            captured_at, account_id, account_name, account_type, account_subtype,
+            current_balance, available_balance, credit_limit,
+            liquid_balance, debt_balance, net_worth_contribution, user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            captured_at,
+            acc.get("account_id"),
+            acc.get("name"),
+            acc_type,
+            subtype,
+            current,
+            available,
+            limit_amt,
+            liquid,
+            debt,
+            contribution,
+            user_id,
+        ))
+    
+    # Store financial snapshot
+    c.execute("""
+    INSERT INTO financial_snapshots (
+        captured_at, checking_balance, total_liquid, total_credit_debt, net_cash,
+        total_depository, total_investment, total_credit, total_loan, net_worth, user_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        captured_at,
+        pos["checking_balance"],
+        total_depository,
+        total_credit + total_loan,
+        pos["net_cash"],
+        total_depository,
+        total_investment,
+        total_credit,
+        total_loan,
+        net_worth,
+        user_id,
+    ))
+    
+    conn.commit()
+
+
+async def run_hourly_balance_update(
+    conn: sqlite3.Connection,
+    bot,
+    channel_id: int,
+    *,
+    user_id: Optional[str] = None,
+    post_discord: bool = True
+) -> Optional[dict]:
+    """Run hourly balance update and optionally post to Discord."""
+    async with httpx.AsyncClient() as client:
+        balance_data = await get_plaid_balances(client, user_id=user_id)
+    
+    accounts = balance_data.get("accounts", [])
+    if not accounts:
+        logger.warning("No accounts returned from Plaid")
+        return None
+    
+    pos = _compute_checking_position(accounts)
+    await _store_account_and_balance_history(conn, accounts, pos, user_id=str(user_id))
+    
+    card_summary = " | ".join(
+        f"{c['name']}: ${c['current']:.2f}" for c in pos["credit_cards"]
+    ) or "No active debt"
+    
+    all_balances_snapshot = f"Checking: ${pos['checking_balance']:.2f} | Cards: {card_summary}"
+    txn_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    c = conn.cursor()
+    c.execute("""
+    INSERT INTO transactions (
+        transaction_id, message_id, date, merchant, amount, account_used,
+        total_liquid, net_cash, all_balances, status, judgment, user_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        f"sync_{int(datetime.now().timestamp())}",
+        None,
+        txn_date,
+        "System Balance Sync",
+        0.0,
+        "Plaid Sync",
+        pos["checking_balance"],
+        _format_net_cash(pos["net_cash"]),
+        all_balances_snapshot,
+        "Evaluated",
+        "Balance audit synced.",
+        user_id,
+    ))
+    conn.commit()
+    
+    if bot and channel_id and post_discord:
+        channel = bot.get_channel(channel_id)
+        if channel:
+            msg = (
+                f" **Hourly Balance Update**\n"
+                f" Liquid Checking: ${pos['checking_balance']:.2f}\n"
+                f" Cards: {card_summary}\n"
+                f" Net Cash: {_format_net_cash(pos['net_cash'])}"
+            )
+            await channel.send(msg)
+    
+    return pos

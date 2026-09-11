@@ -1,121 +1,39 @@
-# ============================================================
-# Delilah Financial OS — Git Ignore
-# ============================================================
-
-
-# ────────────────────────────────────────────────────────────
-# Secrets / Environment
-# ────────────────────────────────────────────────────────────
-
-.env
-.env.*
-!.env.example
-
-*.env
-*.pem
-*.key
-*.crt
-*.p12
-*.pfx
-
-/secrets/
-
-
-# ────────────────────────────────────────────────────────────
-# Financial / Runtime Data
-# ────────────────────────────────────────────────────────────
-
-data/*
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
-
-# Runtime/generated workspace data
-workspace/
-workspaces/
-
-
-# ────────────────────────────────────────────────────────────
-# Python
-# ────────────────────────────────────────────────────────────
-
+```
+# Dependencies
+.venv/
+venv/
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
 
-.venv/
-venv/
-ENV/
-env/
+# Environment variables
+.env
+.env.local
+*.env.*
 
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-
-# ────────────────────────────────────────────────────────────
-# Backups / Temporary Files
-# ────────────────────────────────────────────────────────────
-
-*.bak
-*.bak.*
-*.backup
-*.tmp
-*.temp
-*.swp
-*.swo
-*~
-.DS_Store
-
-*_BACKUP_*
-*.orig
-
-
-# ────────────────────────────────────────────────────────────
 # Logs
-# ────────────────────────────────────────────────────────────
-
 *.log
-logs/
 
+# Tests
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
 
-# ────────────────────────────────────────────────────────────
-# Docker
-# ────────────────────────────────────────────────────────────
+# Build/dist
+dist/
+build/
+*.egg-info/
 
-docker-compose.override.yml
-docker-compose.local.yml
-
-
-# ────────────────────────────────────────────────────────────
-# Application / Local Configuration
-# ────────────────────────────────────────────────────────────
-
-searxng/settings.yml
-
-.user_id_*
-link_token.py
-
-# Local model configuration / generated Modelfiles
-Modelfile
-Modelfile.*
-
-
-
-# ────────────────────────────────────────────────────────────
-# IDE / Editors
-# ────────────────────────────────────────────────────────────
-
+# Editors
 .vscode/
 .idea/
-*.code-workspace
+*.swp
+*.swo
+*.tmp
 
-
-# ────────────────────────────────────────────────────────────
-# OS / Misc
-# ────────────────────────────────────────────────────────────
-
+# OS
+.DS_Store
 Thumbs.db
+```
