@@ -1,0 +1,231 @@
+# Delilah / Financebot Docker Compose example
+#
+# Copy this file to docker-compose.yml and customize it for your environment:
+#
+#   cp docker-compose.yml.example docker-compose.yml
+#
+# Secrets and configuration belong in .env.
+# See .env.example for the available environment variables.
+
+networks:
+  # Internal-only networks used by Delilah and the sandbox.
+  financebot-internal:
+    driver: bridge
+    internal: true
+
+  # Network used by the sandbox package installer to reach the PyPI proxy.
+  sandbox-egress:
+    driver: bridge
+    internal: true
+
+  # Uncomment if you use an existing Nginx Proxy Manager installation
+  # that provides this external Docker network.
+  #
+  # nginx-proxy-manager_default:
+  #   external: true
+
+volumes:
+  ollama_data:
+  sandbox-packages:
+
+services:
+  delilah:
+    build: .
+    container_name: delilah_bot
+    restart: unless-stopped
+
+    volumes:
+      - ./data:/app/data
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - default
+      - financebot-internal
+      # Uncomment if using Nginx Proxy Manager:
+      # - nginx-proxy-manager_default
+
+    env_file:
+      - .env
+
+    hostname: "${HOSTNAME}"
+
+    environment:
+      - OLLAMA_URL=http://ollama:11434/api/chat
+      - SEARXNG_URL=http://searxng:8080/search
+      - SANDBOX_URL=http://sandbox:8100/execute
+      - SANDBOX_SHELL_URL=http://sandbox:8100/shell
+      - SANDBOX_INSTALL_URL=http://sandbox-installer:8100/install
+      - PYTHONUNBUFFERED=1
+
+      # Search/research configuration.
+      - SEARCH_CONCURRENCY=4
+      - SEARCH_SCRAPE_TOP_N=6
+      - SEARCH_HTTP_TIMEOUT=45
+      - MAX_SEARCH_ENGINES_PER_QUERY=4
+      - MAX_SEARCH_RESULTS_PER_ENGINE=10
+      - MAX_SEARCH_UNIQUE_RESULTS=20
+      - MAX_SEARCH_ATTEMPTS_PER_ITEM=6
+      - MAX_RESEARCH_CRAWL_PAGES_PER_ITEM=10
+      - MAX_RESEARCH_CRAWL_DEPTH=2
+      - MAX_RESEARCH_LINKS_PER_PAGE=10
+      - MAX_RESEARCH_QUEUE_SIZE=32
+      - SEARCH_CACHE_TTL_SECONDS=300
+      - RESEARCH_PAGE_CACHE_TTL_SECONDS=900
+
+      # Playwright is disabled by default.
+      # Uncomment/change these if you want browser-based page rendering.
+      - PLAYWRIGHT_ENABLED=0
+      - PLAYWRIGHT_HEADLESS=1
+      - PLAYWRIGHT_TIMEOUT_MS=18000
+      - PLAYWRIGHT_WAIT_MS=900
+      - PLAYWRIGHT_CONCURRENCY=2
+
+    ports:
+      - "8000:8000"
+
+  # Local PyPI proxy used by the sandbox package installer.
+  #
+  # The sandbox itself remains isolated from the public internet.
+  pypi-proxy:
+    image: ubuntu/squid:latest
+    container_name: financebot-pypi-proxy
+    restart: unless-stopped
+
+    networks:
+      - sandbox-egress
+      - default
+
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+
+  # Disposable Python execution sandbox.
+  #
+  # This container is intentionally isolated and has no direct external
+  # network access. It receives packages through sandbox-installer.
+  sandbox:
+    build:
+      context: .
+      dockerfile: ./sandbox/Dockerfile
+
+    container_name: financebot-sandbox
+    restart: unless-stopped
+
+    networks:
+      - default
+      - financebot-internal
+
+    environment:
+      - SANDBOX_DEFAULT_TIMEOUT=90
+      - SANDBOX_MAX_TIMEOUT=300
+      - SANDBOX_MEMORY_LIMIT_MB=1536
+      - SANDBOX_PACKAGES_DIR=/opt/packages
+      - SANDBOX_HOST_PROJECT_DIR=/host/project
+      - SANDBOX_HOST_DB_PATH=/host/data/finances.db
+
+    volumes:
+      - sandbox-packages:/opt/packages:ro
+
+    mem_limit: 3072m
+    cpus: 8.0
+    pids_limit: 256
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=256m
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+  # Installs Python packages into the shared sandbox package volume.
+  #
+  # This service has access to the PyPI proxy so packages can be installed,
+  # while the actual sandbox remains network-isolated.
+  sandbox-installer:
+    build:
+      context: .
+      dockerfile: ./sandbox/Dockerfile
+
+    container_name: financebot-sandbox-installer
+    restart: unless-stopped
+
+    networks:
+      - default
+      - sandbox-egress
+
+    environment:
+      - SANDBOX_PACKAGES_DIR=/opt/packages
+      - SANDBOX_INSTALL_TIMEOUT=120
+      - SANDBOX_INSTALL_TIMEOUT_MAX=300
+
+    volumes:
+      - sandbox-packages:/opt/packages
+
+    mem_limit: 1024m
+    cpus: 2.0
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=256m
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+  # Local SearXNG instance used for web search.
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./searxng:/etc/searxng:rw
+
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+
+    restart: unless-stopped
+
+  # Optional local Ollama inference server.
+  ollama:
+    image: ollama/ollama
+    restart: unless-stopped
+
+    # Ollama is reachable by Delilah through the Docker network at:
+    # http://ollama:11434/api/chat
+    #
+    # The port does NOT need to be exposed to the host for Delilah to use it.
+    #
+    # Uncomment if you want to access Ollama directly from the host or
+    # another machine:
+    #
+    # ports:
+    #   - "11434:11434"
+
+    environment:
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_CONTEXT_LENGTH=32768
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE_TYPE=q4_0
+      - OLLAMA_NUM_THREAD=16
+
+    volumes:
+      - ollama_data:/root/.ollama
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
