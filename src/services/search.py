@@ -991,8 +991,8 @@ async def search_searxng(
 
     engines = [
         "bing",
-        "brave",
-        "duckduckgo",
+        "yahoo",
+        "qwant",
         "google",
     ][:max(1, MAX_SEARCH_ENGINES_PER_QUERY)]
 
