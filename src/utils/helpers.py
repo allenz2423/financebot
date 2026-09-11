@@ -46,7 +46,7 @@ IMAGE_MAX_DIMENSION = int(os.getenv("IMAGE_MAX_DIMENSION", "1568"))
 IMAGE_JPEG_QUALITY = int(os.getenv("IMAGE_JPEG_QUALITY", "85"))
 MAX_IMAGES_PER_MESSAGE = int(os.getenv("MAX_IMAGES_PER_MESSAGE", "4"))
 
-import fitz  # PyMuPDF
+import pymupdf  # PyMuPDF
 
 async def _prepare_pdf_attachment(attachment: discord.Attachment) -> tuple[list[str], str]:
     raw = await attachment.read()
@@ -55,13 +55,13 @@ async def _prepare_pdf_attachment(attachment: discord.Attachment) -> tuple[list[
 
 def _extract_pdf_content(content: bytes) -> dict:
     try:
-        doc = fitz.open(stream=content, filetype="pdf")
+        doc = pymupdf.open(stream=content, filetype="pdf")
         text = ""
         images = []
         for i, page in enumerate(doc):
             text += page.get_text() + "\n"
             if i < PDF_MAX_PAGES:
-                pix = page.get_pixmap(matrix=fitz.Matrix(PDF_RENDER_SCALE, PDF_RENDER_SCALE))
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(PDF_RENDER_SCALE, PDF_RENDER_SCALE))
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 buf = BytesIO()
                 img.save(buf, format="JPEG", quality=IMAGE_JPEG_QUALITY)

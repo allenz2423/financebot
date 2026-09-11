@@ -161,6 +161,23 @@ conn.execute("PRAGMA busy_timeout=10000")
 conn.execute("PRAGMA journal_mode=WAL")
 conn.execute("PRAGMA synchronous=NORMAL")
 
+import threading
+from contextlib import contextmanager
+
+_thread_local = threading.local()
+
+@contextmanager
+def get_db():
+    """Thread-safe context manager for SQLite connection."""
+    if not hasattr(_thread_local, "conn"):
+        local_conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10.0)
+        local_conn.execute("PRAGMA busy_timeout=10000")
+        local_conn.execute("PRAGMA journal_mode=WAL")
+        local_conn.execute("PRAGMA synchronous=NORMAL")
+        _thread_local.conn = local_conn
+    
+    yield _thread_local.conn
+
 # The original transaction table is Plaid-managed after the initial baseline is
 # established. This mutable state is exposed to SQLite triggers through a
 # connection-level function so ONLY the Plaid sync path can write to it.
@@ -1043,7 +1060,7 @@ if c.fetchone()[0] == 0:
     conn.commit()
 
 
-__all__ = ['DB_PATH', 'SEARCH_CONCURRENCY', 'SEARCH_SCRAPE_MAX_CHARS', 'ACTIVE_ADVISOR_TASKS', 'MAX_SEARCH_ENGINES_PER_QUERY', 'STATUS_UPDATE_TASKS', 'SESSION_HISTORY_MAX_TURNS', 'DISCORD_TOKEN', 'DISCORD_CHANNEL_ID', '_ensure_column', 'MAX_SEARCH_RESULTS_PER_ENGINE', 'USER_INTERRUPTS', 'ADVISOR_FINAL_NUM_PREDICT', 'tx_queue', 'health_check', 'conn', 'SEARXNG_URL', 'app', 'PLAYWRIGHT_WAIT_MS', 'AUDIT_SESSION_STATE', '_decode_b64_arg', '_resolve_known_merchant', 'PDF_RENDER_SCALE', 'MAX_RESEARCH_LINKS_PER_PAGE', '_advisor_status_snapshot', 'load_history_on_boot', 'MAX_RESEARCH_FETCHES_PER_SEARCH', 'SUPPORTED_PDF_CONTENT_TYPES', 'ADVISOR_TASK_REGISTRATION_LOCK', 'CHAT_HISTORY_TURNS', 'MAX_TOTAL_TOOL_CALLS', 'ADVISOR_STATUS_LOCK', '_RESEARCHED_MERCHANTS', 'MAX_SEARCH_ATTEMPTS_PER_ITEM', 'ADVISOR_TOOL_NUM_PREDICT', 'ADVISOR_STATUS', 'MAX_TOOL_ROUNDS', 'ADVISOR_NUM_PREDICT', 'SEARCH_CACHE_TTL_SECONDS', 'ADVISOR_MODEL', 'OLLAMA_URL', '_merchant_key', 'DELILAH_BUILD', 'PLAYWRIGHT_ENABLED', 'JINA_API_KEY', 'MAX_TOOL_CALLS_PER_ROUND', 'bot', 'PLAID_SYNC_STATE', 'SESSION_HISTORY', 'MODEL_KEEP_ALIVE', 'PLAYWRIGHT_CONCURRENCY', 'c', 'MAX_RESEARCH_LEDGER_ITEMS', '_research_set', 'SEARCH_HTTP_TIMEOUT', 'PDF_MAX_PAGES', 'ADVISOR_NUM_CTX', 'RESEARCH_PAGE_CACHE_TTL_SECONDS', 'MAX_RESEARCH_CRAWL_PAGES_PER_ITEM', 'MAX_SEARCH_UNIQUE_RESULTS', 'SEARCH_SCRAPE_TOP_N', 'intents', '_set_advisor_status', 'MAX_RESEARCH_QUEUE_SIZE', 'PLAYWRIGHT_TIMEOUT_MS', 'STATUS_MESSAGES', 'MAX_RESEARCH_CRAWL_DEPTH', '_audit_remaining_from_result', '_original_count', 'PLAYWRIGHT_HEADLESS', 'SEARCH_TIME_RANGE']
+__all__ = ['get_db', 'DB_PATH', 'SEARCH_CONCURRENCY', 'SEARCH_SCRAPE_MAX_CHARS', 'ACTIVE_ADVISOR_TASKS', 'MAX_SEARCH_ENGINES_PER_QUERY', 'STATUS_UPDATE_TASKS', 'SESSION_HISTORY_MAX_TURNS', 'DISCORD_TOKEN', 'DISCORD_CHANNEL_ID', '_ensure_column', 'MAX_SEARCH_RESULTS_PER_ENGINE', 'USER_INTERRUPTS', 'ADVISOR_FINAL_NUM_PREDICT', 'tx_queue', 'health_check', 'conn', 'SEARXNG_URL', 'app', 'PLAYWRIGHT_WAIT_MS', 'AUDIT_SESSION_STATE', '_decode_b64_arg', '_resolve_known_merchant', 'PDF_RENDER_SCALE', 'MAX_RESEARCH_LINKS_PER_PAGE', '_advisor_status_snapshot', 'load_history_on_boot', 'MAX_RESEARCH_FETCHES_PER_SEARCH', 'SUPPORTED_PDF_CONTENT_TYPES', 'ADVISOR_TASK_REGISTRATION_LOCK', 'CHAT_HISTORY_TURNS', 'MAX_TOTAL_TOOL_CALLS', 'ADVISOR_STATUS_LOCK', '_RESEARCHED_MERCHANTS', 'MAX_SEARCH_ATTEMPTS_PER_ITEM', 'ADVISOR_TOOL_NUM_PREDICT', 'ADVISOR_STATUS', 'MAX_TOOL_ROUNDS', 'ADVISOR_NUM_PREDICT', 'SEARCH_CACHE_TTL_SECONDS', 'ADVISOR_MODEL', 'OLLAMA_URL', '_merchant_key', 'DELILAH_BUILD', 'PLAYWRIGHT_ENABLED', 'JINA_API_KEY', 'MAX_TOOL_CALLS_PER_ROUND', 'bot', 'PLAID_SYNC_STATE', 'SESSION_HISTORY', 'MODEL_KEEP_ALIVE', 'PLAYWRIGHT_CONCURRENCY', 'c', 'MAX_RESEARCH_LEDGER_ITEMS', '_research_set', 'SEARCH_HTTP_TIMEOUT', 'PDF_MAX_PAGES', 'ADVISOR_NUM_CTX', 'RESEARCH_PAGE_CACHE_TTL_SECONDS', 'MAX_RESEARCH_CRAWL_PAGES_PER_ITEM', 'MAX_SEARCH_UNIQUE_RESULTS', 'SEARCH_SCRAPE_TOP_N', 'intents', '_set_advisor_status', 'MAX_RESEARCH_QUEUE_SIZE', 'PLAYWRIGHT_TIMEOUT_MS', 'STATUS_MESSAGES', 'MAX_RESEARCH_CRAWL_DEPTH', '_audit_remaining_from_result', '_original_count', 'PLAYWRIGHT_HEADLESS', 'SEARCH_TIME_RANGE']
 
 import contextvars
 CURRENT_USER_ID = contextvars.ContextVar('current_user_id', default='1')

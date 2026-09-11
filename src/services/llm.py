@@ -35,6 +35,10 @@ from src.utils.helpers import *
 from src.services.search import *
 from src.services.gmail import *
 from src.db.queries import *
+from src.services.negotiator import generate_negotiation_script
+from src.services.rewards import recommend_best_card
+from src.services.portfolio import calculate_rebalancing_drift
+from src.services.price_drop import analyze_price_drop_and_draft_refund
 from src.services.monitor import (
     list_monitor_rules,
     add_monitor_rule,
@@ -2066,6 +2070,70 @@ BOT_TOOLS_SCHEMA = [
                 }
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_negotiation_script",
+            "description": "Generates a negotiation script for calling customer retention.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service_name": {"type": "string", "description": "The name of the service to negotiate"},
+                    "competitor_name": {"type": "string", "description": "Optional name of a competitor offering a better rate"},
+                    "competitor_price": {"type": "number", "description": "Optional price of the competitor's service"}
+                },
+                "required": ["service_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recommend_best_card",
+            "description": "Recommends the best credit card to use based on the purchase category to maximize rewards.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "The category of the purchase (e.g., dining, travel, groceries)"},
+                    "merchant": {"type": "string", "description": "Optional merchant name"}
+                },
+                "required": ["category"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_rebalancing_drift",
+            "description": "Calculates the drift of the current portfolio allocation against a target allocation and returns recommended trades.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "current_allocation": {"type": "object", "description": "Dict mapping asset symbol to current value"},
+                    "target_allocation": {"type": "object", "description": "Dict mapping asset symbol to target percentage (0.0 to 1.0)"},
+                    "total_portfolio_value": {"type": "number", "description": "The total value of the portfolio"}
+                },
+                "required": ["current_allocation", "target_allocation", "total_portfolio_value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_price_drop_and_draft_refund",
+            "description": "Analyzes a potential price drop for a recent purchase and drafts a refund request to the merchant.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_name": {"type": "string", "description": "The name of the item purchased"},
+                    "merchant": {"type": "string", "description": "The merchant where the item was purchased"},
+                    "purchase_price": {"type": "number", "description": "The original purchase price"},
+                    "current_price": {"type": "number", "description": "The current lower price of the item"}
+                },
+                "required": ["item_name", "merchant", "purchase_price", "current_price"]
+            }
+        }
     }
 ]
 
@@ -2153,6 +2221,10 @@ EXPECTED_TOOL_NAMES = {
     "get_sinking_funds_overview",
     "apply_transaction_roundups",
     "generate_financial_digest",
+    "generate_negotiation_script",
+    "recommend_best_card",
+    "calculate_rebalancing_drift",
+    "analyze_price_drop_and_draft_refund"
 }
 
 if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
@@ -5304,6 +5376,34 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             period=str(p_val) if p_val else "monthly",
                             days=int(d_val) if d_val else None,
                             user_id=uid
+                        )
+                    elif func_name == "generate_negotiation_script":
+                        db_result = generate_negotiation_script(
+                            user_id=uid,
+                            service_name=args.get("service_name"),
+                            competitor_name=args.get("competitor_name"),
+                            competitor_price=args.get("competitor_price")
+                        )
+                    elif func_name == "recommend_best_card":
+                        db_result = recommend_best_card(
+                            user_id=uid,
+                            category=args.get("category"),
+                            merchant=args.get("merchant")
+                        )
+                    elif func_name == "calculate_rebalancing_drift":
+                        db_result = calculate_rebalancing_drift(
+                            user_id=uid,
+                            current_allocation=args.get("current_allocation"),
+                            target_allocation=args.get("target_allocation"),
+                            total_portfolio_value=args.get("total_portfolio_value")
+                        )
+                    elif func_name == "analyze_price_drop_and_draft_refund":
+                        db_result = analyze_price_drop_and_draft_refund(
+                            user_id=uid,
+                            item_name=args.get("item_name"),
+                            merchant=args.get("merchant"),
+                            purchase_price=args.get("purchase_price"),
+                            current_price=args.get("current_price")
                         )
                     elif func_name == "get_net_worth_history":
                         db_result = get_net_worth_history(
