@@ -1,5 +1,16 @@
+from src.core.discovery import explore_domain, list_domains
+from src.core.verification import verify_claim
+from src.db.memory import semantic_search_memory, save_epistemic_memory
+from src.core.temporal import get_temporal_projection
+from src.db.prefs import get_user_timezone, set_user_timezone
 import src.core.state
 import json
+from src.core.discovery import explore_domain, list_domains
+from src.core.verification import verify_claim
+from src.db.memory import semantic_search_memory, save_epistemic_memory
+from src.core.temporal import get_temporal_projection
+from src.db.prefs import get_user_timezone, set_user_timezone
+
 import os
 import re
 import mimetypes
@@ -659,6 +670,129 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "set_user_timezone",
+            "description": "Set the user's personal timezone for date/time context and reminder scheduling.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {"type": "string", "description": "IANA timezone string, e.g. America/Los_Angeles"}
+                },
+                "required": ["timezone"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_timezone",
+            "description": "Get the user's personal timezone.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+
+
+    {
+        "type": "function",
+        "function": {
+            "name": "get_temporal_projection",
+            "description": "Deterministically simulate the ledger forward in time to calculate projected balances and low-water marks. Unlocks 'What-If' planning.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_ahead": {"type": "integer", "description": "Number of days to simulate (e.g., 30, 90)."}
+                }
+            }
+        }
+    },
+
+
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search_memory",
+            "description": "Query the structured Epistemic Memory system using semantic meaning. Retrieves facts, preferences, hypotheses, and goals.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer", "description": "Number of results to retrieve (default 5)."},
+                    "min_confidence": {"type": "number", "description": "Minimum confidence threshold (0.0 to 1.0). Use higher for hard facts, lower for hypotheses."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_epistemic_memory",
+            "description": "Save a structured memory with strict provenance and confidence. Do not save speculations as hard facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "memory_type": {"type": "string", "enum": ["fact", "preference", "event", "goal", "decision", "pattern", "hypothesis"]},
+                    "provenance_type": {"type": "string", "enum": ["user_stated", "llm_inferred", "deterministic_calculation"]},
+                    "confidence": {"type": "number", "description": "Confidence from 0.0 to 1.0"},
+                    "evidence_refs": {"type": "array", "items": {"type": "string"}, "description": "JSON array of evidence strings (e.g. 'Transaction ID 123', 'User chat on 2026-09-11')"}
+                },
+                "required": ["content", "memory_type", "provenance_type", "confidence"]
+            }
+        }
+    },
+
+
+    {
+        "type": "function",
+        "function": {
+            "name": "explore_domain",
+            "description": "Hierarchical Tool Discovery: explore a domain to find relevant capabilities and tools. Pass 'all' to return the entire registry at once.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "domain": {"type": "string"}
+                },
+                "required": ["domain"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_tool_schemas",
+            "description": "Hierarchical Tool Discovery: load the full JSON schemas for one or more tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_names": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["tool_names"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_claim",
+            "description": "The Verification Layer: Verify a factual/numerical claim against the deterministic database using a SQL SELECT query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "sql_query": {"type": "string", "description": "Deterministic SQLite SELECT query to verify the claim. The schema includes tables like transactions, balance_snapshots, savings_buckets, etc. IMPORTANT: You MUST use 'user_id = ?' and the system will auto-inject the correct user."}
+                },
+                "required": ["claim", "sql_query"]
+            }
+        }
+    },
+
     {
         "type": "function",
         "function": {
@@ -1891,8 +2025,15 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_scheduled_reminders",
-            "description": "List all currently scheduled/pending reminders with their IDs, trigger times, and instructions.",
-            "parameters": {"type": "object", "properties": {}},
+            "description": "Search or list scheduled/pending reminders. Can filter by keyword or time window.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "search_term": {"type": "string", "description": "Optional keyword to filter instructions."},
+                    "days_ahead": {"type": "integer", "description": "Optional limit to reminders firing within X days."},
+                    "limit": {"type": "integer"}
+                }
+            },
         }
     },
     {
@@ -2004,6 +2145,14 @@ BOT_TOOLS_SCHEMA = [
                 },
                 "required": ["rule_id"]
             }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "monitor_clear_all_rules",
+            "description": "Delete all monitor rules and alerts for the user. Use this when the user asks to reset or clear all monitors.",
+            "parameters": {"type": "object", "properties": {}}
         }
     },
     {
@@ -2224,7 +2373,16 @@ EXPECTED_TOOL_NAMES = {
     "generate_negotiation_script",
     "recommend_best_card",
     "calculate_rebalancing_drift",
-    "analyze_price_drop_and_draft_refund"
+        "analyze_price_drop_and_draft_refund",
+    "explore_domain",
+    "load_tool_schemas",
+    "verify_claim",
+    "semantic_search_memory",
+    "save_epistemic_memory",
+    "get_temporal_projection",
+    "set_user_timezone",
+    "get_user_timezone",
+    "monitor_clear_all_rules"
 }
 
 if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
@@ -2509,6 +2667,13 @@ async def _chat_with_delilah_impl(
 Your job is to provide accurate, actionable financial assistance while treating internal model knowledge as untrusted. Database/tool results are authoritative for the user's financial data. External facts must be verified with web tools.
 
 ==================================================
+CONCURRENT TOOL EXECUTION (BATCHING)
+==================================================
+
+You are HIGHLY ENCOURAGED to execute multiple disjoint tool calls concurrently in a single turn.
+If you need to fetch from multiple domains, do multiple web searches, read multiple memories, or run independent verifications, DO NOT run them sequentially one by one. You must output ALL independent tool calls simultaneously in a single response.
+
+==================================================
 CORE OPERATING LOOP
 ==================================================
 
@@ -2769,7 +2934,7 @@ RUNTIME CONTRACT:
 - Do not mutate records merely to investigate them.
 """
 
-    current_time = datetime.now(ZoneInfo(src.core.state.TIMEZONE)).strftime(
+    current_time = datetime.now(ZoneInfo(get_user_timezone(uid))).strftime(
         "%A, %B %d, %Y at %I:%M %p %Z"
     )
     # Financial context is intentionally NOT built for Gmail-only turns.
@@ -3204,21 +3369,12 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 if tool["function"]["name"] in allowed
             ]
 
+        core_tools = {"explore_domain", "load_tool_schemas", "verify_claim", "end_turn"}
         if not _audit_is_active():
-            # Gmail-only turns are isolated at the tool-schema boundary.
-            # Do not expose financial, mutation, sandbox, memory, or audit
-            # tools to the model when the user's request is Gmail/email-only.
             if context_policy["gmail_only"]:
-                gmail_allowed = {
-                    "search_gmail",
-                    "end_turn",
-                }
-                return [
-                    tool for tool in BOT_TOOLS_SCHEMA
-                    if tool["function"]["name"] in gmail_allowed
-                ]
-
-            return BOT_TOOLS_SCHEMA
+                gmail_allowed = {"search_gmail", "end_turn"}
+                return [t for t in BOT_TOOLS_SCHEMA if t["function"]["name"] in gmail_allowed]
+            return [t for t in BOT_TOOLS_SCHEMA if t["function"]["name"] in core_tools.union(dynamically_loaded_tools)]
 
         audit_state = AUDIT_SESSION_STATE.get(uid, {})
         pending_research = audit_state.get("research_pending") or []
@@ -4060,6 +4216,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
         return summary or " Task completed."
 
     while True:
+        dynamically_loaded_tools = dynamically_loaded_tools if 'dynamically_loaded_tools' in locals() else set()
         end_turn_called = False
         pause_active = False
 
@@ -4837,7 +4994,49 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     tool_call_counts[func_name] = tool_call_counts.get(func_name, 0) + 1
 
                     # ---- TOOL DISPATCH ----
-                    if func_name == "query_spending":
+                    if func_name == "set_user_timezone":
+                        try:
+                            set_user_timezone(uid, args.get("timezone", ""))
+                            db_result = f"Timezone successfully updated to {args.get('timezone')}."
+                        except Exception as e:
+                            db_result = f"ERROR: {str(e)}"
+                    elif func_name == "get_user_timezone":
+                        db_result = f"Current timezone: {get_user_timezone(uid)}"
+                    elif func_name == "get_temporal_projection":
+                        db_result = get_temporal_projection(
+                            user_id=uid,
+                            days_ahead=args.get("days_ahead", 90)
+                        )
+                    elif func_name == "semantic_search_memory":
+                        import asyncio
+                        db_result = asyncio.run(semantic_search_memory(
+                            user_id=uid,
+                            query=args.get("query", ""),
+                            top_k=args.get("top_k", 5),
+                            min_confidence=args.get("min_confidence", 0.0)
+                        ))
+                    elif func_name == "save_epistemic_memory":
+                        import asyncio
+                        db_result = asyncio.run(save_epistemic_memory(
+                            user_id=uid,
+                            content=args.get("content", ""),
+                            memory_type=args.get("memory_type", "fact"),
+                            provenance_type=args.get("provenance_type", "llm_inferred"),
+                            confidence=args.get("confidence", 0.5),
+                            evidence_refs=args.get("evidence_refs", [])
+                        ))
+                    elif func_name == "explore_domain":
+                        db_result = explore_domain(args.get("domain", ""))
+                    elif func_name == "load_tool_schemas":
+                        tool_names = args.get("tool_names", [])
+                        dynamically_loaded_tools.update(tool_names)
+                        db_result = f"Schemas loaded for: {', '.join(tool_names)}. They are now available to call."
+                    elif func_name == "verify_claim":
+                        # We need user_id injected safely
+                        q = args.get("sql_query", "")
+                        q = q.replace("user_id = ?", f"user_id = '{uid}'")
+                        db_result = verify_claim(args.get("claim", ""), q, uid)
+                    elif func_name == "query_spending":
                         db_result = query_spending(
                             merchant=args.get("merchant"),
                             category=args.get("category"),
@@ -5873,6 +6072,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             db_result = f"Monitor alerts ({len(alerts)}):\n" + "\n".join(lines)
                     elif func_name == "monitor_ack_alert":
                         db_result = ack_alert(conn, int(args.get("alert_id", 0)), uid)
+                    elif func_name == "monitor_clear_all_rules":
+                        c.execute("DELETE FROM monitor_rules WHERE user_id = ?", (uid,))
+                        c.execute("DELETE FROM monitor_alerts WHERE user_id = ?", (uid,))
+                        db_result = "All monitor rules and alerts have been successfully deleted."
                     elif func_name == "monitor_delete_rule":
                         rule_id = int(args.get("rule_id", 0))
                         if rule_id <= 0:
@@ -5978,10 +6181,22 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                             + timedelta(**kw)
                                         ).strftime("%Y-%m-%d %H:%M:%S")
 
-                                if (
-                                    not trigger_val.startswith("+")
-                                    or trigger_match
-                                ):
+                                if (not trigger_val.startswith("+") or trigger_match):
+                                    if not trigger_val.startswith("+"):
+                                        # It's an absolute time string. We must assume it's in the user's timezone 
+                                        # and convert it to UTC so the scheduler fires correctly.
+                                        try:
+                                            # Parse the local time
+                                            local_dt = datetime.strptime(trigger_val, "%Y-%m-%d %H:%M:%S")
+                                            # Attach the user's timezone
+                                            local_dt = local_dt.replace(tzinfo=ZoneInfo(get_user_timezone(uid)))
+                                            # Convert to UTC
+                                            utc_dt = local_dt.astimezone(timezone.utc)
+                                            # Update trigger_val to the UTC string for the database
+                                            trigger_val = utc_dt.strftime("%Y-%m-%d %H:%M:%S")
+                                        except ValueError:
+                                            db_result = "ERROR: Absolute times must be strictly 'YYYY-MM-DD HH:MM:SS'."
+                                            continue
                                     channel_id_val = None
 
                                     if (
@@ -6023,13 +6238,36 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
                     elif func_name == "get_scheduled_reminders":
                         c.execute("CREATE TABLE IF NOT EXISTS scheduled_reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, trigger_at TEXT, instruction TEXT, status TEXT DEFAULT 'pending', channel_id INTEGER)")
-                        c.execute("SELECT id, trigger_at, instruction FROM scheduled_reminders WHERE user_id=? AND status='pending' ORDER BY trigger_at ASC", (uid,))
-                        rows = c.fetchall()
-                        if not rows:
-                            db_result = " No pending reminders scheduled."
+                        
+                        search_term = args.get("search_term", "").lower()
+                        days_ahead = args.get("days_ahead")
+                        limit = args.get("limit", 20)
+                        
+                        query = "SELECT id, trigger_at, instruction FROM scheduled_reminders WHERE user_id=? AND status='pending'"
+                        params = [uid]
+                        
+                        if days_ahead is not None:
+                            query += " AND datetime(trigger_at) <= datetime('now', '+' || ? || ' days')"
+                            params.append(str(days_ahead))
+                            
+                        query += " ORDER BY trigger_at ASC"
+                        
+                        c.execute(query, tuple(params))
+                        all_rows = c.fetchall()
+                        
+                        filtered_rows = []
+                        for rid, trig, inst in all_rows:
+                            if search_term and search_term not in inst.lower():
+                                continue
+                            filtered_rows.append((rid, trig, inst))
+                            
+                        filtered_rows = filtered_rows[:limit]
+                        
+                        if not filtered_rows:
+                            db_result = " No pending reminders matched your query."
                         else:
-                            lines = [" **Pending Reminders:**"]
-                            for rid, trig, inst in rows:
+                            lines = [f" **Pending Reminders (Showing {len(filtered_rows)}):**"]
+                            for rid, trig, inst in filtered_rows:
                                 lines.append(f"- #{rid} @ {trig}: {inst}")
                             db_result = "\n".join(lines)
                     elif func_name == "delete_scheduled_reminder":
@@ -6374,6 +6612,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             if isinstance(args_val, str):
                 try:
                     import json
+
                     args_val = json.loads(args_val) if args_val.strip() else {}
                 except Exception:
                     return False

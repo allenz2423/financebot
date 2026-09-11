@@ -55,3 +55,4 @@ mypy>=1.11.0
 openai>=1.40.0
 # Local GPU path (optional, used when STT_BACKEND=local)
 faster-whisper>=1.1.0
+psutil

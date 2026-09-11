@@ -81,6 +81,9 @@ from src.services.gmail import (
 )
 from src.db.queries import *
 from src.services.llm import *
+from src.db.prefs import set_user_timezone, get_user_timezone
+from src.services.analyst import run_autonomous_analyst
+
 
 
 # ============================================================
@@ -193,7 +196,7 @@ async def help_command(ctx: commands.Context, *, section: str = ""):
             "`!pause` — Pause the active advisor run.\n"
             "`!cancel` — Cancel the active advisor run.\n"
             "`!switch <local|cloud>` — Hot-swap between Ollama and OpenAI-compatible.\n"
-            "`!model list|get|set` — Manage models (e.g., `!model set cloud:<model_name>`)."
+            "`!model list|get|set` — Manage models (e.g., `!model set cloud:<model_name>`).\n`!timezone` — View or set your personal timezone (e.g., `!timezone America/Chicago`).\n"
         ),
         inline=False,
     )
@@ -253,7 +256,8 @@ async def help_command(ctx: commands.Context, *, section: str = ""):
             "`!monitor alerts [limit]` — Show recent unacked alerts.\n"
             "`!monitor ack <id>` — Acknowledge an alert.\n"
             "`!monitor on <id>` / `!monitor off <id>` — Enable/disable a rule.\n"
-            "`!monitor del <id>` — Delete a rule.\n\n"
+            "`!monitor del <id>` — Delete a rule.\n"
+            "`!monitor clear` — Delete ALL rules and alerts.\n\n"
             "Rule kinds: projected_balance_low, category_spend_exceeded, "
             "income_overdue, subscription_price_changed, unusual_transaction, "
             "recurring_bill_missing, cash_flow_change, large_deposit."
@@ -280,7 +284,7 @@ async def help_command(ctx: commands.Context, *, section: str = ""):
          "`!pause` — Pause the active advisor run.\n"
          "`!cancel` — Cancel the active advisor run.\n"
          "`!switch <local|cloud>` — Hot-swap between Ollama and OpenAI-compatible.\n"
-         "`!model list|get|set` — Manage models (e.g., `!model set cloud:<model_name>`)."),
+         "`!model list|get|set` — Manage models (e.g., `!model set cloud:<model_name>`).\n`!timezone` — View or set your personal timezone (e.g., `!timezone America/Chicago`).\n"),
         ("Database / Audit — Direct SQLite",
          "`!dbstatus` — Full database health snapshot.\n"
          "`!unlocked` — Every currently unlocked transaction.\n"
@@ -315,7 +319,8 @@ async def help_command(ctx: commands.Context, *, section: str = ""):
          "`!monitor alerts [limit]` — Show recent unacked alerts.\n"
          "`!monitor ack <id>` — Acknowledge an alert.\n"
          "`!monitor on <id>` / `!monitor off <id>` — Enable/disable a rule.\n"
-         "`!monitor del <id>` — Delete a rule.\n\n"
+         "`!monitor del <id>` — Delete a rule.\n"
+            "`!monitor clear` — Delete ALL rules and alerts.\n\n"
          "Rule kinds: projected_balance_low, category_spend_exceeded, "
          "income_overdue, subscription_price_changed, unusual_transaction, "
          "recurring_bill_missing, cash_flow_change, large_deposit."),
@@ -4241,12 +4246,26 @@ async def monitor_cmd(ctx: commands.Context):
             "`!monitor alerts [limit]` — Show recent alerts.\n"
             "`!monitor ack <id>` — Ack an alert.\n"
             "`!monitor off <id>` / `!monitor on <id>` — Disable/enable a rule.\n"
-            "`!monitor del <id>` — Delete a rule.\n\n"
+            "`!monitor del <id>` — Delete a rule.\n"
+            "`!monitor clear` — Delete ALL rules and alerts.\n\n"
             "Rule kinds: projected_balance_low, category_spend_exceeded, "
             "income_overdue, subscription_price_changed, unusual_transaction, "
             "recurring_bill_missing, cash_flow_change, large_deposit."
         )
 
+
+@monitor_cmd.command(name="clear")
+async def monitor_clear_cmd(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import conn
+        c = conn.cursor()
+        c.execute("DELETE FROM monitor_rules WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM monitor_alerts WHERE user_id = ?", (user_id,))
+        conn.commit()
+        await ctx.send("🧹 All monitor rules and alerts have been cleared.")
+    except Exception as e:
+        await ctx.send(f"❌ Error clearing monitors: {e}")
 
 @monitor_cmd.command(name="list")
 async def monitor_list_cmd(ctx: commands.Context):
@@ -4499,3 +4518,35 @@ async def plaidsetup_cmd(ctx: commands.Context):
         "(that field only matters if you're pasting in tokens you already have from elsewhere).",
         view=PlaidSetupView(),
     )
+
+@bot.command(name="analyst")
+async def analyst_cmd(ctx, action: str = "status"):
+    """
+    Manage the Epistemic Autonomous Analyst.
+    Usage: !analyst run
+    """
+    user_id = str(ctx.author.id)
+    if action == "run":
+        await ctx.send("Starting Epistemic Autonomous Analyst pass...")
+        result = await run_autonomous_analyst(user_id)
+        await ctx.send(f"**Analyst Result**: {result}")
+    else:
+        await ctx.send("Usage: !analyst run")
+
+
+@bot.command(name="timezone")
+async def timezone_cmd(ctx, tz: str = None):
+    """
+    Set or view your personal timezone (e.g., America/New_York).
+    """
+    user_id = str(ctx.author.id)
+    if not tz:
+        current_tz = get_user_timezone(user_id)
+        await ctx.send(f"Your current timezone is: **{current_tz}**\nTo change it, use: `!timezone America/Los_Angeles`")
+        return
+        
+    try:
+        set_user_timezone(user_id, tz)
+        await ctx.send(f"✅ Your timezone has been updated to **{tz}**.")
+    except Exception as e:
+        await ctx.send(f"❌ Invalid timezone: `{tz}`.\n\n**Common Timezones:**\n• `America/New_York` (Eastern)\n• `America/Chicago` (Central)\n• `America/Denver` (Mountain)\n• `America/Los_Angeles` (Pacific)\n• `Europe/London` (GMT/BST)\n\nPlease use one of those formats (case-sensitive)!")
