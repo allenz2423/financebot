@@ -521,6 +521,33 @@ CREATE TABLE IF NOT EXISTS savings_buckets (
 """)
 
 c.execute("""
+CREATE TABLE IF NOT EXISTS roundup_settings (
+    user_id TEXT PRIMARY KEY,
+    enabled INTEGER DEFAULT 1,
+    target_bucket_name TEXT NOT NULL DEFAULT 'Emergency Fund',
+    multiplier REAL DEFAULT 1.0,
+    whole_dollar_roundup REAL DEFAULT 1.0,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS bucket_contributions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    bucket_name TEXT NOT NULL,
+    amount REAL NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    transaction_id TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+)
+""")
+c.execute("""
+CREATE INDEX IF NOT EXISTS idx_bucket_contrib_user ON bucket_contributions(user_id)
+""")
+
+c.execute("""
 CREATE TABLE IF NOT EXISTS subscriptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
@@ -608,6 +635,13 @@ for _col, _typ in (("context_tag", "TEXT"), ("context_note", "TEXT")):
         if "duplicate column name" not in str(_exc).lower():
             raise
 
+for _col, _typ in (("tax_deductible", "INTEGER DEFAULT 0"), ("tax_category", "TEXT")):
+    try:
+        c.execute(f"ALTER TABLE transactions ADD COLUMN {_col} {_typ}")
+    except sqlite3.OperationalError as _exc:
+        if "duplicate column name" not in str(_exc).lower():
+            raise
+
 c.execute("""
 CREATE INDEX IF NOT EXISTS idx_planned_transactions_expected_date
 ON planned_transactions(expected_date)
@@ -667,6 +701,68 @@ CREATE TABLE IF NOT EXISTS financial_snapshots (
     total_loan REAL,
     net_worth REAL
 )
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS user_debts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    balance REAL NOT NULL,
+    apr REAL NOT NULL DEFAULT 0.0,
+    min_payment REAL NOT NULL DEFAULT 0.0,
+    plaid_account_id TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+)
+""")
+c.execute("""
+CREATE INDEX IF NOT EXISTS idx_user_debts_user ON user_debts(user_id)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS transaction_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    transaction_row_id INTEGER NOT NULL,
+    item_name TEXT NOT NULL,
+    quantity REAL DEFAULT 1.0,
+    unit_price REAL,
+    total_price REAL,
+    category TEXT,
+    source TEXT DEFAULT 'gmail_receipt',
+    raw_receipt_id TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+)
+""")
+c.execute("""
+CREATE INDEX IF NOT EXISTS idx_transaction_items_tx ON transaction_items(transaction_row_id)
+""")
+c.execute("""
+CREATE INDEX IF NOT EXISTS idx_transaction_items_user ON transaction_items(user_id)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS subscription_trials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    service_name TEXT NOT NULL,
+    trial_end_date TEXT NOT NULL,
+    projected_cost REAL NOT NULL DEFAULT 0.0,
+    billing_cycle TEXT DEFAULT 'monthly',
+    cancellation_url TEXT,
+    notes TEXT,
+    status TEXT DEFAULT 'active',
+    notified INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+)
+""")
+c.execute("""
+CREATE INDEX IF NOT EXISTS idx_subscription_trials_user ON subscription_trials(user_id)
+""")
+c.execute("""
+CREATE INDEX IF NOT EXISTS idx_subscription_trials_end ON subscription_trials(trial_end_date)
 """)
 
 c.execute("""

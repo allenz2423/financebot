@@ -113,6 +113,7 @@ services:
       - SEARXNG_BASE_URL=http://searxng:8080/
     networks:
       - financebot-internal
+      - egress
     ports:
       - "8080:8080"
 
@@ -162,6 +163,7 @@ services:
       - SANDBOX_PACKAGES_DIR=/opt/packages
       - SANDBOX_INSTALL_TIMEOUT=120
       - SANDBOX_INSTALL_TIMEOUT_MAX=300
+      - SANDBOX_INTERNAL_TOKEN=${SANDBOX_INTERNAL_TOKEN}
     volumes:
       - sandbox-packages:/opt/packages
     networks:

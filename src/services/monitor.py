@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ RULE_KINDS = {
     "recurring_bill_missing",
     "cash_flow_change",
     "large_deposit",
+    "trial_expiring_soon",
 }
 
 
@@ -185,6 +187,14 @@ def _validate_rule(kind: str, config: Dict[str, Any]) -> Tuple[bool, str, Dict[s
         except (TypeError, ValueError):
             return False, "large_deposit requires numeric 'min_amount'", {}
         cfg["min_amount"] = max(0.0, cfg["min_amount"])
+        return True, "", cfg
+
+    if kind == "trial_expiring_soon":
+        try:
+            cfg["days_notice"] = int(cfg.get("days_notice", 2))
+        except (TypeError, ValueError):
+            return False, "trial_expiring_soon requires integer 'days_notice'", {}
+        cfg["days_notice"] = max(1, min(cfg["days_notice"], 30))
         return True, "", cfg
 
     return False, f"Unhandled rule kind '{kind}'", {}
@@ -583,6 +593,31 @@ def _eval_large_deposit(conn, cfg, user_id):
     )
 
 
+def _eval_trial_expiring_soon(conn, config: dict, user_id: str) -> Optional[str]:
+    uid = _fetch_user_id(conn, user_id)
+    days_notice = int(config.get("days_notice", 2))
+    cur = conn.execute(
+        """SELECT id, service_name, trial_end_date, projected_cost, cancellation_url
+        FROM subscription_trials
+        WHERE user_id = ? AND status = 'active'
+          AND date(trial_end_date) <= date('now', '+' || ? || ' days')
+          AND date(trial_end_date) >= date('now')
+        ORDER BY date(trial_end_date) ASC LIMIT 1""",
+        (uid, days_notice),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    tid, sname, edate, cost, url = row
+    cost_val = float(cost or 0.0)
+    cost_txt = f" (${cost_val:,.2f})" if cost_val > 0 else ""
+    url_txt = f" Cancel at: {url}" if url else ""
+    return (
+        f"Free trial for '{sname}' expires on {edate}{cost_txt}. "
+        f"Cancel now to avoid renewal charge.{url_txt}"
+    )
+
+
 EVALUATORS = {
     "projected_balance_low": _eval_projected_balance_low,
     "category_spend_exceeded": _eval_category_spend_exceeded,
@@ -592,6 +627,7 @@ EVALUATORS = {
     "recurring_bill_missing": _eval_recurring_bill_missing,
     "cash_flow_change": _eval_cash_flow_change,
     "large_deposit": _eval_large_deposit,
+    "trial_expiring_soon": _eval_trial_expiring_soon,
 }
 
 
@@ -1100,3 +1136,154 @@ async def monitor_watchdog_loop():
         except Exception as exc:
             print(f" [MONITOR] watchdog iteration failed: {type(exc).__name__}: {exc}")
         await asyncio.sleep(MONITOR_POLL_INTERVAL_SECONDS)
+
+
+def compile_natural_language_rule(text: str) -> Dict[str, Any]:
+    """
+    Deterministically compile plain English intent into a validated monitor rule.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("Rule instruction cannot be empty.")
+
+    cleaned = re.sub(r'^(?:please\s+)?(?:alert\s+me|notify\s+me|warn\s+me|alert|notify|warn)\s+(?:if|when|on)?\s*', '', raw, flags=re.IGNORECASE).strip()
+    lowered = cleaned.lower()
+
+    # 1. Low balance / projected balance
+    # e.g. "balance drops below $1,000 in 14 days" or "checking falls under 500"
+    bal_match = re.search(r'(?:balance|checking|liquid|cash)\s+(?:drops|falls|is|goes)?\s*(?:below|under)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)', lowered)
+    if bal_match:
+        threshold = float(bal_match.group(1).replace(",", ""))
+        window_match = re.search(r'(?:in|within|over)\s+(\d+)\s*(?:days|d)', lowered)
+        window_days = int(window_match.group(1)) if window_match else 14
+        config = {"threshold": threshold, "window_days": window_days}
+        ok, err, norm = _validate_rule("projected_balance_low", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "projected_balance_low",
+            "name": f"Low Balance (${threshold:,.0f} in {window_days}d)",
+            "config": norm,
+            "severity": "critical" if threshold < 500 else "warning",
+            "cooldown_hours": 24,
+        }
+
+    # 2. Large deposit
+    # e.g. "deposit over $2,000" or "deposits exceeding 1500"
+    dep_match = re.search(r'deposit[s]?\s+(?:over|above|exceeding|more than|greater than)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)', lowered)
+    if dep_match:
+        threshold = float(dep_match.group(1).replace(",", ""))
+        config = {"threshold": threshold}
+        ok, err, norm = _validate_rule("large_deposit", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "large_deposit",
+            "name": f"Large Deposit (>${threshold:,.0f})",
+            "config": norm,
+            "severity": "info",
+            "cooldown_hours": 6,
+        }
+
+    # 3. Subscription price change
+    # e.g. "Netflix price increases by 10%" or "Spotify increases"
+    sub_match = re.search(r'([a-zA-Z0-9\s]+?)\s+(?:price|subscription)?\s*(?:increases|jumps|hikes|rises)(?:\s+by\s+([0-9]+(?:\.[0-9]+)?))?%?', lowered)
+    if sub_match and "spend" not in sub_match.group(1) and "balance" not in sub_match.group(1):
+        merch = sub_match.group(1).replace("my", "").strip().title()
+        pct = float(sub_match.group(2)) if sub_match.group(2) else 10.0
+        config = {"merchant": merch, "pct_increase": pct}
+        ok, err, norm = _validate_rule("subscription_price_changed", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "subscription_price_changed",
+            "name": f"{merch} Price Increase",
+            "config": norm,
+            "severity": "warning",
+            "cooldown_hours": 72,
+        }
+
+    # 4. Unusual transaction
+    if "unusual" in lowered or "anomaly" in lowered or "irregular" in lowered:
+        std_match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*(?:stddev|sigmas|standard deviation)', lowered)
+        multiplier = float(std_match.group(1)) if std_match else 3.0
+        config = {"stddev_multiplier": multiplier, "window_days": 90}
+        ok, err, norm = _validate_rule("unusual_transaction", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "unusual_transaction",
+            "name": f"Unusual Spend ({multiplier:.1f}σ)",
+            "config": norm,
+            "severity": "warning",
+            "cooldown_hours": 12,
+        }
+
+    # 5. Category spending exceeded
+    # e.g. "spend more than $200 on dining out in 7 days" or "groceries exceeds $400 this month"
+    cat_match1 = re.search(r'(?:spend|spending)\s+(?:more than|over|above|exceeding)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)\s+(?:on|for|in)\s+([a-zA-Z\s]+)', lowered)
+    cat_match2 = re.search(r'([a-zA-Z\s]+?)\s+(?:exceeds|over|more than|above)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)', lowered)
+
+    if cat_match1:
+        limit = float(cat_match1.group(1).replace(",", ""))
+        category_raw = cat_match1.group(2)
+    elif cat_match2:
+        category_raw = cat_match2.group(1)
+        limit = float(cat_match2.group(2).replace(",", ""))
+    else:
+        category_raw = None
+        limit = 0.0
+
+    if category_raw:
+        # Extract window if present in text
+        window_days = 30
+        if "this week" in lowered or "weekly" in lowered:
+            window_days = 7
+        elif "this month" in lowered or "monthly" in lowered:
+            window_days = 30
+        else:
+            w_m = re.search(r'(?:in|over|within)\s+(\d+)\s*(?:days|d)', lowered)
+            if w_m:
+                window_days = int(w_m.group(1))
+
+        # Clean category name
+        category_clean = re.sub(r'\s+(?:in|over|within|this week|this month).*$', '', category_raw).strip().title()
+        config = {"category": category_clean, "limit": limit, "window_days": window_days}
+        ok, err, norm = _validate_rule("category_spend_exceeded", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "category_spend_exceeded",
+            "name": f"{category_clean} Cap (${limit:,.0f}/{window_days}d)",
+            "config": norm,
+            "severity": "warning",
+            "cooldown_hours": 24,
+        }
+
+    raise ValueError(
+        f"Could not parse natural language monitor rule from: '{text}'.\n"
+        "Examples of supported instructions:\n"
+        "  • 'Alert me if dining exceeds $200 this week'\n"
+        "  • 'Notify if balance falls below $1,000 in 14 days'\n"
+        "  • 'Alert on deposits over $2,500'\n"
+        "  • 'Warn if Netflix price increases by 10%'\n"
+        "  • 'Detect unusual transactions at 2.5 stddev'"
+    )
+
+
+def add_monitor_rule_from_nl(conn: sqlite3.Connection, user_id: str, instruction: str) -> Dict[str, Any]:
+    """Compile a natural language instruction and add the resulting rule to monitor_rules."""
+    spec = compile_natural_language_rule(instruction)
+    ok, msg, new_id = add_monitor_rule(
+        conn,
+        user_id=user_id,
+        name=spec["name"],
+        kind=spec["kind"],
+        config=spec["config"],
+        severity=spec.get("severity", "warning"),
+        cooldown_hours=spec.get("cooldown_hours", 24),
+    )
+    if not ok:
+        raise ValueError(msg)
+    spec["id"] = new_id
+    return spec

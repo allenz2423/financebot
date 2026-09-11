@@ -447,6 +447,109 @@ async def gmail_disconnect_cmd(ctx: commands.Context):
 
 
 # ============================================================
+# Autonomous Receipt Reconciliation & Itemization
+# ============================================================
+
+@bot.group(name="receipts", invoke_without_command=True)
+async def receipts_cmd(ctx: commands.Context):
+    """Receipt reconciliation and itemized transaction breakdown."""
+    if ctx.invoked_subcommand is None:
+        await ctx.send(
+            "**Receipt Reconciliation & Itemization**\n"
+            "`!receipts scan [days]` — Reconcile recent transactions against Gmail receipts.\n"
+            "`!receipts view <tx_id>` — View itemized breakdown for a transaction.\n"
+            "`!receipts add <tx_id> <item_name> <price> [qty]` — Manually add an itemized line item.\n"
+            "`!receipts del <item_id>` — Delete an itemized line item."
+        )
+
+
+@receipts_cmd.command(name="scan")
+async def receipts_scan_cmd(ctx: commands.Context, days: int = 14):
+    user_id = str(ctx.author.id)
+    await ctx.send(" Scanning connected Gmail for matching transaction receipts...")
+    try:
+        from src.db.queries import reconcile_receipts_for_user
+        res = reconcile_receipts_for_user(days=days, user_id=user_id)
+        embed = discord.Embed(
+            title="🧾 Receipt Reconciliation Results",
+            color=0x3498DB,
+            description=(
+                f"**Scanned Transactions:** {res['scanned_transactions']}\n"
+                f"**Matched Receipts:** {res['matched_transactions']}\n"
+                f"**Extracted Items:** {res['items_extracted']}"
+            )
+        )
+        for detail in res.get("details", [])[:6]:
+            embed.add_field(
+                name=f"Tx #{detail['transaction_id']} — {detail['merchant']} (${detail['amount']:,.2f})",
+                value=f"Subject: *{detail['subject'][:60]}*\nItems parsed: **{detail['item_count']}**",
+                inline=False
+            )
+        embed.set_footer(text="Use `!receipts view <tx_id>` to view itemized breakdown")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f" Receipt scan failed: `{type(exc).__name__}: {exc}`")
+
+
+@receipts_cmd.command(name="view")
+async def receipts_view_cmd(ctx: commands.Context, tx_id: int):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import get_transaction_items
+        items = get_transaction_items(tx_id, user_id=user_id)
+        if not items:
+            await ctx.send(f" No itemized receipt data found for transaction #{tx_id}.")
+            return
+
+        total_items_price = sum(item["total_price"] for item in items)
+        embed = discord.Embed(
+            title=f"🧾 Itemized Breakdown — Tx #{tx_id}",
+            color=0x2ECC71,
+            description=f"**Total Itemized:** ${total_items_price:,.2f} ({len(items)} items)"
+        )
+        for item in items:
+            embed.add_field(
+                name=f"#{item['id']} {item['item_name']}",
+                value=f"Qty: {item['quantity']} × ${item['unit_price']:,.2f} = **${item['total_price']:,.2f}** (Source: {item['source']})",
+                inline=False
+            )
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f" Error fetching receipt items: `{type(exc).__name__}: {exc}`")
+
+
+@receipts_cmd.command(name="add")
+async def receipts_add_cmd(ctx: commands.Context, tx_id: int, item_name: str, price: float, qty: float = 1.0):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import add_transaction_item
+        res = add_transaction_item(
+            user_id=user_id,
+            transaction_row_id=tx_id,
+            item_name=item_name,
+            total_price=price,
+            quantity=qty,
+            source="manual"
+        )
+        await ctx.send(f" Added item #{res['id']} **{item_name}** (${price:,.2f}) to Tx #{tx_id}.")
+    except Exception as exc:
+        await ctx.send(f" Failed to add item: `{type(exc).__name__}: {exc}`")
+
+
+@receipts_cmd.command(name="del")
+async def receipts_del_cmd(ctx: commands.Context, item_id: int):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import delete_transaction_item
+        if delete_transaction_item(item_id, user_id=user_id):
+            await ctx.send(f" Deleted item #{item_id}.")
+        else:
+            await ctx.send(f" Item #{item_id} not found.")
+    except Exception as exc:
+        await ctx.send(f" Failed to delete item: `{type(exc).__name__}: {exc}`")
+
+
+# ============================================================
 # Deterministic Database Verification Commands
 # ============================================================
 
@@ -1127,6 +1230,246 @@ async def locked_command(ctx: commands.Context):
         await _send_transaction_browser(ctx, rows, locked=True, user_id=user_id)
     except Exception as exc:
         await _send_error_embed(ctx, " Locked Check Failed", exc, user_id=user_id)
+
+
+# ============================================================
+# Interactive Transaction Triage Center (Buttons, Select, Modal)
+# ============================================================
+
+class _TriageNoteModal(discord.ui.Modal, title="Add Context & Tag"):
+    tag = discord.ui.TextInput(
+        label="Behavioral Tag",
+        placeholder="e.g. impulse, necessity, dining, work, travel",
+        required=True,
+        max_length=50
+    )
+    note = discord.ui.TextInput(
+        label="Context Note",
+        style=discord.TextStyle.paragraph,
+        placeholder="Optional details or context for why this purchase happened",
+        required=False,
+        max_length=500
+    )
+
+    def __init__(self, triage_view: "_TransactionTriageView", tx_row_id: int):
+        super().__init__()
+        self.triage_view = triage_view
+        self.tx_row_id = tx_row_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        from src.db.queries import tag_transaction_context
+        user_id = str(interaction.user.id)
+        tag_transaction_context(self.tx_row_id, self.tag.value.strip(), self.note.value.strip(), user_id=user_id)
+        await interaction.response.send_message(f" Added tag `{self.tag.value.strip()}` to Tx #{self.tx_row_id}", ephemeral=True)
+        await self.triage_view._update_message()
+
+
+class _TransactionCategorySelect(discord.ui.Select):
+    CATEGORIES = [
+        "Dining Out",
+        "Groceries",
+        "Shopping",
+        "Entertainment",
+        "Utilities",
+        "Transportation / Gas",
+        "Healthcare / Medical",
+        "Income / Paycheck",
+        "Credit Card Bill Payment",
+        "P2P Transfer",
+        "Travel / Vacation",
+        "Subscription",
+        "Business / Tax Deductible",
+    ]
+
+    def __init__(self, triage_view: "_TransactionTriageView", current_category: str):
+        options = [
+            discord.SelectOption(
+                label=cat,
+                value=cat,
+                default=(cat.lower() == (current_category or "").lower())
+            )
+            for cat in self.CATEGORIES
+        ]
+        super().__init__(placeholder="Choose / change category...", min_values=1, max_values=1, options=options, row=0)
+        self.triage_view = triage_view
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await self.triage_view._guard(interaction):
+            return
+        selected_category = self.values[0]
+        user_id = str(interaction.user.id)
+        tx = self.triage_view.current_tx
+        from src.db.queries import correct_transaction
+        correct_transaction(
+            transaction_row_id=tx["id"],
+            category=selected_category,
+            reason="triage dropdown",
+            user_id=user_id
+        )
+        tx["category"] = selected_category
+        await interaction.response.send_message(f" Recategorized #{tx['id']} as **{selected_category}**", ephemeral=True)
+        await self.triage_view._update_message()
+
+
+class _TransactionTriageView(discord.ui.View):
+    def __init__(self, ctx: commands.Context, transactions: list[dict]):
+        super().__init__(timeout=600)
+        self.ctx = ctx
+        self.transactions = transactions
+        self.index = 0
+        self._message: discord.Message | None = None
+        self._rebuild_components()
+
+    @property
+    def current_tx(self) -> dict | None:
+        if 0 <= self.index < len(self.transactions):
+            return self.transactions[self.index]
+        return None
+
+    def _rebuild_components(self):
+        self.clear_items()
+        tx = self.current_tx
+        if not tx:
+            return
+        self.add_item(_TransactionCategorySelect(self, tx.get("category", "")))
+
+        approve_btn = discord.ui.Button(label="Approve & Lock", style=discord.ButtonStyle.success, emoji="✅", row=1)
+        approve_btn.callback = self.approve_callback
+        self.add_item(approve_btn)
+
+        flag_btn = discord.ui.Button(label="Flag", style=discord.ButtonStyle.danger, emoji="🚩", row=1)
+        flag_btn.callback = self.flag_callback
+        self.add_item(flag_btn)
+
+        note_btn = discord.ui.Button(label="Tag / Note", style=discord.ButtonStyle.primary, emoji="📝", row=1)
+        note_btn.callback = self.note_callback
+        self.add_item(note_btn)
+
+        skip_btn = discord.ui.Button(label="Skip", style=discord.ButtonStyle.secondary, emoji="⏭️", row=1)
+        skip_btn.callback = self.skip_callback
+        self.add_item(skip_btn)
+
+        close_btn = discord.ui.Button(label="Close", style=discord.ButtonStyle.secondary, emoji="❌", row=1)
+        close_btn.callback = self.close_callback
+        self.add_item(close_btn)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(" Only the command author can triage these transactions.", ephemeral=True)
+            return False
+        return True
+
+    def build_embed(self) -> discord.Embed:
+        tx = self.current_tx
+        if not tx:
+            return discord.Embed(title="🎉 Triage Queue Complete!", description="All pending transactions have been triaged.", color=0x2ECC71)
+
+        embed = discord.Embed(
+            title=f"📋 Transaction Triage Queue ({self.index + 1} of {len(self.transactions)})",
+            color=0x3498DB
+        )
+        embed.add_field(name="Merchant", value=f"**{tx.get('clean_merchant') or tx.get('merchant')}**\n`Raw: {tx.get('merchant')}`", inline=True)
+        embed.add_field(name="Amount", value=f"**${tx.get('amount', 0.0):,.2f}**", inline=True)
+        embed.add_field(name="Date", value=f"{tx.get('date')}", inline=True)
+        embed.add_field(name="Account", value=f"{tx.get('account_used') or 'N/A'}", inline=True)
+        embed.add_field(name="Category", value=f"`{tx.get('category') or 'Uncategorized'}`", inline=True)
+        status_str = f"Status: `{tx.get('status')}` | Judgment: `{tx.get('judgment') or 'None'}` | Locked: `{'Yes' if tx.get('is_locked') else 'No'}`"
+        embed.add_field(name="Audit Status", value=status_str, inline=True)
+
+        from src.db.queries import get_transaction_items
+        items = get_transaction_items(tx["id"], user_id=str(self.ctx.author.id))
+        if items:
+            item_lines = [f"- {it['item_name']} ({it['quantity']}x) — ${it['total_price']:,.2f}" for it in items[:4]]
+            embed.add_field(name=f"🧾 Itemized Receipt ({len(items)} items)", value="\n".join(item_lines), inline=False)
+
+        embed.set_footer(text="Select category from dropdown • Use buttons to lock or tag")
+        return embed
+
+    async def _update_message(self):
+        self._rebuild_components()
+        if self._message:
+            await self._message.edit(embed=self.build_embed(), view=self)
+
+    async def approve_callback(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        tx = self.current_tx
+        user_id = str(interaction.user.id)
+        from src.db.queries import lock_transaction, correct_transaction
+        correct_transaction(transaction_row_id=tx["id"], status="Evaluated", reason="triage approved", user_id=user_id)
+        lock_transaction(transaction_row_id=tx["id"], locked=True, user_id=user_id)
+        self.index += 1
+        self._rebuild_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def flag_callback(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        tx = self.current_tx
+        user_id = str(interaction.user.id)
+        from src.db.queries import correct_transaction
+        correct_transaction(transaction_row_id=tx["id"], status="Flagged", judgment="flagged", reason="triage flagged", user_id=user_id)
+        self.index += 1
+        self._rebuild_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def note_callback(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        tx = self.current_tx
+        modal = _TriageNoteModal(self, tx["id"])
+        await interaction.response.send_modal(modal)
+
+    async def skip_callback(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.index += 1
+        self._rebuild_components()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def close_callback(self, interaction: discord.Interaction):
+        if not await self._guard(interaction):
+            return
+        self.stop()
+        if self._message:
+            await self._message.delete()
+
+
+@bot.command(name="triage")
+async def triage_command(ctx: commands.Context, limit: int = 50):
+    """Interactive transaction review with buttons, dropdowns, and modals."""
+    user_id = str(ctx.author.id)
+    limit = max(1, min(limit, 200))
+    try:
+        with _open_verification_db(user_id=user_id) as vconn:
+            cur = vconn.cursor()
+            cur.execute(
+                """SELECT id, date, merchant, clean_merchant, amount, account_used, category, status, judgment, is_locked
+                FROM transactions
+                WHERE user_id = ? AND is_locked = 0 AND merchant NOT LIKE '%System Balance Sync%'
+                ORDER BY datetime(date) DESC, id DESC
+                LIMIT ?""",
+                (user_id, limit)
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            await ctx.send("🎉 All transactions are triaged and locked! No unlocked transactions found.")
+            return
+
+        tx_list = [
+            {
+                "id": r[0], "date": r[1], "merchant": r[2], "clean_merchant": r[3],
+                "amount": float(r[4] or 0.0), "account_used": r[5], "category": r[6],
+                "status": r[7], "judgment": r[8], "is_locked": r[9]
+            }
+            for r in rows
+        ]
+        view = _TransactionTriageView(ctx, tx_list)
+        msg = await ctx.send(embed=view.build_embed(), view=view)
+        view._message = msg
+    except Exception as exc:
+        await _send_error_embed(ctx, "Triage Start Failed", exc, user_id=user_id)
 
 
 @bot.command(name="corrections")
@@ -1932,6 +2275,675 @@ async def check_now_error(ctx: commands.Context, error: commands.CommandError):
         await ctx.send(" You need administrator permissions.")
     else:
         await ctx.send(f" Command error: {error}")
+
+# ============================================================
+# Debt Snowball & Avalanche Payoff Engine
+# ============================================================
+@bot.group(name="debt", invoke_without_command=True)
+async def debt_group(ctx: commands.Context):
+    """Manage liabilities and calculate Snowball / Avalanche payoff strategies."""
+    if ctx.invoked_subcommand is None:
+        await ctx.send(
+            "**Delilah Debt Payoff Engine**\n"
+            "`!debt list` — View all tracked debts, APRs, and minimum payments.\n"
+            "`!debt sync` — Auto-sync credit card & loan balances from Plaid.\n"
+            "`!debt add <name> <balance> [apr] [min_payment]` — Track a manual debt.\n"
+            "`!debt set <id> <apr|min|balance|name> <value>` — Update a debt's details.\n"
+            "`!debt del <id>` — Delete a tracked debt.\n"
+            "`!debt payoff [avalanche|snowball] [extra_monthly]` — Simulate debt payoff schedule."
+        )
+
+
+@debt_group.command(name="list")
+async def debt_list_cmd(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import list_user_debts
+        debts = list_user_debts(user_id=user_id, auto_sync=True)
+        if not debts:
+            await ctx.send(" No tracked debts found. Use `!debt sync` or `!debt add`.")
+            return
+
+        total_bal = sum(d["balance"] for d in debts)
+        total_min = sum(d["min_payment"] for d in debts)
+
+        embed = discord.Embed(
+            title="💳 Tracked Liabilities & Debts",
+            color=0xE74C3C,
+            description=f"**Total Debt:** ${total_bal:,.2f} | **Total Min Payments:** ${total_min:,.2f}/mo"
+        )
+        for d in debts:
+            embed.add_field(
+                name=f"#{d['id']} {d['name']}",
+                value=f"Balance: **${d['balance']:,.2f}**\nAPR: **{d['apr']:.2f}%** | Min: **${d['min_payment']:,.2f}/mo**",
+                inline=False
+            )
+        embed.set_footer(text="Run `!debt payoff avalanche 200` to simulate accelerating payoff by $200/mo")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f" Error listing debts: `{type(exc).__name__}: {exc}`")
+
+
+@debt_group.command(name="sync")
+async def debt_sync_cmd(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import sync_debts_from_plaid
+        synced = sync_debts_from_plaid(user_id=user_id)
+        await ctx.send(f" Synced {synced} credit/loan accounts from Plaid into debt tracker.")
+    except Exception as exc:
+        await ctx.send(f" Sync failed: `{type(exc).__name__}: {exc}`")
+
+
+@debt_group.command(name="add")
+async def debt_add_cmd(ctx: commands.Context, name: str, balance: float, apr: float = 0.0, min_payment: float = 0.0):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import add_or_update_debt
+        res = add_or_update_debt(user_id=user_id, name=name, balance=balance, apr=apr, min_payment=min_payment)
+        await ctx.send(f" Added debt #{res['id']} **{name}**: ${balance:,.2f} at {apr:.2f}% APR (Min: ${res['min_payment']:,.2f}/mo).")
+    except Exception as exc:
+        await ctx.send(f" Failed to add debt: `{type(exc).__name__}: {exc}`")
+
+
+@debt_group.command(name="set")
+async def debt_set_cmd(ctx: commands.Context, debt_id: int, field: str, value: str):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import list_user_debts, add_or_update_debt
+        debts = list_user_debts(user_id=user_id, auto_sync=False)
+        target = next((d for d in debts if d["id"] == debt_id), None)
+        if not target:
+            await ctx.send(f" Debt #{debt_id} not found.")
+            return
+
+        field = field.lower().strip()
+        if field in ("apr", "rate"):
+            target["apr"] = float(value.replace("%", ""))
+        elif field in ("min", "min_payment", "payment"):
+            target["min_payment"] = float(value.replace("$", ""))
+        elif field in ("balance", "bal"):
+            target["balance"] = float(value.replace("$", ""))
+        elif field in ("name", "title"):
+            target["name"] = value.strip()
+        else:
+            await ctx.send(" Field must be `apr`, `min`, `balance`, or `name`.")
+            return
+
+        add_or_update_debt(
+            user_id=user_id,
+            name=target["name"],
+            balance=target["balance"],
+            apr=target["apr"],
+            min_payment=target["min_payment"],
+            debt_id=debt_id
+        )
+        await ctx.send(f" Updated debt #{debt_id} **{target['name']}**: {field} is now {value}.")
+    except Exception as exc:
+        await ctx.send(f" Failed to update debt: `{type(exc).__name__}: {exc}`")
+
+
+@debt_group.command(name="del")
+async def debt_del_cmd(ctx: commands.Context, debt_id: int):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import delete_user_debt
+        if delete_user_debt(debt_id, user_id=user_id):
+            await ctx.send(f" Deleted debt #{debt_id}.")
+        else:
+            await ctx.send(f" Debt #{debt_id} not found.")
+    except Exception as exc:
+        await ctx.send(f" Failed to delete debt: `{type(exc).__name__}: {exc}`")
+
+
+@debt_group.command(name="payoff")
+async def debt_payoff_cmd(ctx: commands.Context, strategy: str = "avalanche", extra_monthly: float = 0.0):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import calculate_debt_payoff
+        strat = strategy.lower().strip()
+        if strat not in ("avalanche", "snowball"):
+            try:
+                extra_monthly = float(strat)
+                strat = "avalanche"
+            except ValueError:
+                strat = "avalanche"
+
+        res = calculate_debt_payoff(strategy=strat, extra_monthly=extra_monthly, user_id=user_id)
+        if res.get("status") == "empty":
+            await ctx.send(" No active debts found. Use `!debt add` or `!debt sync`.")
+            return
+
+        embed = discord.Embed(
+            title=f"🎯 Debt Payoff Plan — {strat.upper()}",
+            color=0x2ECC71,
+            description=(
+                f"**Initial Balance:** ${res['total_initial_balance']:,.2f}\n"
+                f"**Extra Monthly Allocation:** ${res['extra_monthly']:,.2f}\n"
+                f"**Freedom Date:** **{res['debt_free_date']}** ({res['months_to_payoff']} months)\n"
+                f"**Total Interest Paid:** ${res['total_interest_paid']:,.2f}\n"
+                f"**Total Amount Paid:** ${res['total_paid']:,.2f}"
+            )
+        )
+
+        milestones_text = []
+        for idx, m in enumerate(res["milestones"], 1):
+            milestones_text.append(f"**{idx}. {m['name']}**: Month {m['month']} ({m['date']}) → +${m['freed_payment']:,.2f}/mo freed")
+        if milestones_text:
+            embed.add_field(name="🏁 Payoff Milestones", value="\n".join(milestones_text[:8]), inline=False)
+
+        comp = res.get("comparison", {})
+        saved_interest = comp.get("interest_saved_with_avalanche", 0.0)
+        saved_months = comp.get("months_saved_with_avalanche", 0)
+
+        comp_text = (
+            f"**{comp['alt_strategy'].capitalize()}**: {comp['alt_months']} months, ${comp['alt_interest']:,.2f} interest.\n"
+        )
+        if strat == "avalanche":
+            comp_text += f"💡 Avalanche saves **${saved_interest:,.2f}** in interest and **{saved_months} months** vs Snowball."
+        else:
+            comp_text += f"💡 Snowball prioritizes early wins. Avalanche would save **${-saved_interest:,.2f}** in interest."
+        embed.add_field(name="⚖️ Strategy Comparison", value=comp_text, inline=False)
+
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f" Simulation failed: `{type(exc).__name__}: {exc}`")
+
+
+# ============================================================
+# Tax Category Tagging & Deduction Exporter
+# ============================================================
+
+@bot.group(name="tax", invoke_without_command=True)
+async def tax_group(ctx: commands.Context):
+    """Manage tax deductions and Schedule C expense reporting."""
+    if ctx.invoked_subcommand is None:
+        await ctx.send(
+            "**Delilah Tax Deduction Tracker**\n"
+            "`!tax summary [year]` — View itemized deductions and categories for the year.\n"
+            "`!tax tag <tx_id> <category>` — Mark a transaction as tax-deductible (e.g., Software, Supplies, Meals 50%).\n"
+            "`!tax untag <tx_id>` — Remove tax-deductible status from a transaction.\n"
+            "`!tax export [year]` — Export all deductions to a clean CSV file."
+        )
+
+
+@tax_group.command(name="summary")
+async def tax_summary_cmd(ctx: commands.Context, year: int = None):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import get_tax_deductions_summary
+        res = get_tax_deductions_summary(year=year, user_id=user_id)
+        if not res["categories"]:
+            await ctx.send(f" No tax deductions recorded for {res['year']}. Use `!tax tag <tx_id> <category>`.")
+            return
+
+        embed = discord.Embed(
+            title=f"📊 Tax Deductions Summary — {res['year']}",
+            color=0xF1C40F,
+            description=(
+                f"**Total Deductible:** **${res['total_deductible']:,.2f}** "
+                f"(Gross Spent: ${res['total_gross_spent']:,.2f})\n"
+                f"**Total Transactions:** {res['total_transactions']}"
+            )
+        )
+        for cat in res["categories"][:10]:
+            embed.add_field(
+                name=f"{cat['category']} ({cat['count']} items)",
+                value=f"Deductible: **${cat['deductible']:,.2f}** (Gross: ${cat['gross']:,.2f})",
+                inline=True
+            )
+        embed.set_footer(text="Run `!tax export` to generate a full CSV for your accountant")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f" Tax summary failed: `{type(exc).__name__}: {exc}`")
+
+
+@tax_group.command(name="tag")
+async def tax_tag_cmd(ctx: commands.Context, tx_id: int, *, category: str = "Business"):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import tag_transaction_tax
+        res = tag_transaction_tax(transaction_row_id=tx_id, is_deductible=True, tax_category=category, user_id=user_id)
+        if res.get("status") == "not_found":
+            await ctx.send(f" Transaction #{tx_id} not found.")
+            return
+        await ctx.send(f" Marked Tx #{tx_id} (**{res['merchant']}** — ${res['amount']:,.2f}) as tax-deductible under `{category}`.")
+    except Exception as exc:
+        await ctx.send(f" Failed to tag tax deduction: `{type(exc).__name__}: {exc}`")
+
+
+@tax_group.command(name="untag")
+async def tax_untag_cmd(ctx: commands.Context, tx_id: int):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import tag_transaction_tax
+        res = tag_transaction_tax(transaction_row_id=tx_id, is_deductible=False, user_id=user_id)
+        if res.get("status") == "not_found":
+            await ctx.send(f" Transaction #{tx_id} not found.")
+            return
+        await ctx.send(f" Removed tax-deductible status from Tx #{tx_id}.")
+    except Exception as exc:
+        await ctx.send(f" Failed to untag transaction: `{type(exc).__name__}: {exc}`")
+
+
+@tax_group.command(name="export")
+async def tax_export_cmd(ctx: commands.Context, year: int = None):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import export_tax_csv
+        target_year = year or datetime.now().year
+        csv_data = export_tax_csv(year=target_year, user_id=user_id)
+        if not csv_data.strip():
+            await ctx.send(f" No deductions to export for {target_year}.")
+            return
+        
+        file_obj = discord.File(
+            fp=BytesIO(csv_data.encode("utf-8")),
+            filename=f"tax_deductions_{target_year}.csv"
+        )
+        await ctx.send(
+            content=f"📁 Here is your tax deductions export for **{target_year}**:",
+            file=file_obj
+        )
+    except Exception as exc:
+        await ctx.send(f" Tax export failed: `{type(exc).__name__}: {exc}`")
+
+
+# ============================================================
+# "What-If?" Scenario & Cash Flow Runway Simulator
+# ============================================================
+
+@bot.command(name="whatif", aliases=["scenario"])
+async def whatif_cmd(ctx: commands.Context, amount: float, days: int = 60, *, name: str = "Hypothetical Event"):
+    """Simulate the cash flow impact and runway change of a hypothetical purchase or income."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import simulate_cash_flow_scenario
+        events = [{
+            "name": name,
+            "amount": amount,
+            "offset_days": 1,
+            "recurring_monthly": False
+        }]
+        res = simulate_cash_flow_scenario(days=days, scenario_events=events, user_id=user_id)
+
+        scen = res["scenario"]
+        base = res["baseline"]
+        delta = res["delta"]
+
+        is_expense = amount < 0
+        color = 0xE74C3C if scen["min_balance"] < 0 else (0xF39C12 if is_expense else 0x2ECC71)
+
+        embed = discord.Embed(
+            title=f"🔮 'What-If?' Runway Simulation ({days} Days)",
+            color=color,
+            description=(
+                f"**Hypothetical Event:** `{name}` (**{'+' if amount >= 0 else ''}${amount:,.2f}**)\n"
+                f"**Current Liquid Funds:** ${res['starting_liquid']:,.2f}\n"
+                f"**Estimated Daily Burn:** ${res['daily_burn_rate']:,.2f}/day"
+            )
+        )
+
+        min_status = f"${scen['min_balance']:,.2f} on {scen['min_date']}"
+        if scen["min_balance"] < 0:
+            min_status += f" ⚠️ **(Depleted on Day {scen['runway_days']})**"
+        embed.add_field(name="Projected Lowest Balance", value=min_status, inline=False)
+
+        embed.add_field(
+            name="Baseline (Without Event)",
+            value=f"Min: ${base['min_balance']:,.2f}\nFinal: ${base['final_balance']:,.2f}",
+            inline=True
+        )
+        embed.add_field(
+            name="Scenario (With Event)",
+            value=f"Min: ${scen['min_balance']:,.2f}\nFinal: ${scen['final_balance']:,.2f}",
+            inline=True
+        )
+        embed.add_field(
+            name="Net Impact",
+            value=f"Min Diff: **${delta['min_balance_impact']:,.2f}**\nFinal Diff: **${delta['final_balance_impact']:,.2f}**",
+            inline=True
+        )
+
+        if scen["runway_days"] is not None:
+            embed.add_field(
+                name="🚨 Runway Alert",
+                value=f"This event would cause liquid reserves to hit **$0.00** in **{scen['runway_days']} days**.",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="✅ Runway Safety",
+                value=f"Liquid cash remains positive throughout the {days}-day horizon.",
+                inline=False
+            )
+
+        embed.set_footer(text="Run !upcoming to view scheduled inflows and planned expenses")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f" What-If simulation failed: `{type(exc).__name__}: {exc}`")
+
+
+# ============================================================
+# Free-Trial & Zombie Subscription Watchdog
+# ============================================================
+
+@bot.group(name="trials", aliases=["trial"], invoke_without_command=True)
+async def trials_group(ctx: commands.Context):
+    """Manage free trials and detect zombie subscriptions."""
+    if ctx.invoked_subcommand is None:
+        await ctx.send(
+            "**Free-Trial & Zombie Subscription Watchdog**\n"
+            "`!trials list` — View active trials and countdowns to billing.\n"
+            "`!trials add <service> <end_date> [cost] [cancel_url]` — Track a free trial (end_date: YYYY-MM-DD).\n"
+            "`!trials cancel <trial_id>` — Mark a trial as cancelled.\n"
+            "`!trials zombies` — Identify idle/zombie recurring subscriptions."
+        )
+
+
+@trials_group.command(name="list")
+async def trials_list_cmd(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import list_subscription_trials
+        trials = list_subscription_trials(user_id=user_id, active_only=True)
+        if not trials:
+            await ctx.send(" No active free trials tracked. Use `!trials add` to track one.")
+            return
+
+        embed = discord.Embed(
+            title="⏳ Active Free Trials & Renewal Watch",
+            color=0xE67E22,
+            description=f"Tracking **{len(trials)}** active trial(s)."
+        )
+        for t in trials:
+            days_str = f"**{t['days_remaining']} days left**" if t['days_remaining'] is not None else "Date reached"
+            cost_str = f"${t['projected_cost']:,.2f}/{t['billing_cycle']}" if t['projected_cost'] > 0 else "Free / Unset"
+            val = f"Expires: **{t['trial_end_date']}** ({days_str})\nProjected: {cost_str}"
+            if t['cancellation_url']:
+                val += f"\n[Cancellation Link]({t['cancellation_url']})"
+            embed.add_field(name=f"#{t['id']} {t['service_name']}", value=val, inline=False)
+
+        embed.set_footer(text="The financial monitor will fire an alert before renewal")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f" Failed to list trials: `{type(exc).__name__}: {exc}`")
+
+
+@trials_group.command(name="add")
+async def trials_add_cmd(ctx: commands.Context, service_name: str, end_date: str, cost: float = 0.0, cancel_url: str = None):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import add_subscription_trial
+        res = add_subscription_trial(
+            user_id=user_id,
+            service_name=service_name,
+            trial_end_date=end_date,
+            projected_cost=cost,
+            cancellation_url=cancel_url
+        )
+        await ctx.send(f" Tracked trial #{res['id']} for **{service_name}** expiring on `{end_date}` (${cost:,.2f}).")
+    except Exception as exc:
+        await ctx.send(f" Failed to add trial: `{type(exc).__name__}: {exc}`")
+
+
+@trials_group.command(name="cancel")
+async def trials_cancel_cmd(ctx: commands.Context, trial_id: int):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import update_trial_status
+        if update_trial_status(trial_id=trial_id, status="cancelled", user_id=user_id):
+            await ctx.send(f" Marked trial #{trial_id} as cancelled.")
+        else:
+            await ctx.send(f" Trial #{trial_id} not found.")
+    except Exception as exc:
+        await ctx.send(f" Failed to cancel trial: `{type(exc).__name__}: {exc}`")
+
+
+@trials_group.command(name="zombies")
+async def trials_zombies_cmd(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import detect_zombie_subscriptions
+        zombies = detect_zombie_subscriptions(user_id=user_id)
+        if not zombies:
+            await ctx.send(" No recurring subscriptions found.")
+            return
+
+        total_annual = sum(z["annual_cost"] for z in zombies)
+        embed = discord.Embed(
+            title="🧟 Subscription Watchdog & Zombie Review",
+            color=0x9B59B6,
+            description=f"Auditing **{len(zombies)}** recurring subscriptions (Total: **${total_annual:,.2f}/yr**)."
+        )
+        for z in zombies[:8]:
+            embed.add_field(
+                name=f"{z['merchant']} (${z['monthly_amount']:,.2f}/mo)",
+                value=f"Annual cost: **${z['annual_cost']:,.2f}** | Last: {z['last_billed']}\n💡 *{z['recommendation']}*",
+                inline=False
+            )
+        embed.set_footer(text="Ask Delilah to draft a cancellation email for any service")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"⚠️ Zombie scan failed: `{type(exc).__name__}: {exc}`")
+
+
+# ============================================================
+# Virtual Round-Up & Sinking Fund Envelopes
+# ============================================================
+@bot.group(name="sinking", aliases=["roundup", "bucket"], invoke_without_command=True)
+async def sinking_group(ctx: commands.Context):
+    """Manage virtual sinking fund envelopes and automated round-up savings."""
+    if ctx.invoked_subcommand is None:
+        await ctx.send(
+            "💰 **Virtual Round-Up & Sinking Funds Envelopes**\n"
+            "`!sinking list` — View all sinking funds, funding velocity, and completion dates.\n"
+            "`!sinking config <on|off> <target_bucket> [multiplier=1.0] [threshold=0.0]` — Configure round-up auto-save.\n"
+            "`!sinking sweep [days=30]` — Sweep spare change round-ups into the designated fund.\n"
+            "`!sinking target <name> <target_amount>` — Set or adjust the target for a fund.\n"
+            "`!sinking deposit <name> <amount>` — Add manual savings to an envelope."
+        )
+
+
+@sinking_group.command(name="list", aliases=["overview"])
+async def sinking_list_cmd(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import get_sinking_funds_overview
+        overview = get_sinking_funds_overview(user_id=user_id)
+        if overview.get("status") == "empty":
+            await ctx.send("ℹ️ No sinking funds found. Use `!sinking target <name> <target_amount>` to create one.")
+            return
+
+        target_b_name = overview['roundup_settings'].get('target_bucket_name', 'Emergency Fund')
+        embed = discord.Embed(
+            title="🎯 Sinking Funds & Savings Envelopes",
+            color=0x2ECC71,
+            description=(
+                f"**Total Saved:** ${overview['total_saved']:,.2f} / ${overview['total_target']:,.2f} "
+                f"(`{overview['overall_progress_pct']}%`)\n"
+                f"**Round-Up Engine:** `{'Active (' + target_b_name + ')' if overview['roundup_settings']['enabled'] else 'Disabled'}`"
+            )
+        )
+        for b in overview["buckets"]:
+            proj = b["projected_completion_date"] or "Indeterminate (need more deposits)"
+            vel = f"${b['monthly_velocity']:,.2f}/mo" if b['monthly_velocity'] > 0 else "No recent flow"
+            embed.add_field(
+                name=f"{b['milestone']} {b['name']}",
+                value=(
+                    f"Balance: **${b['current_amount']:,.2f}** / ${b['target_amount']:,.2f} (`{b['progress_pct']}%`)\n"
+                    f"Remaining: **${b['remaining_amount']:,.2f}** | Velocity: {vel}\n"
+                    f"Target Finish: `{proj}`"
+                ),
+                inline=False
+            )
+        embed.set_footer(text="Use !sinking sweep to auto-transfer spare change from recent transactions")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"⚠️ Sinking funds query failed: `{type(exc).__name__}: {exc}`")
+
+
+@sinking_group.command(name="config")
+async def sinking_config_cmd(ctx: commands.Context, enabled: str, target_bucket: str, multiplier: float = 1.0, threshold: float = 0.0):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import set_roundup_settings
+        is_on = enabled.lower() in ("true", "1", "on", "yes", "enable", "active")
+        res = set_roundup_settings(
+            user_id=user_id,
+            enabled=is_on,
+            target_bucket_name=target_bucket,
+            multiplier=multiplier,
+            whole_dollar_roundup=1.0
+        )
+        await ctx.send(
+            f"✅ Round-up settings saved!\n"
+            f"- Status: `{'Enabled' if res['enabled'] else 'Disabled'}`\n"
+            f"- Target Sinking Fund: **{res['target_bucket_name']}**\n"
+            f"- Multiplier: `{res['multiplier']}x`"
+        )
+    except Exception as exc:
+        await ctx.send(f"⚠️ Failed to update round-up config: `{type(exc).__name__}: {exc}`")
+
+
+@sinking_group.command(name="sweep")
+async def sinking_sweep_cmd(ctx: commands.Context, days: int = 30):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import apply_transaction_roundups
+        res = apply_transaction_roundups(user_id=user_id, days=days)
+        if res.get("status") == "empty":
+            await ctx.send("ℹ️ No eligible transactions found to round up.")
+            return
+
+        embed = discord.Embed(
+            title="🧹 Spare-Change Round-Up Sweep Executed",
+            color=0x1ABC9C,
+            description=(
+                f"Swept **${res['total_swept']:,.2f}** across **{res['roundups_count']}** transaction(s) "
+                f"into **{res['target_bucket']}**!\n"
+                f"New Bucket Balance: **${res['current_bucket_amount']:,.2f}** / ${res['target_amount']:,.2f} (`{res['progress_pct']}%`)"
+            )
+        )
+        if res.get("transactions_swept"):
+            sample = [f"- {t['merchant']} (${t['amount']:,.2f}) ➔ **+${t['roundup']:,.2f}**" for t in res["transactions_swept"][:5]]
+            embed.add_field(name="Recent Sweeps", value="\n".join(sample), inline=False)
+
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"⚠️ Sinking sweep failed: `{type(exc).__name__}: {exc}`")
+
+
+@sinking_group.command(name="target")
+async def sinking_target_cmd(ctx: commands.Context, name: str, target: float):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import adjust_savings_bucket
+        msg = adjust_savings_bucket(name=name, target=target, user_id=user_id)
+        await ctx.send(msg)
+    except Exception as exc:
+        await ctx.send(f"⚠️ Failed to adjust bucket target: `{type(exc).__name__}: {exc}`")
+
+
+@sinking_group.command(name="deposit")
+async def sinking_deposit_cmd(ctx: commands.Context, name: str, amount: float):
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import adjust_savings_bucket
+        from src.core.state import c, safe_commit
+        msg = adjust_savings_bucket(name=name, delta=amount, user_id=user_id)
+        c.execute(
+            "INSERT INTO bucket_contributions (user_id, bucket_name, amount, source) VALUES (?, ?, ?, 'manual_deposit')",
+            (user_id, name, amount)
+        )
+        safe_commit()
+        await ctx.send(f"{msg}\n📥 Logged deposit of **${amount:,.2f}** to contribution history.")
+    except Exception as exc:
+        await ctx.send(f"⚠️ Failed to deposit into bucket: `{type(exc).__name__}: {exc}`")
+
+
+# ============================================================
+# LaTeX Financial Digest & Scorecard Command
+# ============================================================
+@bot.command(name="digest", aliases=["scorecard", "report"])
+async def digest_command(ctx: commands.Context, period: str = "monthly"):
+    """
+    Generate an executive financial scorecard & downloadable LaTeX digest.
+    Usage: !digest [weekly|monthly]
+    """
+    user_id = str(ctx.author.id)
+    p_clean = period.lower().strip()
+    if p_clean in ("weekly", "week", "7d", "7"):
+        chosen_period = "weekly"
+    else:
+        chosen_period = "monthly"
+
+    try:
+        from src.services.report_generator import export_financial_digest
+        res = export_financial_digest(
+            period=chosen_period,
+            user_id=user_id,
+            user_name=ctx.author.display_name or "Delilah Client"
+        )
+        d = res["digest"]
+
+        grade_colors = {
+            "A+": 0x2ECC71, "A": 0x27AE60, "B": 0x3498DB,
+            "C": 0xF39C12, "D": 0xE67E22, "F": 0xE74C3C
+        }
+        col = grade_colors.get(d["grade"], 0x3498DB)
+
+        embed = discord.Embed(
+            title=f"📊 {d['period_label']} Financial Health Scorecard",
+            color=col,
+            description=(
+                f"**Overall Grade: `{d['grade']}` ({d['financial_health_score']}/100)**\n"
+                f"Evaluation Period: **Last {d['days']} Days**\n\n"
+                f"**Net Cash Flow:** `${d['net_cash_flow']:+,.2f}`\n"
+                f"• Inflows: `${d['inflow']:,.2f}`\n"
+                f"• Outflows: `${d['outflow']:,.2f}`\n"
+                f"• Savings Rate: **{d['savings_rate_pct']:.1f}%**"
+            )
+        )
+
+        if d.get("category_spending"):
+            top_cats = d["category_spending"][:4]
+            cat_str = "\n".join([f"• **{c['category']}**: ${c['amount']:,.2f} (`{c['percentage']:.0f}%`)" for c in top_cats])
+            embed.add_field(name="🏷️ Top Spending Categories", value=cat_str, inline=False)
+
+        debt = d.get("debt_summary", {})
+        sf = d.get("sinking_funds_summary", {})
+        embed.add_field(
+            name="💳 Debt Position",
+            value=f"Total: **${debt.get('total_debt', 0.0):,.2f}** ({debt.get('debt_count', 0)} accounts)",
+            inline=True
+        )
+        embed.add_field(
+            name="🎯 Sinking Funds",
+            value=f"Saved: **${sf.get('total_saved', 0.0):,.2f}** / ${sf.get('total_target', 0.0):,.2f} (`{sf.get('progress_pct', 0.0)}%`)",
+            inline=True
+        )
+
+        if d.get("top_transactions"):
+            largest = d["top_transactions"][0]
+            embed.add_field(
+                name="💥 Largest Purchase",
+                value=f"**{largest['merchant']}**: ${largest['amount']:,.2f} (`{largest['category']}`)",
+                inline=False
+            )
+
+        embed.set_footer(text="Full LaTeX report attached below • Compile with pdflatex or import into Overleaf")
+
+        files_to_send = []
+        if res.get("pdf_path") and os.path.exists(res["pdf_path"]):
+            files_to_send.append(discord.File(res["pdf_path"], filename=f"Delilah_Digest_{chosen_period}.pdf"))
+        if res.get("tex_path") and os.path.exists(res["tex_path"]):
+            files_to_send.append(discord.File(res["tex_path"], filename=f"Delilah_Digest_{chosen_period}.tex"))
+
+        await ctx.send(embed=embed, files=files_to_send)
+    except Exception as exc:
+        await ctx.send(f"⚠️ Failed to generate financial digest: `{type(exc).__name__}: {exc}`")
+
 
 # ============================================================
 # Self-Audit Command
@@ -3223,7 +4235,8 @@ async def monitor_cmd(ctx: commands.Context):
         await ctx.send(
             "**Financial Monitor**\n"
             "`!monitor list` — Show active rules.\n"
-            "`!monitor add <kind> <name> <json-config>` — Add a rule.\n"
+            "`!monitor create <instruction>` — Create a rule from natural language.\n"
+            "`!monitor add <kind> <name> <json-config>` — Add a rule manually.\n"
             "`!monitor run` — Evaluate rules now.\n"
             "`!monitor alerts [limit]` — Show recent alerts.\n"
             "`!monitor ack <id>` — Ack an alert.\n"
@@ -3255,6 +4268,41 @@ async def monitor_list_cmd(ctx: commands.Context):
         await ctx.send("\n".join(lines))
     except Exception as exc:
         await ctx.send(f" Monitor list failed: `{type(exc).__name__}: {exc}`")
+
+
+@monitor_cmd.command(name="create")
+async def monitor_create_cmd(ctx: commands.Context, *, instruction: str):
+    """Create a monitor rule from natural English (e.g. !monitor create alert if dining exceeds $200 this week)."""
+    user_id = str(ctx.author.id)
+    try:
+        import json
+        from src.services.monitor import compile_natural_language_rule, add_monitor_rule
+        spec = compile_natural_language_rule(instruction)
+        ok, msg, rid = add_monitor_rule(
+            conn,
+            user_id=user_id,
+            name=spec["name"],
+            kind=spec["kind"],
+            config=spec["config"],
+            severity=spec.get("severity", "warning"),
+            cooldown_hours=spec.get("cooldown_hours", 24)
+        )
+        if ok:
+            embed = discord.Embed(
+                title="🛡️ Monitor Rule Created",
+                color=0x2ECC71,
+                description=f"Rule **#{rid}** successfully registered from natural language."
+            )
+            embed.add_field(name="Name", value=spec["name"], inline=True)
+            embed.add_field(name="Kind", value=f"`{spec['kind']}`", inline=True)
+            embed.add_field(name="Severity", value=spec["severity"].capitalize(), inline=True)
+            embed.add_field(name="Validated Parameters", value=f"```json\n{json.dumps(spec['config'], indent=2)}\n```", inline=False)
+            embed.set_footer(text="The monitor engine will continuously evaluate this rule against your ledger.")
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send(f"❌ Failed to register rule: {msg}")
+    except Exception as exc:
+        await ctx.send(f"⚠️ {exc}")
 
 
 @monitor_cmd.command(name="add")

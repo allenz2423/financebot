@@ -11,7 +11,7 @@ import random
 import socket
 import time
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
 from html import unescape
 from zoneinfo import ZoneInfo
@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
+from typing import Optional, List, Dict, Any, Tuple
 import base64
 from io import BytesIO
 from pathlib import Path
@@ -288,6 +289,432 @@ def delete_savings_bucket(*, user_id: str, name: str | None = None, bucket_id: i
         )
     return f" Deleted **{display_name}** (ID {found_id})."
 
+
+def get_roundup_settings(*, user_id: str) -> dict:
+    """Retrieve round-up configuration for the user."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("get_roundup_settings: forced isolation violation — user_id is required")
+    c.execute(
+        "SELECT enabled, target_bucket_name, multiplier, whole_dollar_roundup FROM roundup_settings WHERE user_id = ?",
+        (user_id,)
+    )
+    row = c.fetchone()
+    if not row:
+        return {
+            "enabled": True,
+            "target_bucket_name": "Emergency Fund",
+            "multiplier": 1.0,
+            "whole_dollar_roundup": 1.0,
+        }
+    return {
+        "enabled": bool(row[0]),
+        "target_bucket_name": row[1],
+        "multiplier": float(row[2]),
+        "whole_dollar_roundup": float(row[3]),
+    }
+
+
+def set_roundup_settings(
+    *,
+    user_id: str,
+    enabled: bool = True,
+    target_bucket_name: str = "Emergency Fund",
+    multiplier: float = 1.0,
+    whole_dollar_roundup: float = 1.0,
+) -> dict:
+    """Update round-up settings for the user."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("set_roundup_settings: forced isolation violation — user_id is required")
+    target_bucket_name = (target_bucket_name or "Emergency Fund").strip()
+    multiplier = max(0.1, min(float(multiplier), 10.0))
+    whole_dollar = max(0.0, float(whole_dollar_roundup))
+
+    c.execute(
+        """INSERT INTO roundup_settings (user_id, enabled, target_bucket_name, multiplier, whole_dollar_roundup, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(user_id) DO UPDATE SET
+            enabled = excluded.enabled,
+            target_bucket_name = excluded.target_bucket_name,
+            multiplier = excluded.multiplier,
+            whole_dollar_roundup = excluded.whole_dollar_roundup,
+            updated_at = datetime('now')""",
+        (user_id, 1 if enabled else 0, target_bucket_name, multiplier, whole_dollar)
+    )
+    safe_commit()
+    return {
+        "enabled": enabled,
+        "target_bucket_name": target_bucket_name,
+        "multiplier": multiplier,
+        "whole_dollar_roundup": whole_dollar,
+    }
+
+
+def calculate_transaction_roundup(amount: float, multiplier: float = 1.0, whole_dollar_roundup: float = 1.0) -> float:
+    """Calculate spare change round-up for a transaction amount."""
+    amt = float(amount or 0.0)
+    if amt <= 0:
+        return 0.0
+    cents = round(amt % 1.0, 2)
+    if cents == 0.0:
+        roundup = whole_dollar_roundup
+    else:
+        roundup = round(1.0 - cents, 2)
+    return round(roundup * multiplier, 2)
+
+
+def apply_transaction_roundups(days: int = 7, *, user_id: str) -> dict:
+    """
+    Scan recent purchases, calculate spare change round-ups, and allocate to the target savings bucket.
+    Idempotent: will not double-count transactions that have already been rounded up.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("apply_transaction_roundups: forced isolation violation — user_id is required")
+
+    settings = get_roundup_settings(user_id=user_id)
+    if not settings["enabled"]:
+        return {"status": "disabled", "message": "Round-ups are currently disabled for this user."}
+
+    target_bucket = settings["target_bucket_name"]
+    mult = settings["multiplier"]
+    whole_dollar = settings["whole_dollar_roundup"]
+
+    # Ensure target bucket exists
+    c.execute("SELECT id, current_amount FROM savings_buckets WHERE user_id = ? AND LOWER(name) = LOWER(?)", (user_id, target_bucket))
+    b_row = c.fetchone()
+    if not b_row:
+        c.execute("INSERT INTO savings_buckets (user_id, name, target_amount, current_amount) VALUES (?, ?, 1000.0, 0.0)", (user_id, target_bucket))
+        safe_commit()
+
+    # Find candidate transactions in the last N days not yet recorded in bucket_contributions
+    c.execute(
+        """SELECT t.id, t.date, t.clean_merchant, t.merchant, t.amount
+        FROM transactions t
+        WHERE t.user_id = ? AND t.amount > 0
+          AND t.date >= datetime('now', ?)
+          AND t.merchant NOT LIKE '%System Balance Sync%'
+          AND COALESCE(t.category, '') NOT LIKE 'Credit Card Bill Payment%'
+          AND COALESCE(t.category, '') NOT LIKE 'P2P Transfer%'
+          AND NOT EXISTS (
+              SELECT 1 FROM bucket_contributions bc
+              WHERE bc.user_id = ? AND bc.transaction_id = CAST(t.id AS TEXT)
+          )
+        ORDER BY datetime(t.date) ASC""",
+        (user_id, f"-{days} days", user_id)
+    )
+    rows = c.fetchall()
+
+    if not rows:
+        return {
+            "status": "success",
+            "roundups_count": 0,
+            "total_swept": 0.0,
+            "target_bucket": target_bucket,
+            "message": "No new transactions found to round up.",
+        }
+
+    total_roundup = 0.0
+    records = []
+    for r in rows:
+        tx_id, dt, cmerch, merch, amt = r
+        amt_f = float(amt)
+        spare = calculate_transaction_roundup(amt_f, multiplier=mult, whole_dollar_roundup=whole_dollar)
+        if spare > 0:
+            total_roundup += spare
+            c.execute(
+                """INSERT INTO bucket_contributions (user_id, bucket_name, amount, source, transaction_id, created_at)
+                VALUES (?, ?, ?, 'roundup', ?, datetime('now'))""",
+                (user_id, target_bucket, spare, str(tx_id))
+            )
+            records.append({
+                "transaction_id": tx_id,
+                "merchant": cmerch or merch,
+                "amount": amt_f,
+                "roundup": spare,
+            })
+
+    total_roundup = round(total_roundup, 2)
+    # Credit the savings bucket
+    c.execute(
+        "UPDATE savings_buckets SET current_amount = current_amount + ? WHERE user_id = ? AND LOWER(name) = LOWER(?)",
+        (total_roundup, user_id, target_bucket)
+    )
+    safe_commit()
+
+    # Get updated bucket balance
+    c.execute("SELECT current_amount, target_amount FROM savings_buckets WHERE user_id = ? AND LOWER(name) = LOWER(?)", (user_id, target_bucket))
+    up_row = c.fetchone()
+    cur_bal = float(up_row[0]) if up_row else total_roundup
+    tar_bal = float(up_row[1]) if up_row else 1000.0
+
+    return {
+        "status": "success",
+        "roundups_count": len(records),
+        "total_swept": total_roundup,
+        "target_bucket": target_bucket,
+        "current_bucket_amount": cur_bal,
+        "target_amount": tar_bal,
+        "progress_pct": round((cur_bal / tar_bal * 100) if tar_bal > 0 else 100.0, 1),
+        "transactions_swept": records[:10],
+    }
+
+
+def get_sinking_funds_overview(*, user_id: str) -> dict:
+    """
+    Compute goal progress, monthly funding velocity, and completion projections for all sinking funds.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("get_sinking_funds_overview: forced isolation violation — user_id is required")
+
+    c.execute(
+        "SELECT id, name, target_amount, current_amount FROM savings_buckets WHERE user_id = ? ORDER BY name",
+        (user_id,)
+    )
+    rows = c.fetchall()
+    if not rows:
+        return {"status": "empty", "message": "No sinking funds or savings buckets configured.", "buckets": []}
+
+    buckets = []
+    total_saved = 0.0
+    total_target = 0.0
+
+    for bid, name, target_amt, cur_amt in rows:
+        target = float(target_amt or 0.0)
+        current = float(cur_amt or 0.0)
+        total_saved += current
+        total_target += target
+
+        pct = round((current / target * 100) if target > 0 else 100.0, 1)
+
+        # Monthly savings velocity over trailing 90 days from contributions
+        c.execute(
+            """SELECT SUM(amount) FROM bucket_contributions
+            WHERE user_id = ? AND LOWER(bucket_name) = LOWER(?)
+              AND created_at >= datetime('now', '-90 days')""",
+            (user_id, name)
+        )
+        v_row = c.fetchone()
+        three_month_contrib = float(v_row[0] or 0.0)
+        monthly_velocity = round(three_month_contrib / 3.0, 2)
+
+        # Remaining & projection
+        remaining = max(0.0, target - current)
+        months_to_complete = None
+        target_date = None
+        if remaining > 0 and monthly_velocity > 0:
+            months_to_complete = round(remaining / monthly_velocity, 1)
+            target_date = (datetime.now() + timedelta(days=int(months_to_complete * 30.44))).strftime("%B %Y")
+        elif remaining == 0:
+            months_to_complete = 0.0
+            target_date = "Completed!"
+
+        # Milestone
+        if pct >= 100.0:
+            milestone = "🎉 Fully Funded"
+        elif pct >= 75.0:
+            milestone = "🔥 75% Milestone Reached"
+        elif pct >= 50.0:
+            milestone = "⭐ 50% Halfway Mark"
+        elif pct >= 25.0:
+            milestone = "🌱 25% Seed Milestone"
+        else:
+            milestone = "🚀 In Progress"
+
+        buckets.append({
+            "id": bid,
+            "name": name,
+            "current_amount": current,
+            "target_amount": target,
+            "remaining_amount": round(remaining, 2),
+            "progress_pct": pct,
+            "monthly_velocity": monthly_velocity,
+            "months_remaining": months_to_complete,
+            "projected_completion_date": target_date,
+            "milestone": milestone,
+        })
+
+    roundup_cfg = get_roundup_settings(user_id=user_id)
+
+    return {
+        "status": "success",
+        "total_saved": round(total_saved, 2),
+        "total_target": round(total_target, 2),
+        "overall_progress_pct": round((total_saved / total_target * 100) if total_target > 0 else 100.0, 1),
+        "roundup_settings": roundup_cfg,
+        "buckets": buckets,
+    }
+
+
+def generate_financial_digest(period: str = "monthly", days: int = None, *, user_id: str) -> dict:
+    """
+    Compile a deterministic financial scorecard and executive digest for weekly or monthly review.
+    Calculates cash flow, savings rate, financial health grade (A+ to F), top expense categories,
+    outlier transactions, sinking fund trajectory, and debt metrics.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("generate_financial_digest: forced isolation violation — user_id is required")
+
+    p_norm = (period or "monthly").lower().strip()
+    if days is None:
+        if p_norm in ("weekly", "week", "7d"):
+            days = 7
+            period_label = "Weekly"
+        else:
+            days = 30
+            period_label = "Monthly"
+    else:
+        days = max(1, min(int(days), 365))
+        period_label = f"{days}-Day"
+
+    # 1. Settled Cash Flow (Inflow & Outflow)
+    c.execute(
+        """SELECT
+            SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END),
+            SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END),
+            COUNT(*)
+        FROM transactions
+        WHERE user_id = ?
+          AND merchant NOT LIKE '%System Balance Sync%'
+          AND date >= datetime('now', ?)""",
+        (user_id, f"-{days} days")
+    )
+    inflow_raw, outflow_raw, tx_count = c.fetchone() or (0.0, 0.0, 0)
+    inflow = float(inflow_raw or 0.0)
+    outflow = float(outflow_raw or 0.0)
+    net_cash_flow = round(inflow - outflow, 2)
+
+    # Savings Rate
+    if inflow > 0:
+        savings_rate = round((net_cash_flow / inflow) * 100, 1)
+    else:
+        savings_rate = 0.0 if outflow == 0 else -100.0
+
+    # 2. Category Spending Breakdown
+    c.execute(
+        """SELECT COALESCE(category, 'Uncategorized'), SUM(amount), COUNT(*)
+        FROM transactions
+        WHERE user_id = ? AND amount > 0
+          AND merchant NOT LIKE '%System Balance Sync%'
+          AND date >= datetime('now', ?)
+        GROUP BY COALESCE(category, 'Uncategorized')
+        ORDER BY SUM(amount) DESC""",
+        (user_id, f"-{days} days")
+    )
+    cat_rows = c.fetchall()
+    categories = []
+    for cat_name, cat_amt, cat_cnt in cat_rows:
+        amt = float(cat_amt or 0.0)
+        pct = round((amt / outflow * 100) if outflow > 0 else 0.0, 1)
+        categories.append({
+            "category": cat_name,
+            "amount": round(amt, 2),
+            "count": cat_cnt,
+            "percentage": pct,
+        })
+
+    # 3. Top Outlier / Largest Purchases
+    c.execute(
+        """SELECT id, date, COALESCE(clean_merchant, merchant), amount, COALESCE(category, 'Uncategorized')
+        FROM transactions
+        WHERE user_id = ? AND amount > 0
+          AND merchant NOT LIKE '%System Balance Sync%'
+          AND date >= datetime('now', ?)
+        ORDER BY amount DESC LIMIT 5""",
+        (user_id, f"-{days} days")
+    )
+    top_txs = [
+        {"id": r[0], "date": r[1], "merchant": r[2], "amount": float(r[3]), "category": r[4]}
+        for r in c.fetchall()
+    ]
+
+    # 4. Debt Status
+    c.execute(
+        "SELECT COUNT(*), SUM(balance), SUM(min_payment) FROM user_debts WHERE user_id = ?",
+        (user_id,)
+    )
+    debt_cnt, debt_bal, debt_min = c.fetchone() or (0, 0.0, 0.0)
+    total_debt = float(debt_bal or 0.0)
+
+    # 5. Sinking Funds & Savings Envelopes
+    c.execute(
+        "SELECT COUNT(*), SUM(current_amount), SUM(target_amount) FROM savings_buckets WHERE user_id = ?",
+        (user_id,)
+    )
+    sf_cnt, sf_cur, sf_tar = c.fetchone() or (0, 0.0, 0.0)
+    total_saved = float(sf_cur or 0.0)
+    total_target = float(sf_tar or 0.0)
+    sf_pct = round((total_saved / total_target * 100) if total_target > 0 else 100.0, 1)
+
+    # 6. Active Subscriptions & Free Trials
+    c.execute(
+        "SELECT COUNT(*) FROM subscription_trials WHERE user_id = ? AND status = 'active' AND date(trial_end_date) >= date('now')",
+        (user_id,)
+    )
+    active_trials_cnt = (c.fetchone() or [0])[0]
+
+    # 7. Financial Health Score (0 - 100) & Letter Grade
+    score = 0.0
+    if savings_rate >= 20.0:
+        score += 40.0
+    elif savings_rate > 0:
+        score += (savings_rate / 20.0) * 40.0
+
+    if total_debt == 0.0:
+        score += 30.0
+    else:
+        if inflow > 0 and debt_min:
+            coverage = inflow / float(debt_min)
+            score += min(25.0, coverage * 3.0)
+        else:
+            score += 10.0
+
+    score += min(20.0, (sf_pct / 100.0) * 20.0)
+
+    if net_cash_flow >= 0:
+        score += 10.0
+
+    health_score = int(round(max(0.0, min(100.0, score))))
+
+    if health_score >= 90:
+        grade = "A+"
+    elif health_score >= 80:
+        grade = "A"
+    elif health_score >= 70:
+        grade = "B"
+    elif health_score >= 60:
+        grade = "C"
+    elif health_score >= 50:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return {
+        "status": "success",
+        "period_label": period_label,
+        "days": days,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "financial_health_score": health_score,
+        "grade": grade,
+        "inflow": round(inflow, 2),
+        "outflow": round(outflow, 2),
+        "net_cash_flow": net_cash_flow,
+        "savings_rate_pct": savings_rate,
+        "transaction_count": tx_count or 0,
+        "category_spending": categories,
+        "top_transactions": top_txs,
+        "debt_summary": {
+            "debt_count": debt_cnt or 0,
+            "total_debt": round(total_debt, 2),
+        },
+        "sinking_funds_summary": {
+            "bucket_count": sf_cnt or 0,
+            "total_saved": round(total_saved, 2),
+            "total_target": round(total_target, 2),
+            "progress_pct": sf_pct,
+        },
+        "active_trials_count": active_trials_cnt or 0,
+    }
+
+
 def get_subscriptions(*, user_id: str) -> list[dict]:
     if not user_id or not isinstance(user_id, str):
         raise ValueError(
@@ -299,6 +726,141 @@ def get_subscriptions(*, user_id: str) -> list[dict]:
         (user_id,)
     )
     return [{"merchant": r[0], "amount": r[1], "last_date": r[2], "status": r[3]} for r in c.fetchall()]
+
+
+def add_subscription_trial(
+    *,
+    user_id: str,
+    service_name: str,
+    trial_end_date: str,
+    projected_cost: float = 0.0,
+    billing_cycle: str = "monthly",
+    cancellation_url: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> dict:
+    """Track a free trial with renewal date and projected cost."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("add_subscription_trial: forced isolation violation — user_id is required")
+    service_name = (service_name or "").strip()
+    if not service_name:
+        raise ValueError("Service name cannot be empty")
+    trial_end_date = (trial_end_date or "").strip()
+    if not trial_end_date:
+        raise ValueError("trial_end_date is required (YYYY-MM-DD)")
+
+    c.execute(
+        """INSERT INTO subscription_trials
+        (user_id, service_name, trial_end_date, projected_cost, billing_cycle, cancellation_url, notes, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'), datetime('now'))""",
+        (user_id, service_name, trial_end_date, float(projected_cost or 0.0), billing_cycle, cancellation_url, notes)
+    )
+    new_id = c.lastrowid
+    safe_commit()
+    return {
+        "id": new_id,
+        "service_name": service_name,
+        "trial_end_date": trial_end_date,
+        "projected_cost": float(projected_cost or 0.0),
+        "status": "active",
+    }
+
+
+def list_subscription_trials(*, user_id: str, active_only: bool = True) -> list:
+    """Return all tracked subscription trials."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("list_subscription_trials: forced isolation violation — user_id is required")
+    cond = "AND status = 'active'" if active_only else ""
+    c.execute(
+        f"""SELECT id, service_name, trial_end_date, projected_cost, billing_cycle, cancellation_url, notes, status
+        FROM subscription_trials
+        WHERE user_id = ? {cond}
+        ORDER BY date(trial_end_date) ASC""",
+        (user_id,)
+    )
+    results = []
+    today = datetime.now().date()
+    for r in c.fetchall():
+        end_dt_str = str(r[2])[:10]
+        try:
+            end_d = datetime.strptime(end_dt_str, "%Y-%m-%d").date()
+            days_left = (end_d - today).days
+        except ValueError:
+            days_left = None
+
+        results.append({
+            "id": r[0],
+            "service_name": r[1],
+            "trial_end_date": r[2],
+            "projected_cost": float(r[3] or 0.0),
+            "billing_cycle": r[4],
+            "cancellation_url": r[5],
+            "notes": r[6],
+            "status": r[7],
+            "days_remaining": days_left,
+        })
+    return results
+
+
+def update_trial_status(trial_id: int, status: str, *, user_id: str) -> bool:
+    """Update status of a trial ('active', 'cancelled', 'converted')."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("update_trial_status: forced isolation violation — user_id is required")
+    status = status.lower().strip()
+    c.execute(
+        "UPDATE subscription_trials SET status = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?",
+        (status, int(trial_id), user_id)
+    )
+    affected = c.rowcount > 0
+    safe_commit()
+    return affected
+
+
+def detect_zombie_subscriptions(inactivity_days: int = 45, *, user_id: str) -> list:
+    """
+    Detect recurring subscriptions that have billed recently, tracking annual cost
+    and highlighting potential candidates for cancellation.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("detect_zombie_subscriptions: forced isolation violation — user_id is required")
+
+    c.execute(
+        """SELECT s.merchant, s.last_amount, s.last_date, s.status
+        FROM subscriptions s
+        WHERE s.user_id = ? AND s.status = 'Active'
+        ORDER BY s.last_amount DESC""",
+        (user_id,)
+    )
+    subs = c.fetchall()
+    zombies = []
+
+    for merch, amt, l_date, st in subs:
+        c.execute(
+            """SELECT COUNT(*) FROM transactions
+            WHERE user_id = ? AND clean_merchant = ?
+              AND date >= datetime('now', ?)""",
+            (user_id, merch, f"-{inactivity_days} days")
+        )
+        recent_count = c.fetchone()[0]
+
+        c.execute(
+            """SELECT SUM(amount), COUNT(*) FROM transactions
+            WHERE user_id = ? AND (merchant LIKE ? OR clean_merchant = ?)
+              AND date >= datetime('now', '-365 days')""",
+            (user_id, f"%{merch}%", merch)
+        )
+        annual_row = c.fetchone()
+        annual_spend = float(annual_row[0] or (float(amt or 0.0) * 12))
+
+        zombies.append({
+            "merchant": merch,
+            "monthly_amount": float(amt or 0.0),
+            "annual_cost": round(annual_spend, 2),
+            "last_billed": l_date,
+            "recent_activity_count": recent_count,
+            "recommendation": f"Review potential cancellation. Saving: ${annual_spend:,.2f}/yr."
+        })
+
+    return zombies
 
 def get_budget_settings(*, user_id: str) -> tuple[float, float]:
     if not user_id or not isinstance(user_id, str):
@@ -1961,6 +2523,568 @@ def get_debt_overview(*, user_id: str) -> str:
     lines.append(f"**Loan balances:** ${loan:,.2f}")
     return "\n".join(lines)
 
+
+def sync_debts_from_plaid(*, user_id: str) -> int:
+    """Sync active credit and loan accounts from plaid_accounts into user_debts."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("sync_debts_from_plaid: forced isolation violation — user_id is required")
+    c.execute(
+        """SELECT plaid_account_id, name, current_balance, subtype, type
+        FROM plaid_accounts WHERE user_id = ? AND active = 1 AND type IN ('credit', 'loan')""",
+        (user_id,)
+    )
+    rows = c.fetchall()
+    synced_count = 0
+    for paid, name, bal, subtype, typ in rows:
+        balance = float(bal or 0.0)
+        if balance <= 0:
+            continue
+        c.execute(
+            "SELECT id, apr, min_payment FROM user_debts WHERE user_id = ? AND plaid_account_id = ?",
+            (user_id, paid)
+        )
+        existing = c.fetchone()
+        if existing:
+            c.execute(
+                "UPDATE user_debts SET balance = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?",
+                (balance, existing[0], user_id)
+            )
+        else:
+            default_apr = 24.99 if typ == "credit" else 8.5
+            default_min = max(25.0, round(balance * 0.025, 2))
+            c.execute(
+                """INSERT INTO user_debts (user_id, name, balance, apr, min_payment, plaid_account_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+                (user_id, f"{name or 'Account'} ({subtype or typ})", balance, default_apr, default_min, paid)
+            )
+        synced_count += 1
+    safe_commit()
+    return synced_count
+
+
+def add_or_update_debt(*, user_id: str, name: str, balance: float, apr: float = 0.0, min_payment: float = 0.0, debt_id: Optional[int] = None, plaid_account_id: Optional[str] = None) -> dict:
+    """Create or update a tracked debt."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("add_or_update_debt: forced isolation violation — user_id is required")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Debt name cannot be empty")
+    balance = float(balance)
+    apr = max(0.0, float(apr))
+    min_payment = max(0.0, float(min_payment))
+
+    if min_payment <= 0.0 and balance > 0:
+        min_payment = max(25.0, round(balance * 0.025, 2))
+
+    if debt_id is not None:
+        c.execute(
+            """UPDATE user_debts
+            SET name = ?, balance = ?, apr = ?, min_payment = ?, updated_at = datetime('now')
+            WHERE id = ? AND user_id = ?""",
+            (name, balance, apr, min_payment, debt_id, user_id)
+        )
+        safe_commit()
+        return {"id": debt_id, "name": name, "balance": balance, "apr": apr, "min_payment": min_payment}
+
+    c.execute(
+        """INSERT INTO user_debts (user_id, name, balance, apr, min_payment, plaid_account_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+        (user_id, name, balance, apr, min_payment, plaid_account_id)
+    )
+    new_id = c.lastrowid
+    safe_commit()
+    return {"id": new_id, "name": name, "balance": balance, "apr": apr, "min_payment": min_payment}
+
+
+def list_user_debts(*, user_id: str, auto_sync: bool = True) -> list:
+    """Return all active debts for the user."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("list_user_debts: forced isolation violation — user_id is required")
+    if auto_sync:
+        sync_debts_from_plaid(user_id=user_id)
+
+    c.execute(
+        """SELECT id, name, balance, apr, min_payment, plaid_account_id, updated_at
+        FROM user_debts WHERE user_id = ? AND balance > 0
+        ORDER BY balance ASC""",
+        (user_id,)
+    )
+    debts = []
+    for r in c.fetchall():
+        debts.append({
+            "id": r[0],
+            "name": r[1],
+            "balance": float(r[2]),
+            "apr": float(r[3]),
+            "min_payment": float(r[4]),
+            "plaid_account_id": r[5],
+            "updated_at": r[6],
+        })
+    return debts
+
+
+def delete_user_debt(debt_id: int, *, user_id: str) -> bool:
+    """Delete a tracked debt."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("delete_user_debt: forced isolation violation — user_id is required")
+    c.execute("DELETE FROM user_debts WHERE id = ? AND user_id = ?", (debt_id, user_id))
+    affected = c.rowcount > 0
+    safe_commit()
+    return affected
+
+
+def calculate_debt_payoff(
+    strategy: str = "avalanche",
+    extra_monthly: float = 0.0,
+    *,
+    user_id: str,
+    debts_override: Optional[list] = None
+) -> dict:
+    """
+    Deterministic debt snowball and avalanche simulation engine.
+    Strategy: 'avalanche' (highest APR first) or 'snowball' (lowest balance first).
+    Simulates monthly payment cascades including rollover of minimum payments.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("calculate_debt_payoff: forced isolation violation — user_id is required")
+
+    strategy = strategy.lower().strip()
+    if strategy not in ("avalanche", "snowball"):
+        raise ValueError("Strategy must be either 'avalanche' or 'snowball'")
+
+    debts = [dict(d) for d in debts_override] if debts_override is not None else list_user_debts(user_id=user_id)
+    active_debts = [d for d in debts if d.get("balance", 0) > 0]
+
+    if not active_debts:
+        return {
+            "status": "empty",
+            "message": "No active debts found to simulate.",
+            "total_debt": 0.0,
+        }
+
+    total_initial_balance = sum(d["balance"] for d in active_debts)
+    total_min_payment = sum(d["min_payment"] for d in active_debts)
+
+    def _simulate(strat: str, extra: float):
+        import copy
+        current_debts = copy.deepcopy(active_debts)
+        months = 0
+        total_interest = 0.0
+        total_paid = 0.0
+        milestones = []
+        monthly_schedule = []
+
+        now = datetime.now()
+
+        while current_debts and months < 360:
+            months += 1
+            month_date = (now + timedelta(days=months * 30.44)).strftime("%Y-%m")
+            interest_month = 0.0
+            paid_month = 0.0
+
+            # 1. Accrue monthly interest
+            for d in current_debts:
+                m_interest = round(d["balance"] * (d["apr"] / 100.0 / 12.0), 2)
+                d["balance"] += m_interest
+                interest_month += m_interest
+                total_interest += m_interest
+
+            # 2. Base payment pool: all minimum payments + extra
+            # Minimum payments on debts that are already eliminated roll into the extra pool!
+            unallocated_funds = extra
+
+            # Pay minimums first
+            paid_off_this_turn = []
+            for d in current_debts:
+                pmt = min(d["min_payment"], d["balance"])
+                d["balance"] -= pmt
+                paid_month += pmt
+                total_paid += pmt
+                if d["balance"] <= 0.001:
+                    paid_off_this_turn.append(d)
+
+            # Rollover minimum payments of paid off debts
+            for d in paid_off_this_turn:
+                milestones.append({
+                    "name": d["name"],
+                    "month": months,
+                    "date": month_date,
+                    "freed_payment": d["min_payment"],
+                })
+                current_debts.remove(d)
+
+            # 3. Sort active debts according to strategy for extra payments
+            if current_debts:
+                if strat == "avalanche":
+                    current_debts.sort(key=lambda x: (-x["apr"], x["balance"]))
+                else:  # snowball
+                    current_debts.sort(key=lambda x: (x["balance"], -x["apr"]))
+
+                # Add freed min payments to extra roll
+                freed_minimums = sum(m["freed_payment"] for m in milestones)
+                snowball_pool = unallocated_funds + freed_minimums
+
+                # Cascade extra funds to priority debt(s)
+                idx = 0
+                while snowball_pool > 0.001 and idx < len(current_debts):
+                    target = current_debts[idx]
+                    alloc = min(snowball_pool, target["balance"])
+                    target["balance"] -= alloc
+                    paid_month += alloc
+                    total_paid += alloc
+                    snowball_pool -= alloc
+
+                    if target["balance"] <= 0.001:
+                        milestones.append({
+                            "name": target["name"],
+                            "month": months,
+                            "date": month_date,
+                            "freed_payment": target["min_payment"],
+                        })
+                        current_debts.pop(idx)
+                    else:
+                        idx += 1
+
+            remaining_balance = sum(d["balance"] for d in current_debts)
+            monthly_schedule.append({
+                "month": months,
+                "date": month_date,
+                "remaining_balance": round(remaining_balance, 2),
+                "interest_paid": round(interest_month, 2),
+                "principal_paid": round(paid_month - interest_month, 2),
+            })
+
+            if not current_debts:
+                break
+
+        return {
+            "strategy": strat,
+            "months": months,
+            "total_interest": round(total_interest, 2),
+            "total_paid": round(total_paid, 2),
+            "milestones": milestones,
+            "monthly_schedule": monthly_schedule,
+            "debt_free_date": (now + timedelta(days=months * 30.44)).strftime("%B %Y"),
+        }
+
+    chosen_result = _simulate(strategy, extra_monthly)
+    alt_strategy = "snowball" if strategy == "avalanche" else "avalanche"
+    alt_result = _simulate(alt_strategy, extra_monthly)
+
+    interest_diff = round(alt_result["total_interest"] - chosen_result["total_interest"], 2)
+    months_diff = alt_result["months"] - chosen_result["months"]
+
+    return {
+        "status": "success",
+        "strategy": strategy,
+        "total_initial_balance": round(total_initial_balance, 2),
+        "total_min_payment": round(total_min_payment, 2),
+        "extra_monthly": round(extra_monthly, 2),
+        "months_to_payoff": chosen_result["months"],
+        "debt_free_date": chosen_result["debt_free_date"],
+        "total_interest_paid": chosen_result["total_interest"],
+        "total_paid": chosen_result["total_paid"],
+        "milestones": chosen_result["milestones"],
+        "schedule": chosen_result["monthly_schedule"],
+        "comparison": {
+            "alt_strategy": alt_strategy,
+            "alt_months": alt_result["months"],
+            "alt_debt_free_date": alt_result["debt_free_date"],
+            "alt_interest": alt_result["total_interest"],
+            "interest_saved_with_avalanche": abs(round(alt_result["total_interest"] - chosen_result["total_interest"], 2)) if strategy == "avalanche" else -round(chosen_result["total_interest"] - alt_result["total_interest"], 2),
+            "months_saved_with_avalanche": alt_result["months"] - chosen_result["months"] if strategy == "avalanche" else -(chosen_result["months"] - alt_result["months"]),
+        }
+    }
+
+
+def add_transaction_item(
+    *,
+    user_id: str,
+    transaction_row_id: int,
+    item_name: str,
+    total_price: float,
+    quantity: float = 1.0,
+    unit_price: Optional[float] = None,
+    category: Optional[str] = None,
+    source: str = "manual",
+    raw_receipt_id: Optional[str] = None,
+) -> dict:
+    """Attach an itemized line item to a transaction."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("add_transaction_item: forced isolation violation — user_id is required")
+    item_name = (item_name or "").strip()
+    if not item_name:
+        raise ValueError("item_name cannot be empty")
+    quantity = float(quantity or 1.0)
+    total_price = float(total_price)
+    if unit_price is None:
+        unit_price = round(total_price / quantity, 2) if quantity > 0 else total_price
+
+    c.execute(
+        """INSERT INTO transaction_items
+        (user_id, transaction_row_id, item_name, quantity, unit_price, total_price, category, source, raw_receipt_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+        (user_id, transaction_row_id, item_name, quantity, unit_price, total_price, category, source, raw_receipt_id)
+    )
+    new_id = c.lastrowid
+    safe_commit()
+    return {
+        "id": new_id,
+        "transaction_row_id": transaction_row_id,
+        "item_name": item_name,
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "total_price": total_price,
+        "category": category,
+        "source": source,
+    }
+
+
+def get_transaction_items(transaction_row_id: int, *, user_id: str) -> list:
+    """Retrieve all itemized line items attached to a transaction."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("get_transaction_items: forced isolation violation — user_id is required")
+    c.execute(
+        """SELECT id, transaction_row_id, item_name, quantity, unit_price, total_price, category, source, raw_receipt_id, created_at
+        FROM transaction_items
+        WHERE transaction_row_id = ? AND user_id = ?
+        ORDER BY id ASC""",
+        (transaction_row_id, user_id)
+    )
+    items = []
+    for r in c.fetchall():
+        items.append({
+            "id": r[0],
+            "transaction_row_id": r[1],
+            "item_name": r[2],
+            "quantity": float(r[3]),
+            "unit_price": float(r[4]),
+            "total_price": float(r[5]),
+            "category": r[6],
+            "source": r[7],
+            "raw_receipt_id": r[8],
+            "created_at": r[9],
+        })
+    return items
+
+
+def delete_transaction_item(item_id: int, *, user_id: str) -> bool:
+    """Delete an itemized line item."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("delete_transaction_item: forced isolation violation — user_id is required")
+    c.execute("DELETE FROM transaction_items WHERE id = ? AND user_id = ?", (item_id, user_id))
+    affected = c.rowcount > 0
+    safe_commit()
+    return affected
+
+
+def reconcile_receipts_for_user(days: int = 14, *, user_id: str) -> dict:
+    """
+    Search connected Gmail for receipts matching recent transactions and itemize them.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("reconcile_receipts_for_user: forced isolation violation — user_id is required")
+
+    from src.services.receipt_parser import find_matching_gmail_receipt
+
+    # Query recent evaluated transactions without existing items
+    c.execute(
+        """SELECT t.id, t.date, t.merchant, t.clean_merchant, t.amount
+        FROM transactions t
+        WHERE t.user_id = ? AND t.amount > 0
+          AND t.date >= datetime('now', ?)
+          AND NOT EXISTS (
+              SELECT 1 FROM transaction_items ti WHERE ti.transaction_row_id = t.id AND ti.user_id = ?
+          )
+        ORDER BY t.date DESC LIMIT 20""",
+        (user_id, f"-{days} days", user_id)
+    )
+    unmatched_txs = c.fetchall()
+
+    matched_count = 0
+    total_items_added = 0
+    reconciled_details = []
+
+    for row in unmatched_txs:
+        tx = {
+            "id": row[0],
+            "date": row[1],
+            "merchant": row[2],
+            "clean_merchant": row[3],
+            "amount": float(row[4]),
+        }
+
+        match = find_matching_gmail_receipt(tx, user_id=user_id)
+        if match:
+            matched_count += 1
+            msg_id = match.get("message_id")
+            items = match.get("items", [])
+            for item in items:
+                add_transaction_item(
+                    user_id=user_id,
+                    transaction_row_id=tx["id"],
+                    item_name=item["item_name"],
+                    total_price=item["total_price"],
+                    quantity=item.get("quantity", 1.0),
+                    unit_price=item.get("unit_price"),
+                    source="gmail_receipt",
+                    raw_receipt_id=msg_id,
+                )
+                total_items_added += 1
+
+            reconciled_details.append({
+                "transaction_id": tx["id"],
+                "merchant": tx["clean_merchant"] or tx["merchant"],
+                "amount": tx["amount"],
+                "subject": match.get("subject"),
+                "item_count": len(items),
+            })
+
+    return {
+        "status": "success",
+        "scanned_transactions": len(unmatched_txs),
+        "matched_transactions": matched_count,
+        "items_extracted": total_items_added,
+        "details": reconciled_details,
+    }
+
+
+def tag_transaction_tax(
+    transaction_row_id: int,
+    is_deductible: bool = True,
+    tax_category: Optional[str] = None,
+    *,
+    user_id: str,
+) -> dict:
+    """Tag or untag a transaction as a tax deductible business or personal expense."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("tag_transaction_tax: forced isolation violation — user_id is required")
+    try:
+        transaction_row_id = int(transaction_row_id)
+    except (TypeError, ValueError):
+        raise ValueError("transaction_row_id must be an integer")
+
+    c.execute(
+        "SELECT id, merchant, clean_merchant, amount, date FROM transactions WHERE id = ? AND user_id = ?",
+        (transaction_row_id, user_id)
+    )
+    row = c.fetchone()
+    if not row:
+        return {"status": "not_found", "message": f"Transaction #{transaction_row_id} not found."}
+
+    tax_cat = (tax_category or "").strip() if is_deductible else None
+    deductible_val = 1 if is_deductible else 0
+
+    c.execute(
+        "UPDATE transactions SET tax_deductible = ?, tax_category = ? WHERE id = ? AND user_id = ?",
+        (deductible_val, tax_cat, transaction_row_id, user_id)
+    )
+    safe_commit()
+
+    return {
+        "status": "success",
+        "transaction_id": transaction_row_id,
+        "merchant": row[2] or row[1],
+        "amount": float(row[3]),
+        "date": row[4],
+        "tax_deductible": bool(deductible_val),
+        "tax_category": tax_cat,
+    }
+
+
+def get_tax_deductions_summary(year: Optional[int] = None, *, user_id: str) -> dict:
+    """
+    Summarize tax-deductible expenses grouped by Schedule C / tax category.
+    Applies the standard 50% deduction rule for business meals.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("get_tax_deductions_summary: forced isolation violation — user_id is required")
+
+    target_year = year or datetime.now().year
+    year_str = f"{target_year}%"
+
+    c.execute(
+        """SELECT id, date, merchant, clean_merchant, amount, category, tax_category
+        FROM transactions
+        WHERE user_id = ? AND tax_deductible = 1 AND date LIKE ?
+        ORDER BY datetime(date) ASC, id ASC""",
+        (user_id, year_str)
+    )
+    rows = c.fetchall()
+
+    by_category = defaultdict(lambda: {"gross": 0.0, "deductible": 0.0, "count": 0})
+    total_gross = 0.0
+    total_deductible = 0.0
+    transactions_list = []
+
+    for r in rows:
+        rid, dt, merch, cmerch, amt, gen_cat, tax_cat = r
+        amount = float(amt or 0.0)
+        display_cat = tax_cat or gen_cat or "Uncategorized Deductible"
+        
+        # Apply 50% meal deduction rule if categorized under meals/dining
+        is_meal = "meal" in display_cat.lower() or "dining" in display_cat.lower()
+        deductible_amount = round(amount * 0.5, 2) if is_meal else amount
+
+        by_category[display_cat]["gross"] += amount
+        by_category[display_cat]["deductible"] += deductible_amount
+        by_category[display_cat]["count"] += 1
+
+        total_gross += amount
+        total_deductible += deductible_amount
+
+        transactions_list.append({
+            "id": rid,
+            "date": dt,
+            "merchant": cmerch or merch,
+            "gross_amount": amount,
+            "deductible_amount": deductible_amount,
+            "tax_category": display_cat,
+        })
+
+    categories_summary = [
+        {
+            "category": cat,
+            "count": data["count"],
+            "gross": round(data["gross"], 2),
+            "deductible": round(data["deductible"], 2),
+        }
+        for cat, data in sorted(by_category.items(), key=lambda x: -x[1]["deductible"])
+    ]
+
+    return {
+        "status": "success",
+        "year": target_year,
+        "total_transactions": len(rows),
+        "total_gross_spent": round(total_gross, 2),
+        "total_deductible": round(total_deductible, 2),
+        "categories": categories_summary,
+        "transactions": transactions_list,
+    }
+
+
+def export_tax_csv(year: Optional[int] = None, *, user_id: str) -> str:
+    """Generate a clean CSV report of tax deductions."""
+    summary = get_tax_deductions_summary(year, user_id=user_id)
+    txs = summary.get("transactions", [])
+
+    import io
+    import csv
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Transaction ID", "Date", "Merchant", "Tax Category", "Gross Amount", "Deductible Amount"])
+    for tx in txs:
+        writer.writerow([
+            tx["id"],
+            tx["date"],
+            tx["merchant"],
+            tx["tax_category"],
+            f"{tx['gross_amount']:.2f}",
+            f"{tx['deductible_amount']:.2f}",
+        ])
+    return output.getvalue()
+
+
 def get_net_worth_history(days: int = 365, limit: int = 100, offset: int = 0, *, user_id: str) -> str:
     if not user_id or not isinstance(user_id, str):
         raise ValueError(
@@ -2732,6 +3856,189 @@ def get_upcoming_cash_flow(*, days: int = 30, user_id: str,) -> str:
         "Future events are not treated as settled transactions."
     )
 
+
+def simulate_cash_flow_scenario(
+    days: int = 60,
+    scenario_events: Optional[List[Dict[str, Any]]] = None,
+    *,
+    user_id: str,
+    starting_balance_override: Optional[float] = None,
+) -> dict:
+    """
+    Deterministic cash flow runway and 'What-If?' scenario simulation engine.
+    Projects daily balances over `days` into the future based on:
+      - Starting liquid cash
+      - Daily discretionary burn rate (trailing 30 days)
+      - Planned income & expense transactions
+      - Optional hypothetical scenario events
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("simulate_cash_flow_scenario: forced isolation violation — user_id is required")
+
+    days = max(7, min(int(days), 365))
+    events = [dict(e) for e in scenario_events] if scenario_events else []
+
+    # 1. Determine starting liquid depository cash
+    if starting_balance_override is not None:
+        start_liquid = float(starting_balance_override)
+    else:
+        c.execute(
+            "SELECT SUM(current_balance) FROM plaid_accounts WHERE user_id = ? AND type = 'depository' AND active = 1",
+            (user_id,)
+        )
+        row = c.fetchone()
+        depository_sum = float(row[0]) if row and row[0] is not None else None
+        if depository_sum is not None and depository_sum > 0:
+            start_liquid = depository_sum
+        else:
+            pos = get_current_financial_position(user_id=user_id)
+            start_liquid = float(pos.get("total_liquid") or 0.0)
+
+    # 2. Historical daily discretionary burn rate (trailing 30 days)
+    c.execute(
+        """SELECT SUM(amount) FROM transactions
+        WHERE user_id = ? AND amount > 0 AND date >= datetime('now', '-30 days')
+          AND merchant NOT LIKE '%System Balance Sync%'
+          AND COALESCE(category, '') NOT LIKE 'Credit Card Bill Payment%'
+          AND COALESCE(category, '') NOT LIKE 'P2P Transfer%'""",
+        (user_id,)
+    )
+    spend_row = c.fetchone()
+    monthly_discretionary = float(spend_row[0] or 0.0) if spend_row else 0.0
+    daily_burn = round(monthly_discretionary / 30.0, 2)
+
+    # 3. Fetch planned transactions
+    c.execute(
+        """SELECT expected_date, direction, expected_amount, description
+        FROM planned_transactions
+        WHERE user_id = ? AND status = 'Expected' AND expected_date IS NOT NULL
+          AND expected_date <= date('now', '+' || ? || ' days')""",
+        (user_id, days)
+    )
+    planned_rows = c.fetchall()
+    planned_by_date = defaultdict(list)
+    for p_date, p_dir, p_amt, p_desc in planned_rows:
+        planned_by_date[p_date[:10]].append({
+            "direction": p_dir,
+            "amount": float(p_amt or 0.0),
+            "description": p_desc,
+        })
+
+    # 4. Fetch expected income
+    c.execute(
+        """SELECT expected_date, net_expected, source
+        FROM cash_inflows
+        WHERE user_id = ? AND status = 'Pending' AND expected_date IS NOT NULL
+          AND expected_date <= date('now', '+' || ? || ' days')""",
+        (user_id, days)
+    )
+    inflow_rows = c.fetchall()
+    inflows_by_date = defaultdict(list)
+    for i_date, i_amt, i_src in inflow_rows:
+        inflows_by_date[i_date[:10]].append({
+            "amount": float(i_amt or 0.0),
+            "source": i_src,
+        })
+
+    def _run_timeline(apply_events: bool):
+        now = datetime.now()
+        bal = start_liquid
+        min_bal = bal
+        min_date = now.strftime("%Y-%m-%d")
+        runway = None
+        timeline = []
+
+        for d in range(1, days + 1):
+            cur_date = (now + timedelta(days=d)).strftime("%Y-%m-%d")
+            day_income = 0.0
+            day_expenses = daily_burn
+
+            # Planned inflows
+            for inf in inflows_by_date.get(cur_date, []):
+                day_income += inf["amount"]
+
+            # Planned transactions
+            for pl in planned_by_date.get(cur_date, []):
+                if pl["direction"] == "income":
+                    day_income += pl["amount"]
+                elif pl["direction"] == "expense":
+                    day_expenses += pl["amount"]
+
+            # Scenario events
+            if apply_events:
+                for ev in events:
+                    ev_amt = float(ev.get("amount", 0.0))
+                    target_date = ev.get("date")
+                    offset = ev.get("offset_days")
+                    recurring = ev.get("recurring_monthly", False)
+
+                    matches = False
+                    if target_date and target_date == cur_date:
+                        matches = True
+                    elif offset is not None and offset == d:
+                        matches = True
+                    elif recurring and offset is not None and d >= offset and (d - offset) % 30 == 0:
+                        matches = True
+
+                    if matches:
+                        if ev_amt > 0:
+                            day_income += ev_amt
+                        else:
+                            day_expenses += abs(ev_amt)
+
+            bal = bal + day_income - day_expenses
+
+            if bal < min_bal:
+                min_bal = bal
+                min_date = cur_date
+
+            if bal < 0 and runway is None:
+                runway = d
+
+            # Keep sample intervals (every 7 days or final day)
+            if d % 7 == 0 or d == days or (apply_events and any(ev.get("offset_days") == d for ev in events)):
+                timeline.append({
+                    "day": d,
+                    "date": cur_date,
+                    "balance": round(bal, 2),
+                })
+
+        return {
+            "final_balance": round(bal, 2),
+            "min_balance": round(min_bal, 2),
+            "min_date": min_date,
+            "runway_days": runway,
+            "timeline": timeline,
+        }
+
+    baseline = _run_timeline(apply_events=False)
+    scenario_res = _run_timeline(apply_events=True) if events else baseline
+
+    return {
+        "status": "success",
+        "simulation_days": days,
+        "starting_liquid": round(start_liquid, 2),
+        "daily_burn_rate": daily_burn,
+        "events_applied": events,
+        "scenario": {
+            "final_balance": scenario_res["final_balance"],
+            "min_balance": scenario_res["min_balance"],
+            "min_date": scenario_res["min_date"],
+            "runway_days": scenario_res["runway_days"],
+            "timeline": scenario_res["timeline"],
+        },
+        "baseline": {
+            "final_balance": baseline["final_balance"],
+            "min_balance": baseline["min_balance"],
+            "min_date": baseline["min_date"],
+            "runway_days": baseline["runway_days"],
+        },
+        "delta": {
+            "final_balance_impact": round(scenario_res["final_balance"] - baseline["final_balance"], 2),
+            "min_balance_impact": round(scenario_res["min_balance"] - baseline["min_balance"], 2),
+        }
+    }
+
 # ============================================================
 # Spending Queries
 # ============================================================
@@ -3371,7 +4678,38 @@ def batch_lock_transactions(
     return summary
 
 
-__all__ = ['get_plaid_credential', 'batch_correct_transactions', 'update_expected_income', 'get_planned_transactions', 'get_recent_transactions', '_date_distance_days', 'save_known_merchant', 'correct_transaction', 'get_financial_dashboard', '_strip_sandbox_blocks', 'get_recent_chat_history', 'delete_memory', 'search_transactions', '_TX_FIELDS', 'add_planned_transaction', '_SANDBOX_SHELL_BLOCK_RE', 'add_expected_income', 'get_net_worth_history', '_format_compact_tx_line', 'get_transaction_context', 'check_and_reconcile_income', 'format_transaction_context', 'check_budget_status', 'cancel_planned_transaction', '_get_transactions_by_lock_state', 'get_unlocked_transactions', 'get_spending_breakdown', 'get_subscriptions', 'get_recent_financial_activity', 'detect_and_update_subscriptions', 'query_spending', 'log_lifestyle_context', 'get_known_merchant', 'get_unique_unregistered_merchants', 'update_planned_transaction', 'reconcile_expected_and_planned_transactions', 'get_weekly_spending', 'save_memory', 'get_locked_transactions', 'get_savings_buckets', 'get_budget_settings', '_SANDBOX_PY_BLOCK_RE', '_extract_sandbox_blocks', 'adjust_savings_bucket', 'get_recent_income', 'get_accounts_overview', '_num', 'save_chat_turn', 'batch_lock_transactions', 'cancel_expected_income', 'get_upcoming_cash_flow', 'delete_savings_bucket', 'tag_transaction_context', 'lock_transaction', 'get_recent_corrections', 'get_lifestyle_context', 'clear_transaction_correction', 'get_debt_overview', 'get_expected_income', 'get_transactions_by_context', 'get_current_financial_position', 'add_transaction', 'get_memories', 'get_cash_flow_summary', 'delete_transaction', 'delete_manual_transaction', 'bot']
+__all__ = [
+    'get_plaid_credential', 'batch_correct_transactions', 'update_expected_income',
+    'get_planned_transactions', 'get_recent_transactions', '_date_distance_days',
+    'save_known_merchant', 'correct_transaction', 'get_financial_dashboard',
+    '_strip_sandbox_blocks', 'get_recent_chat_history', 'delete_memory',
+    'search_transactions', '_TX_FIELDS', 'add_planned_transaction',
+    '_SANDBOX_SHELL_BLOCK_RE', 'add_expected_income', 'get_net_worth_history',
+    '_format_compact_tx_line', 'get_transaction_context', 'check_and_reconcile_income',
+    'format_transaction_context', 'check_budget_status', 'cancel_planned_transaction',
+    '_get_transactions_by_lock_state', 'get_unlocked_transactions', 'get_spending_breakdown',
+    'get_subscriptions', 'get_recent_financial_activity', 'detect_and_update_subscriptions',
+    'query_spending', 'log_lifestyle_context', 'get_known_merchant',
+    'get_unique_unregistered_merchants', 'update_planned_transaction',
+    'reconcile_expected_and_planned_transactions', 'get_weekly_spending', 'save_memory',
+    'get_locked_transactions', 'get_savings_buckets', 'get_budget_settings',
+    '_SANDBOX_PY_BLOCK_RE', '_extract_sandbox_blocks', 'adjust_savings_bucket',
+    'get_recent_income', 'get_accounts_overview', '_num', 'save_chat_turn',
+    'batch_lock_transactions', 'cancel_expected_income', 'get_upcoming_cash_flow',
+    'delete_savings_bucket', 'tag_transaction_context', 'lock_transaction',
+    'get_recent_corrections', 'get_lifestyle_context', 'clear_transaction_correction',
+    'get_debt_overview', 'get_expected_income', 'get_transactions_by_context',
+    'get_current_financial_position', 'add_transaction', 'get_memories',
+    'get_cash_flow_summary', 'delete_transaction', 'delete_manual_transaction', 'bot',
+    'calculate_debt_payoff', 'add_or_update_debt', 'list_user_debts', 'delete_user_debt',
+    'sync_debts_from_plaid', 'add_transaction_item', 'get_transaction_items',
+    'delete_transaction_item', 'reconcile_receipts_for_user', 'tag_transaction_tax',
+    'get_tax_deductions_summary', 'export_tax_csv', 'simulate_cash_flow_scenario',
+    'add_subscription_trial', 'list_subscription_trials', 'update_trial_status',
+    'detect_zombie_subscriptions', 'get_roundup_settings', 'set_roundup_settings',
+    'calculate_transaction_roundup', 'apply_transaction_roundups', 'get_sinking_funds_overview',
+    'generate_financial_digest'
+]
 
 def get_plaid_credential(user_id, key: str) -> str | None:
     """Look up a Plaid credential saved via !plaidsetup, falling back to .env."""

@@ -1001,6 +1001,79 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "get_transaction_items",
+            "description": "Get itemized receipt line items (individual items, quantities, and prices) for a transaction.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "transaction_row_id": {
+                        "type": "integer",
+                        "description": "The transaction row ID (integer)."
+                    }
+                },
+                "required": ["transaction_row_id"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tag_transaction_tax",
+            "description": "Mark or unmark a transaction as a tax deductible business or personal expense with a specific Schedule C category.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "transaction_row_id": {"type": "integer", "description": "The transaction row ID"},
+                    "is_deductible": {"type": "boolean", "description": "True to mark as tax-deductible, False to untag"},
+                    "tax_category": {"type": "string", "description": "Schedule C / deduction category (e.g. Software, Supplies, Meals, Travel)"}
+                },
+                "required": ["transaction_row_id", "is_deductible"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tax_deductions_summary",
+            "description": "Get a summary of tax-deductible expenses grouped by category for a specific tax year, including 50% business meal rules.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "year": {"type": "integer", "description": "Tax year (defaults to current year)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "simulate_cash_flow_scenario",
+            "description": "Simulate future daily cash flow runway and What-If scenarios (e.g. buying a laptop, receiving a bonus, or monthly rent change). Projects lowest balance, runway days, and final balance.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "Horizon days (default 60)"},
+                    "scenario_events": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "amount": {"type": "number", "description": "Negative for expense, positive for windfall/income"},
+                                "offset_days": {"type": "integer", "description": "Days in future when event occurs"},
+                                "recurring_monthly": {"type": "boolean", "description": "Repeats every 30 days"}
+                            },
+                            "required": ["name", "amount"]
+                        },
+                        "description": "Hypothetical scenario events to apply."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_known_merchant",
             "description": "Exact read-only lookup in the curated known-merchant registry. If found, do not search_web solely to identify the merchant.",
             "parameters": {
@@ -1109,6 +1182,27 @@ BOT_TOOLS_SCHEMA = [
             "name": "get_debt_overview",
             "description": "Show current credit-card and loan balances from synced accounts.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "simulate_debt_payoff",
+            "description": "Simulate debt snowball (lowest balance first) or avalanche (highest APR first) payoff plans, calculating total interest, debt-free date, and milestone schedule.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["avalanche", "snowball"],
+                        "description": "Strategy to use: 'avalanche' (highest APR first, minimizes interest) or 'snowball' (lowest balance first, quick wins). Default 'avalanche'."
+                    },
+                    "extra_monthly_payment": {
+                        "type": "number",
+                        "description": "Additional dollars per month allocated toward debt on top of minimum payments."
+                    }
+                }
+            },
         },
     },
     {
@@ -1907,6 +2001,71 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["rule_id"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "monitor_create_natural_rule",
+            "description": "Create a background financial monitor rule from a natural English instruction (e.g. 'alert me if dining exceeds $200 this week' or 'notify if balance falls below $1,000 in 14 days').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "The natural language rule instruction."
+                    }
+                },
+                "required": ["instruction"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_sinking_funds_overview",
+            "description": "Get status of all sinking funds / savings envelopes, progress towards targets, monthly funding velocity, projected completion dates, and round-up auto-save settings.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_transaction_roundups",
+            "description": "Sweep spare change round-ups from recent transactions into the configured sinking fund / savings envelope.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of days of transactions to calculate roundups for (default: 30)."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_financial_digest",
+            "description": "Generate an executive financial health scorecard and digest including savings rate, cash flow delta, category breakdown, debt status, and sinking funds progress.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "period": {
+                        "type": "string",
+                        "enum": ["weekly", "monthly"],
+                        "description": "The time period to summarize (default: 'monthly')."
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Optional explicit number of trailing days to analyze."
+                    }
+                }
+            }
+        }
     }
 ]
 
@@ -1985,6 +2144,15 @@ EXPECTED_TOOL_NAMES = {
     "monitor_list_alerts",
     "monitor_ack_alert",
     "monitor_delete_rule",
+    "simulate_debt_payoff",
+    "get_transaction_items",
+    "tag_transaction_tax",
+    "get_tax_deductions_summary",
+    "simulate_cash_flow_scenario",
+    "monitor_create_natural_rule",
+    "get_sinking_funds_overview",
+    "apply_transaction_roundups",
+    "generate_financial_digest",
 }
 
 if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
@@ -1995,6 +2163,9 @@ if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
 
 # Set of all mutation tools that should always commit to the database
 MUTATION_TOOLS = {
+    "apply_transaction_roundups",
+    "monitor_create_natural_rule",
+    "tag_transaction_tax",
     "correct_transaction",
     "batch_correct_transactions",
     "batch_lock_transactions",
@@ -4757,6 +4928,21 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             status=args.get("status", "all"),
                             fields=args.get("fields"),
                          user_id=uid)
+                    elif func_name == "get_transaction_items":
+                        row_id = int(args.get("transaction_row_id", 0))
+                        db_result = get_transaction_items(transaction_row_id=row_id, user_id=uid)
+                    elif func_name == "tag_transaction_tax":
+                        row_id = int(args.get("transaction_row_id", 0))
+                        is_deduct = bool(args.get("is_deductible", True))
+                        tax_c = args.get("tax_category")
+                        db_result = tag_transaction_tax(transaction_row_id=row_id, is_deductible=is_deduct, tax_category=tax_c, user_id=uid)
+                    elif func_name == "get_tax_deductions_summary":
+                        yr = args.get("year")
+                        db_result = get_tax_deductions_summary(year=int(yr) if yr else None, user_id=uid)
+                    elif func_name == "simulate_cash_flow_scenario":
+                        d_val = args.get("days", 60)
+                        ev_list = args.get("scenario_events")
+                        db_result = simulate_cash_flow_scenario(days=int(d_val), scenario_events=ev_list, user_id=uid)
                     elif func_name == "get_known_merchant":
                         db_result = get_known_merchant(merchant=str(args.get("merchant", "")))
                     elif func_name == "get_unique_unregistered_merchants":
@@ -5100,6 +5286,25 @@ CURRENT DATABASE FINANCIAL CONTEXT
                          user_id=uid)
                     elif func_name == "get_debt_overview":
                         db_result = get_debt_overview(user_id=uid)
+                    elif func_name == "simulate_debt_payoff":
+                        strat = args.get("strategy", "avalanche")
+                        extra = float(args.get("extra_monthly_payment", 0.0) or 0.0)
+                        db_result = calculate_debt_payoff(strategy=strat, extra_monthly=extra, user_id=uid)
+                    elif func_name == "get_sinking_funds_overview":
+                        db_result = get_sinking_funds_overview(user_id=uid)
+                    elif func_name == "apply_transaction_roundups":
+                        db_result = apply_transaction_roundups(
+                            days=int(args.get("days", 30) or 30),
+                            user_id=uid
+                        )
+                    elif func_name == "generate_financial_digest":
+                        p_val = args.get("period", "monthly")
+                        d_val = args.get("days")
+                        db_result = generate_financial_digest(
+                            period=str(p_val) if p_val else "monthly",
+                            days=int(d_val) if d_val else None,
+                            user_id=uid
+                        )
                     elif func_name == "get_net_worth_history":
                         db_result = get_net_worth_history(
                             days=args.get("days", 365), limit=args.get("limit", 100)
@@ -5538,6 +5743,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             cooldown_hours=int(args.get("cooldown_hours", 24)),
                         )
                         db_result = msg if ok else f"Error: {msg}"
+                    elif func_name == "monitor_create_natural_rule":
+                        from src.services.monitor import add_monitor_rule_from_nl
+                        try:
+                            spec = add_monitor_rule_from_nl(conn, user_id=uid, instruction=str(args.get("instruction", "")))
+                            db_result = f"Created monitor rule #{spec['id']} '{spec['name']}' ({spec['kind']}) with config: {spec['config']}"
+                        except Exception as e:
+                            db_result = f"Error creating rule: {e}"
                     elif func_name == "monitor_run_pass":
                         res = run_monitor_pass(conn, uid, deliver=False)
                         db_result = (
