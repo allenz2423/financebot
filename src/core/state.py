@@ -23,8 +23,6 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
-import plaid_sync
-import sandbox_client
 import base64
 from io import BytesIO
 from pathlib import Path

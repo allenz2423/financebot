@@ -19,8 +19,9 @@ from src.security.utils import (
     validate_column_name,
     validate_sql_identifier,
 )
-from src.db.queries import get_plaid_credential
-from src.core.state import CURRENT_USER_ID
+# Lazy import to avoid circular dependency
+# from src.db.queries import get_plaid_credential
+# from src.core.state import CURRENT_USER_ID
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,11 @@ def _get_user_plaid_creds(user_id: Optional[str] = None) -> Tuple[Optional[str],
     Returns:
         Tuple of (client_id, secret, access_tokens)
     """
-    uid = str(user_id or CURRENT_USER_ID.get() or "").strip()
+    # Lazy import to avoid circular dependency
+    from src.db.queries import get_plaid_credential
+    from src.core.state import CURRENT_USER_ID
+    
+    uid = str(user_id or getattr(CURRENT_USER_ID, 'get', lambda: "")() or "").strip()
     
     client_id = get_plaid_credential(uid, "plaid_client_id")
     secret = get_plaid_credential(uid, "plaid_secret")
@@ -415,7 +420,8 @@ async def plaid_polling_loop(conn, tx_queue: asyncio.Queue, bot, channel_id: int
         try:
             for db_path in glob.glob("data/finances_*.db"):
                 uid = db_path.split("_")[-1].split(".")[0]
-                state.CURRENT_USER_ID.set(uid)
+                if hasattr(state.CURRENT_USER_ID, 'set'):
+                    state.CURRENT_USER_ID.set(uid)
                 client_id, secret, tokens = _get_user_plaid_creds(user_id=uid)
                 if not tokens: continue
                 PLAID_SYNC_STATE[uid] = True

@@ -63,16 +63,16 @@ async def _patched_send(self, content=None, **kwargs):
 commands.Context.send = _patched_send
 # ------------------------------------
 
-import plaid_sync
-import sandbox_client
+# import plaid_sync  # Lazy import to avoid circular dependency
+# import sandbox_client  # Lazy import to avoid circular dependency
 import base64
 from io import BytesIO
 from pathlib import Path
 from PIL import Image
 
-from src.core.state import *
-from src.utils.helpers import *
-from src.services.search import *
+# from src.core.state import *  # Lazy import to avoid circular dependency
+# from src.utils.helpers import *  # Lazy import to avoid circular dependency
+# from src.services.search import *  # Lazy import to avoid circular dependency
 from src.services.gmail import (
     begin_gmail_authorization,
     complete_gmail_authorization,

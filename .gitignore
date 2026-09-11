@@ -1,4 +1,9 @@
 ```
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
 # Dependencies
 .venv/
 venv/
@@ -7,33 +12,21 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Environment variables
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
 .env
 .env.local
 *.env.*
 
-# Logs
-*.log
-
-# Tests
-.pytest_cache/
-.coverage
-coverage/
-htmlcov/
-
-# Build/dist
-dist/
-build/
-*.egg-info/
-
 # Editors
 .vscode/
 .idea/
-*.swp
-*.swo
-*.tmp
 
-# OS
+# OS generated files
 .DS_Store
 Thumbs.db
 ```

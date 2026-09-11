@@ -22,17 +22,16 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
-import plaid_sync
-import sandbox_client
 import base64
 from io import BytesIO
 from pathlib import Path
 from PIL import Image
 
-from src.core.state import *
-from src.core.state import CURRENT_USER_ID
-from src.utils.helpers import *
-from src.services.search import *
+# Lazy imports to avoid circular dependencies
+# from src.core.state import *
+# from src.core.state import CURRENT_USER_ID
+# from src.utils.helpers import *
+# from src.services.search import *
 
 
 # ============================================================
