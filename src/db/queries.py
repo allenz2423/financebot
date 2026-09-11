@@ -27,6 +27,10 @@ from io import BytesIO
 from pathlib import Path
 from PIL import Image
 
+# Configuration constants (avoid circular imports)
+DB_PATH = os.getenv("DB_PATH", "data/finances.db")
+CHAT_HISTORY_TURNS = int(os.getenv("CHAT_HISTORY_TURNS", "100"))
+
 # Lazy imports to avoid circular dependencies
 # from src.core.state import *
 # from src.core.state import CURRENT_USER_ID

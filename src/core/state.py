@@ -621,7 +621,6 @@ CREATE TABLE IF NOT EXISTS plaid_accounts (
     name TEXT,
     official_name TEXT,
     mask TEXT,
-    user_id TEXT,
     type TEXT,
     subtype TEXT,
     institution_name TEXT,
