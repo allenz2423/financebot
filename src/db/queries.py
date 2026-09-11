@@ -4299,37 +4299,8 @@ def check_budget_status(*, user_id: str) -> str:
 # ============================================================
 # Chat Memory
 # ============================================================
-def save_chat_turn(user_id: str, role: str, content: str):
-    if not user_id or not isinstance(user_id, str):
-        raise ValueError(
-            "save_chat_turn: forced isolation violation — user_id is required "
-            "and must be a non-empty string."
-        )
-    c.execute(
-        "INSERT INTO chat_history (user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        (str(user_id), role, content, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-    )
-    safe_commit()
+from src.db.history_queries import save_chat_turn, get_recent_chat_history
 
-def get_recent_chat_history(
-    user_id: str, limit: int = CHAT_HISTORY_TURNS
-) -> list[dict]:
-    if not user_id or not isinstance(user_id, str):
-        raise ValueError(
-            "get_recent_chat_history: forced isolation violation — user_id is required "
-            "and must be a non-empty string."
-        )
-    c.execute(
-        "SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
-        (str(user_id), limit, 0),
-    )
-    rows = c.fetchall()
-    rows.reverse()
-    return [{"role": role, "content": content} for role, content in rows]
-
-# ============================================================
-# Audit Batch Mutations
-# ============================================================
 def delete_manual_transaction(*, transaction_row_id: int, user_id: str) -> str:
     """Delete a manually-created transaction with no Plaid transaction_id."""
     if not user_id or not isinstance(user_id, str):
