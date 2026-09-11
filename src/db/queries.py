@@ -33,6 +33,12 @@ from PIL import Image
 # from src.utils.helpers import *
 # from src.services.search import *
 
+# Import configuration constants needed at module load time
+from src.core.state import CHAT_HISTORY_TURNS, DB_PATH
+
+# Import database connection from state module (single shared connection)
+from src.core.state import conn, c
+
 
 # ============================================================
 # Financial Helpers
