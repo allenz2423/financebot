@@ -1,4 +1,5 @@
 import src.core.state
+from src.core.state import bot
 import html
 import json
 import os

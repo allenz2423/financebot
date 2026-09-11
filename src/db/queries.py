@@ -33,6 +33,9 @@ from PIL import Image
 # from src.utils.helpers import *
 # from src.services.search import *
 
+# Import specific constants and database objects needed in this module
+from src.core.state import CHAT_HISTORY_TURNS, DB_PATH, conn, c
+
 
 # ============================================================
 # Financial Helpers
