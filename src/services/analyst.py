@@ -56,17 +56,23 @@ async def run_autonomous_analyst(user_id: str) -> str:
         
         tx_data = "\n".join(tx_lines)
 
-    system_prompt = """You are the Epistemic Autonomous Analyst, a background process.
-Analyze the following recent transactions. Identify behavioral patterns, rising expenses, or unusual spending.
-Return your output ONLY as a JSON list of objects with this schema:
+    system_prompt = """You are the Epistemic Autonomous Analyst, an advanced quantitative background intelligence process for Delilah Financial OS.
+Analyze the following recent transactions with rigorous forensic scrutiny. Formulate actionable hypotheses regarding:
+1. Recurring Price Creep: Any subscription, SaaS, or utility increasing in cost compared to prior months.
+2. High-Frequency Micro-Friction: Daily/multiple weekly micro-purchases (coffee, convenience, delivery) eroding cash flow.
+3. Lifestyle Inflation: Accelerated burn rate or discretionary luxury spending expanding without corresponding income growth.
+4. Phantom Subscriptions: Recurring charges for digital tools or services with low utility or dormant usage.
+5. Tax Deductible Signals: Uncategorized business expenses, medical payments, or charitable donations.
+
+Return your output ONLY as a JSON list of objects with this exact schema:
 [
   {
-    "insight": "The actual text of the pattern you noticed.",
-    "evidence_refs": ["List of transaction IDs that support this insight"],
-    "confidence": 0.8
+    "insight": "Concise, data-backed financial hypothesis with quantified impact.",
+    "evidence_refs": ["Transaction IDs that support this insight"],
+    "confidence": 0.85
   }
 ]
-IMPORTANT: You are generating HYPOTHESES. Be critical. If nothing is interesting, return [].
+IMPORTANT: You are formulating empirical hypotheses. Ground every insight strictly in the provided transaction lines. If no significant anomalies or patterns exist, return [].
 """
 
     try:

@@ -1640,7 +1640,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_financial_health_scorecard",
-            "description": "Retrieves the user's authoritative 0-100 composite 5-pillar financial health scorecard, letter grade (A+ to F), weakest pillar, and #1 priority action plan.",
+            "description": "Retrieves the user's authoritative 0-100 composite 5-pillar financial health scorecard (Emergency Buffer, Debt Burden, Savings Rate, Budget Discipline, Net Worth Trajectory), letter grade (A+ to F), radar metrics, weakest pillar, and ranked executive action plan. Use when assessing holistic financial posture, onboarding, or periodic financial checkups.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -1648,7 +1648,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_credit_utilization_breakdown",
-            "description": "Returns revolving credit card utilization per card and aggregate, credit score impact tiers, and exact paydown amounts required to reach <30% or <10%.",
+            "description": "Returns revolving credit card utilization per card and aggregate, credit score impact tiers (Optimal <10%, Good <30%, Elevated 30-50%, Critical >50%), total revolving limit vs balance, and exact paydown amounts required to reach the next credit score tier. Use when advising on credit repair, loan approval prep, or balance reduction.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -1656,12 +1656,12 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "simulate_credit_paydown_impact",
-            "description": "Simulates how applying a specific dollar paydown to credit cards lowers aggregate/individual utilization and improves credit score tiers.",
+            "description": "Simulates how applying a specific dollar paydown to credit cards (either targeted to a specific card or distributed across aggregate debt) lowers utilization and improves FICO credit score tiers. Use when user asks 'What happens if I pay $X towards my cards?' or to demonstrate credit score impact.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "paydown_amount": {"type": "number", "description": "Total dollar amount to pay down"},
-                    "target_card": {"type": "string", "description": "Optional specific card name"}
+                    "target_card": {"type": "string", "description": "Optional specific card name to pay down"}
                 },
                 "required": ["paydown_amount"]
             }
@@ -1671,7 +1671,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_cash_drag_analysis",
-            "description": "Audits excess idle cash sitting in checking accounts beyond operating buffers (default 1.5x monthly expenses) and quantifies lost high-yield savings interest.",
+            "description": "Audits excess idle cash sitting in low-yield checking accounts beyond operating buffers (default 1.5x monthly expenses) and quantifies annualized lost yield compared to top-tier HYSA benchmarks. Use when optimizing cash allocation, eliminating inflation leakage, or establishing high-yield sweep rules.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1685,7 +1685,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_debt_snowball_vs_avalanche",
-            "description": "Compares month-by-month debt payoff under Snowball (lowest balance first) vs Avalanche (highest APR first) strategies, showing total interest and debt-free dates.",
+            "description": "Compares month-by-month debt payoff under Snowball (lowest balance first for psychological momentum) vs Avalanche (highest APR first for mathematical interest minimization). Returns months to debt freedom, total interest paid, and dollar savings difference. Use when formulating debt payoff plans or optimizing extra monthly payments.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1700,7 +1700,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_portfolio_holdings",
-            "description": "Retrieves all investment holdings with symbols, shares, cost basis, current prices, market values, asset class, and unrealized gain/loss.",
+            "description": "Retrieves all investment holdings across equities, fixed income, real estate, and crypto with ticker symbols, share counts, cost basis, current market prices, total market values, asset class breakdown, and unrealized dollar & percentage P&L. Use when reviewing portfolio performance, assessing asset allocation, or tax loss harvesting.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -1708,7 +1708,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "set_portfolio_holding",
-            "description": "Adds, updates, or deletes (shares=0) an investment holding in the user's portfolio.",
+            "description": "Adds, updates, or deletes (by passing shares=0) an investment holding in the user's portfolio. Tracks symbol, share count, market price, cost basis, and asset class. Use when user reports acquiring, selling, or adjusting investment positions.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1726,7 +1726,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_portfolio_drift",
-            "description": "Compares current portfolio asset class weights against target allocation percentages and generates exact rebalancing buy/sell orders.",
+            "description": "Compares current portfolio asset class weights against target allocation percentages (e.g. 70% Equities, 20% Fixed Income, 10% Crypto) and generates exact dollar-denominated rebalancing buy/sell recommendations. Use when conducting periodic portfolio rebalancing or risk alignment.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1739,7 +1739,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_compound_growth",
-            "description": "Computes future portfolio value, total contributions, and total compound interest earned over time.",
+            "description": "Computes future portfolio growth trajectory, total principal invested vs compound interest earned, and milestone year-by-year projections based on starting principal, recurring monthly contributions, investment horizon, and expected annual return rate. Use when projecting long-term wealth accumulation.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1756,7 +1756,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_portfolio_dividend_projection",
-            "description": "Projects annual and monthly estimated dividend/yield cash flow from equity and fixed income holdings.",
+            "description": "Projects annual, monthly, and daily dividend/yield cash flow from equity and fixed income holdings based on portfolio value and assumed or historical dividend yield percentages. Use when planning passive income, dividend reinvestment (DRIP), or living off yield.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1771,7 +1771,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_category_budget_pacing",
-            "description": "Checks current monthly category budgets, spending pace velocity, and month-end projected spending.",
+            "description": "Evaluates current monthly category budgets against month-to-date spending velocity, elapsed month percentage, and projected month-end burn. Identifies categories on track, pacing hot, or over budget. Use for mid-month spending check-ins and burn-rate warnings.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1784,7 +1784,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "delete_category_budget",
-            "description": "Deletes a monthly category budget ceiling.",
+            "description": "Removes an active monthly category budget ceiling. Use when resetting budget parameters or retiring category limits.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1798,7 +1798,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "auto_generate_50_30_20_budget",
-            "description": "Calculates recommended 50/30/20 budget allocations (Needs: 50%, Wants: 30%, Savings/Debt: 20%) tailored to user net income.",
+            "description": "Calculates an optimal 50/30/20 budget blueprint (Needs: 50%, Wants: 30%, Savings/Debt Payoff: 20%) calibrated to the user's net after-tax income (auto-detected or manually specified). Use when establishing baseline budget envelopes or restructuring cash flow.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1811,7 +1811,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "compare_period_spending",
-            "description": "Compares spending breakdown and category totals between two historical date ranges.",
+            "description": "Compares spending volume, transaction velocity, and category-level breakdowns between two distinct historical date windows (e.g. last 30 days vs prior 30 days). Returns dollar deltas and percentage changes. Use to detect spending trends, seasonal surges, or lifestyle creep.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1827,7 +1827,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_daily_spending_average",
-            "description": "Calculates weekday vs weekend average spending rate and highlights discretionary spikes.",
+            "description": "Calculates daily average spending rates across trailing days, breaking down weekday vs weekend spending velocity and highlighting irregular spending spikes. Use to diagnose weekend spending surges and establish realistic daily allowances.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1842,7 +1842,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_bills_calendar",
-            "description": "Retrieves upcoming fixed bills, subscriptions, payment cadences, and 30-day cash outflow forecast.",
+            "description": "Retrieves upcoming fixed bills, SaaS subscriptions, utilities, and debt payments across a forward-looking forecast window (default 30 days). Includes due dates, payment cadence, and cumulative cash commitment. Use before approving discretionary expenses to prevent overdrafts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1855,7 +1855,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "add_recurring_bill",
-            "description": "Registers a recurring bill or subscription commitment.",
+            "description": "Registers a recurring bill or subscription commitment with merchant name, recurring amount, billing cadence (monthly, annual, biweekly, weekly), due day of month, and category. Use when user mentions a recurring obligation.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1873,7 +1873,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "remove_recurring_bill",
-            "description": "Unregisters or cancels tracking of a recurring bill.",
+            "description": "Removes a recurring bill or subscription from scheduled tracking. Use when user cancels a subscription or retires a recurring payment obligation.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1887,7 +1887,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "project_cash_balance",
-            "description": "Forecasts daily bank balance over the next 30/60/90 days incorporating paydays, recurring bills, and baseline burn.",
+            "description": "Projects daily checking cash balances over forward horizon (30/60/90 days) by modeling recurring income deposits, scheduled bills, and discretionary burn rate. Flags projected cash crunches and minimum cash dip dates. Use to stress-test liquidity.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1900,7 +1900,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "detect_unusual_bill_increases",
-            "description": "Compares recent recurring charges against historical baselines to flag price creeping.",
+            "description": "Audits recurring subscription and utility charges against historical 90-day baselines to detect stealth price hikes, contract expirations, or promotional rate runoffs. Use during recurring expense audits.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1915,7 +1915,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_savings_goals",
-            "description": "Lists all active savings goals, target amounts, current amounts, deadlines, and shortfall deficits.",
+            "description": "Retrieves all active savings goals, target amounts, current balances, deadlines, funding progress percentages, and remaining shortfall amounts. Use to review sinking funds, emergency fund progress, or big-ticket purchase targets.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -1923,7 +1923,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "fund_savings_goal",
-            "description": "Deposits funds into a designated savings goal.",
+            "description": "Allocates and deposits funds into a designated savings goal envelope. Updates current balance and computes new progress percentage. Use when user saves money or allocates windfalls toward a goal.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1938,7 +1938,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "delete_savings_goal",
-            "description": "Deletes a savings goal envelope.",
+            "description": "Deletes a savings goal envelope. Use when a goal is completed, retired, or abandoned.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1952,7 +1952,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_goal_timeline",
-            "description": "Calculates required monthly savings to reach a target date, or estimated completion date given fixed monthly deposits.",
+            "description": "Solves savings timelines: calculates required monthly contribution to reach target by specific deadline date, OR calculates projected completion date given a fixed monthly deposit. Use when user plans major purchases (house down payment, car, wedding, travel).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1969,7 +1969,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "prioritize_savings_goals",
-            "description": "Deterministically ranks all savings goals by deadline urgency and funding shortfall percentage.",
+            "description": "Ranks all savings goals using deterministic prioritization algorithm balancing target deadline urgency, funding shortfall percentage, and essential vs discretionary priority. Use when user has limited savings capacity and needs optimal dollar allocation.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -1979,7 +1979,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "scan_tax_deductions",
-            "description": "Scans recent transactions for tax-deductible expenses (charity, business, medical) and estimates tax savings.",
+            "description": "Audits recent ledger transactions for IRS tax-deductible expenses (charitable contributions, business expenses, home office, medical, education) and calculates estimated tax savings based on marginal tax bracket. Use for tax planning and year-end deduction sweeps.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1993,7 +1993,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_tax_bracket_estimate",
-            "description": "Estimates federal income tax, marginal tax bracket, effective tax rate, and standard deduction.",
+            "description": "Calculates federal income tax liability, marginal tax bracket, effective tax rate, standard deduction, and take-home pay based on gross annual income and filing status ('single' or 'married'). Use when projecting tax burden, bonus withholding, or salary changes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2008,7 +2008,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_charitable_donations_summary",
-            "description": "Summarizes all 501(c)(3) donations, church tithings, and charitable gifts recorded in the ledger.",
+            "description": "Summarizes all 501(c)(3) charitable gifts, donations, and tithings for a given tax year, listing total donated, merchant breakdown, and estimated itemized tax savings. Use during tax preparation or giving audits.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2021,7 +2021,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_hsa_fsa_tax_savings",
-            "description": "Calculates pre-tax savings from HSA/FSA contributions across Federal, FICA, and state taxes.",
+            "description": "Calculates triple-tax advantage savings from pre-tax Health Savings Account (HSA) or Flexible Spending Account (FSA) contributions across Federal Income Tax, FICA (Social Security + Medicare 7.65%), and state taxes. Use when advising on open enrollment and medical budgeting.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2036,7 +2036,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "estimate_capital_gains_tax",
-            "description": "Computes short-term vs long-term capital gains tax on an asset sale.",
+            "description": "Computes capital gains tax on taxable asset sales, determining short-term vs long-term capital gains classification based on holding period (>12 months = preferential long-term rate) and estimated tax liability. Use before liquidating taxable investments or crypto.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2054,7 +2054,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_transaction_ledger",
-            "description": "Paginated transaction ledger browser with filters for categories, amounts, and statuses.",
+            "description": "Queries the canonical ledger with multi-parameter filtering (limit, offset, category, min/max amount, date range). Returns detailed transaction records with IDs, dates, clean merchants, and categories. Use to inspect transaction history or verify specific expenses.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2071,7 +2071,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_transaction_detail",
-            "description": "Detailed forensic inspect of a single transaction including original name, merchant alias, and edit history.",
+            "description": "Forensically inspects a single transaction by ID, retrieving raw Plaid statement description, canonical merchant alias, category history, and any user corrections or audit tags. Use when troubleshooting mystery charges or miscategorized items.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2085,7 +2085,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "parse_text_receipt",
-            "description": "Parses raw text or OCR receipt lines into itemized line items, subtotal, tax, tip, and matches candidate bank transactions.",
+            "description": "Extracts line items, subtotal, sales tax, tip, and total amount from raw OCR text or receipt paste, matching with candidate ledger transactions within a 7-day window. Use when user uploads receipt text or asks to log an itemized receipt.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2099,7 +2099,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_merchants_and_aliases",
-            "description": "Searches merchant aliases, canonical names, and registered merchant strings.",
+            "description": "Searches the merchant database and alias mappings to find canonical merchant entities and registered alias patterns. Use to check if a merchant is already known or mapped.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2113,7 +2113,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "add_merchant_alias_mapping",
-            "description": "Maps dirty statement strings (e.g. 'SQ *BLUE BOTTLE') to clean canonical merchant names ('Blue Bottle Coffee').",
+            "description": "Establishes a persistent rule mapping dirty bank statement strings (e.g. 'SQ *BLUE BOTTLE COFFEE') to clean canonical names (e.g. 'Blue Bottle Coffee'). Automatically cleanses matching historical and future transactions. Use when cleaning up ledger statements.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2130,7 +2130,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_loan_amortization",
-            "description": "Computes monthly principal & interest payment, total interest, and loan cost for mortgages or personal loans.",
+            "description": "Computes monthly principal & interest (P&I) payment, total interest over life of loan, and total repayment cost for fixed-rate mortgages, auto loans, or personal loans. Use when evaluating loan affordability or comparing loan terms.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2146,7 +2146,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_extra_payment_impact",
-            "description": "Calculates interest savings and years shaved off a loan by making extra monthly principal payments.",
+            "description": "Simulates the compounding benefits of extra monthly principal payments: calculates exact dollar interest savings, number of payments eliminated, and months/years shaved off the loan term. Use to show the high ROI of principal curtailment.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2163,7 +2163,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "compare_rent_vs_buy",
-            "description": "Comprehensive financial comparison between buying a home vs renting over a specified horizon.",
+            "description": "Performs a rigorous financial comparison between buying a home (down payment, mortgage P&I, property tax, insurance, maintenance, home appreciation) vs renting (monthly rent, annual rent inflation, down payment invested in index funds) over a multi-year horizon. Returns net wealth differential. Use when advising on home purchase decisions.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2181,7 +2181,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_mortgage_refinance_breakeven",
-            "description": "Calculates monthly payment savings and months to break even on closing costs when refinancing a mortgage.",
+            "description": "Calculates monthly payment savings and exact months required to break even on closing costs when refinancing an existing mortgage to a lower interest rate. Use when evaluating refinance quotes or interest rate drops.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2199,7 +2199,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_student_loan_payoff",
-            "description": "Computes total payoff duration and interest for student loans under variable monthly payments.",
+            "description": "Calculates total interest, payoff timeline in months and years, and monthly interest accrual for student loans under standard or accelerated payment schedules. Use when structuring student debt payoff strategies.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2217,7 +2217,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_fire_number",
-            "description": "Computes Financial Independence (FI/RE) target portfolio number (e.g. 25x annual expenses via 4% rule) and progress.",
+            "description": "Calculates Financial Independence / Retire Early (FI/RE) target portfolio number using the Trinity Study Safe Withdrawal Rate (default 4.0% = 25x annual expenses). Computes current FI/RE progress percentage and portfolio gap. Use when discussing early retirement and financial independence.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2231,7 +2231,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_401k_match_maximizer",
-            "description": "Calculates employer 401(k) match dollar amount, missed match dollars ('free money left on the table'), and optimal contribution rate.",
+            "description": "Audits employer 401(k) matching formula (e.g. 50% match up to 6% salary), calculates guaranteed instant return on investment, quantifies missed employer match dollars ('free money left on the table'), and determines the exact optimal employee contribution percentage. Use when optimizing retirement contributions.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2248,7 +2248,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_roth_conversion_tax",
-            "description": "Analyzes the tax cost and long-term tax efficiency of converting Traditional IRA to Roth IRA.",
+            "description": "Evaluates the tax efficiency of converting Traditional pre-tax IRA/401(k) assets to a Roth IRA. Computes upfront tax liability at current marginal tax rate vs tax-free compounded growth in retirement. Use when planning Backdoor Roth or low-income year conversions.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2264,7 +2264,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_required_minimum_distributions",
-            "description": "Calculates IRS Required Minimum Distribution (RMD) for traditional 401(k)/IRA accounts using IRS Uniform Lifetime Table divisors.",
+            "description": "Calculates IRS Required Minimum Distribution (RMD) for traditional retirement accounts (401k, Traditional IRA) using the IRS Uniform Lifetime Table based on account owner age and prior year-end balance. Use to prevent steep 25% IRS excise tax penalties.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2279,7 +2279,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "simulate_retirement_drawdown",
-            "description": "Simulates year-by-year portfolio longevity and ending balance under inflation and withdrawals across retirement.",
+            "description": "Simulates year-by-year retirement portfolio longevity under inflation-adjusted withdrawals, market returns, and tax drag across a 20-40 year horizon. Identifies portfolio depletion risks and safe terminal values. Use to stress-test retirement plans.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2299,7 +2299,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "detect_bank_fee_leakage",
-            "description": "Scans ledger for overdraft fees, ATM charges, wire fees, and maintenance fees with fee waiver request guidance.",
+            "description": "Audits transaction history for predatory bank fees including overdraft charges, non-network ATM fees, monthly maintenance charges, and wire fees. Provides total fee leakage and actionable fee waiver negotiation scripts. Use during periodic account health checks.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2312,7 +2312,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_duplicate_transactions",
-            "description": "Finds duplicate or identical card transactions within a 48-hour window with matching amounts and merchants.",
+            "description": "Scans recent ledger for accidental double-charges or identical transactions within 48 hours sharing the same amount and merchant. Use to identify merchant billing errors and initiate charge disputes.",
             "parameters": {
                 "type": "object",
                 "properties": {}
@@ -2323,7 +2323,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "render_financial_chart",
-            "description": "Renders pure-Python dark-mode PNG charts for category spending, daily cash flow, or net worth trends.",
+            "description": "Generates high-contrast, pure-Python dark-mode financial visualization charts ('category' breakdown donut/bar, 'cashflow' waterfall, or 'networth' historical trajectory) and saves as PNG. Use when user requests visual charts or executive summary graphics.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2338,7 +2338,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "calculate_inflation_erosion",
-            "description": "Computes purchasing power loss on dormant cash over time due to inflation.",
+            "description": "Calculates the real purchasing power loss and cumulative inflation erosion on dormant cash balances over a multi-year horizon under specified inflation rates. Use to demonstrate the cost of holding excessive cash in non-yielding accounts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2354,7 +2354,7 @@ NEW_50_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "generate_weekly_financial_briefing",
-            "description": "Synthesizes weekly net worth change, 7-day spend, upcoming bills, and budget pacing into an executive summary.",
+            "description": "Synthesizes an executive weekly financial briefing covering 7-day spend total, top spending categories, net worth trajectory, upcoming bills due in the next 7 days, and budget pacing alerts. Use for weekly reviews or executive status reports.",
             "parameters": {"type": "object", "properties": {}}
         }
     }
