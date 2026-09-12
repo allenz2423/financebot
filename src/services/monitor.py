@@ -50,6 +50,7 @@ RULE_KINDS = {
     "trial_expiring_soon",
     "duplicate_charge_detected",
     "category_budget_overpacing",
+    "credit_utilization_high",
 }
 
 
@@ -227,6 +228,14 @@ def _validate_rule(kind: str, config: Dict[str, Any]) -> Tuple[bool, str, Dict[s
         except (TypeError, ValueError):
             return False, "category_budget_overpacing requires numeric 'min_spent'", {}
         cfg["min_spent"] = max(0.0, cfg["min_spent"])
+        return True, "", cfg
+
+    if kind == "credit_utilization_high":
+        try:
+            cfg["threshold_pct"] = float(cfg.get("threshold_pct", 30.0))
+        except (TypeError, ValueError):
+            return False, "credit_utilization_high requires numeric 'threshold_pct'", {}
+        cfg["threshold_pct"] = max(1.0, min(cfg["threshold_pct"], 100.0))
         return True, "", cfg
 
     return False, f"Unhandled rule kind '{kind}'", {}
@@ -735,6 +744,33 @@ def _eval_category_budget_overpacing(conn: sqlite3.Connection, cfg: dict, user_i
     return f"⚠️ Budget overpacing detected in {len(overpaced)} categories:\n" + "\n".join(f"• {m}" for m in overpaced)
 
 
+def _eval_credit_utilization_high(conn: sqlite3.Connection, cfg: dict, user_id: str) -> Optional[str]:
+    uid = _fetch_user_id(conn, user_id)
+    threshold_pct = float(cfg.get("threshold_pct", 30.0))
+
+    from src.services.credit import calculate_credit_utilization
+    data = calculate_credit_utilization(user_id=uid, conn=conn)
+    cards = data.get("cards", [])
+    if not cards:
+        return None
+
+    high_cards = [c for c in cards if c["utilization_pct"] >= threshold_pct]
+    if not high_cards:
+        return None
+
+    messages = []
+    for c in high_cards:
+        lim_str = f"${c['limit']:,.2f}" if c["limit"] is not None else "no limit"
+        pay_str = f" Pay ${c['paydown_for_30_pct']:,.2f} to drop below 30%." if c["paydown_for_30_pct"] > 0 else ""
+        messages.append(
+            f"{c['name']} is at {c['utilization_pct']}% utilization (${c['balance']:,.2f} / {lim_str}).{pay_str}"
+        )
+
+    if len(messages) == 1:
+        return f"💳 High Credit Card Utilization Alert: {messages[0]}"
+    return f"💳 High Credit Card Utilization Alert on {len(messages)} cards:\n" + "\n".join(f"• {m}" for m in messages)
+
+
 EVALUATORS = {
     "projected_balance_low": _eval_projected_balance_low,
     "category_spend_exceeded": _eval_category_spend_exceeded,
@@ -747,6 +783,7 @@ EVALUATORS = {
     "trial_expiring_soon": _eval_trial_expiring_soon,
     "duplicate_charge_detected": _eval_duplicate_charge_detected,
     "category_budget_overpacing": _eval_category_budget_overpacing,
+    "credit_utilization_high": _eval_credit_utilization_high,
 }
 
 
@@ -1391,7 +1428,26 @@ def compile_natural_language_rule(text: str) -> Dict[str, Any]:
             "cooldown_hours": 24,
         }
 
-    # 6. Category spending exceeded
+    # 6. Credit card utilization
+    # e.g. "alert if credit card utilization exceeds 30%", "warn if card utilization over 25%", "utilization alert"
+    if any(k in lowered for k in ["credit utilization", "card utilization", "utilization exceeds", "utilization over", "utilization alert", "utilization above", "credit limit utilization"]):
+        pct_match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*%', lowered)
+        if not pct_match:
+            pct_match = re.search(r'(?:above|over|exceeds|exceeding)\s+([0-9]+(?:\.[0-9]+)?)', lowered)
+        threshold = float(pct_match.group(1)) if pct_match else 30.0
+        config = {"threshold_pct": threshold}
+        ok, err, norm = _validate_rule("credit_utilization_high", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "credit_utilization_high",
+            "name": f"Credit Utilization Alert (>{threshold:.0f}%)",
+            "config": norm,
+            "severity": "warning",
+            "cooldown_hours": 48,
+        }
+
+    # 7. Category spending exceeded
     # e.g. "spend more than $200 on dining out in 7 days" or "groceries exceeds $400 this month"
     cat_match1 = re.search(r'(?:spend|spending)\s+(?:more than|over|above|exceeding)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)\s+(?:on|for|in)\s+([a-zA-Z\s]+)', lowered)
     cat_match2 = re.search(r'([a-zA-Z\s]+?)\s+(?:exceeds|over|more than|above)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)', lowered)

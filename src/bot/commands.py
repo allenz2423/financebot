@@ -3235,7 +3235,19 @@ async def pacing_cmd(ctx: commands.Context):
 
 # ============================================================
 # Investment Portfolio & Rebalancing Commands
-# ============================================================
+@bot.command(name="utilization", aliases=["credit", "debtratio", "cardutilization"])
+async def utilization_cmd(ctx: commands.Context):
+    """View revolving credit utilization across cards, FICO credit tier impact, and paydown plan."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.credit import calculate_credit_utilization, format_credit_utilization_report
+        with _open_verification_db(user_id=user_id) as vconn:
+            data = calculate_credit_utilization(user_id=user_id, conn=vconn)
+        report = format_credit_utilization_report(data)
+        await ctx.send(report)
+    except Exception as exc:
+        await ctx.send(f"❌ Credit utilization check failed: `{type(exc).__name__}: {exc}`")
+
 
 @bot.command(name="networth", aliases=["nw", "balancesheet"])
 async def networth_cmd(ctx: commands.Context):
