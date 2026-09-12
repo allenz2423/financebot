@@ -3,6 +3,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.rag.engine import query_knowledge_base
 from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
@@ -15,6 +16,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.rag.engine import query_knowledge_base
 from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
@@ -680,6 +682,23 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "query_knowledge_base",
+            "description": "RAG Knowledge Base. Searches a curated corpus of verified financial knowledge covering: consumer protection (chargebacks, refunds, price matching), tax deductions and rules, credit card optimization, budgeting frameworks, insurance negotiation, medical bill negotiation, banking fees, investing basics, retirement accounts, scam prevention, rent negotiation, and smart shopping tactics. Use this BEFORE answering general financial questions to ground your response in verified facts instead of guessing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Natural language query (e.g. 'Can I chargeback a cancelled subscription?')"},
+                    "tag_filter": {"type": "string", "description": "Optional comma-separated tags to boost relevance (e.g. 'chargeback,dispute')"}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+
 
     {
         "type": "function",
@@ -2515,6 +2534,7 @@ EXPECTED_TOOL_NAMES = {
     "semantic_search_memory",
     "save_epistemic_memory",
     "get_temporal_projection",
+    "query_knowledge_base",
     "auto_reconcile_ledger",
     "calculate_lifestyle_creep",
     "allocate_next_best_dollar",
@@ -5154,6 +5174,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = calculate_credit_float_velocity(uid)
                     elif func_name == "get_safe_to_spend_metrics":
                         db_result = get_safe_to_spend_metrics(uid)
+                    elif func_name == "query_knowledge_base":
+                        db_result = query_knowledge_base(
+                            question=args.get("question", ""),
+                            tag_filter=args.get("tag_filter", "")
+                        )
                     elif func_name == "auto_reconcile_ledger":
                         db_result = auto_reconcile_ledger(uid)
                     elif func_name == "calculate_lifestyle_creep":
