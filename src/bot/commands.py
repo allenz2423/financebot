@@ -2771,6 +2771,61 @@ async def emergency_fund_cmd(ctx: commands.Context):
         await ctx.send(f"❌ Emergency fund health check failed: `{type(exc).__name__}: {exc}`")
 
 
+# ============================================================
+# Investment Portfolio & Rebalancing Commands
+# ============================================================
+
+@bot.command(name="portfolio", aliases=["holdings", "investments"])
+async def portfolio_cmd(ctx: commands.Context):
+    """View investment holdings, asset class breakdown, unrealized P&L, and target allocation."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.portfolio import format_portfolio_report
+        report = format_portfolio_report(user_id=user_id)
+        await ctx.send(report)
+    except Exception as exc:
+        await ctx.send(f"❌ Portfolio query failed: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="setholding")
+async def set_holding_cmd(ctx: commands.Context, symbol: str, shares: float, price: float = 0.0, cost_basis: float = 0.0, asset_class: str = "Equities"):
+    """Set or update an investment holding (shares=0 removes it)."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.portfolio import set_holding
+        res = set_holding(
+            user_id=user_id,
+            symbol=symbol,
+            shares=shares,
+            cost_basis=cost_basis,
+            current_price=price,
+            asset_class=asset_class
+        )
+        if res.get("action") == "deleted":
+            await ctx.send(f"🗑️ Removed holding `{symbol.upper()}`.")
+        else:
+            await ctx.send(f"✅ Saved holding `{res['symbol']}`: {res['shares']} shares @ ${res['current_price']:.2f} ({res['asset_class']}).")
+    except Exception as exc:
+        await ctx.send(f"❌ Failed to set holding: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="rebalance", aliases=["drift"])
+async def rebalance_cmd(ctx: commands.Context):
+    """Calculate asset allocation drift against targets and display required rebalancing trades."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.portfolio import get_portfolio_summary, format_portfolio_report
+        data = get_portfolio_summary(user_id=user_id)
+        if not data.get("targets"):
+            await ctx.send("⚠️ No target allocation set. Use `!portfolio` to view holdings.")
+            return
+        report = format_portfolio_report(user_id=user_id)
+        await ctx.send(report)
+    except Exception as exc:
+        await ctx.send(f"❌ Rebalancing check failed: `{type(exc).__name__}: {exc}`")
+
+
+
 
 
 
