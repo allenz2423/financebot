@@ -5,7 +5,7 @@ from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
 from src.rag.engine import query_knowledge_base, save_to_knowledge_base
 from src.services.reconciler import auto_reconcile_ledger
-from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
+from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar, analyze_recurring_leakage
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.db.prefs import get_user_timezone, set_user_timezone
@@ -753,6 +753,19 @@ BOT_TOOLS_SCHEMA = [
                     "windfall_amount": {"type": "number", "description": "The dollar amount to allocate"}
                 },
                 "required": ["windfall_amount"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_recurring_leakage",
+            "description": "Recurring Payment & Subscription Leakage Intelligence Engine. Audits recurring cadences (weekly, monthly, annual), catches silent subscription price creep, and calculates annual recurring burden.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lookback_days": {"type": "integer", "description": "Number of days of transaction history to audit (default 180)"}
+                }
             }
         }
     },
@@ -2558,6 +2571,7 @@ EXPECTED_TOOL_NAMES = {
     "auto_reconcile_ledger",
     "calculate_lifestyle_creep",
     "allocate_next_best_dollar",
+    "analyze_recurring_leakage",
     "simulate_what_if_scenario",
     "simulate_stochastic_cash_flow",
     "predict_next_paydays",
@@ -5212,6 +5226,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = calculate_lifestyle_creep(uid, args.get("days_back", 180))
                     elif func_name == "allocate_next_best_dollar":
                         db_result = allocate_next_best_dollar(uid, args.get("windfall_amount", 0.0))
+                    elif func_name == "analyze_recurring_leakage":
+                        db_result = analyze_recurring_leakage(uid, args.get("lookback_days", 180))
                     elif func_name == "simulate_what_if_scenario":
                         db_result = run_what_if_scenario(
                             user_id=uid,

@@ -2630,6 +2630,52 @@ async def whatif_cmd(ctx: commands.Context, amount: float, days: int = 60, *, na
 
 
 # ============================================================
+# Financial Intelligence & Leakage Commands
+# ============================================================
+
+@bot.command(name="recurringleakage", aliases=["leakage", "phantomsubs"])
+async def recurring_leakage_cmd(ctx: commands.Context, lookback_days: int = 180):
+    """Audit recurring payments, identify subscription inflation, and calculate monthly burn rate."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.intelligence import analyze_recurring_leakage
+        report = analyze_recurring_leakage(user_id, lookback_days=lookback_days)
+        if len(report) > 1900:
+            parts = [report[i:i+1900] for i in range(0, len(report), 1900)]
+            for part in parts:
+                await ctx.send(f"```text\n{part}\n```")
+        else:
+            await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Recurring leakage audit failed: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="lifestylecreep", aliases=["creep"])
+async def lifestyle_creep_cmd(ctx: commands.Context, days_back: int = 180):
+    """Detect statistically significant upward trends in weekly discretionary spending."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.intelligence import calculate_lifestyle_creep
+        report = calculate_lifestyle_creep(user_id, days_back=days_back)
+        await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Lifestyle creep analysis failed: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="nextdollar")
+async def next_dollar_cmd(ctx: commands.Context, amount: float):
+    """Mathematically determine the highest-ROI allocation for an incoming windfall."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.intelligence import allocate_next_best_dollar
+        report = allocate_next_best_dollar(user_id, windfall_amount=amount)
+        await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Next best dollar allocation failed: `{type(exc).__name__}: {exc}`")
+
+
+
+# ============================================================
 # Free-Trial & Zombie Subscription Watchdog
 # ============================================================
 
