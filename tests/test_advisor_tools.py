@@ -91,8 +91,8 @@ def test_db():
 
 
 def test_advisor_tools_total_count():
-    assert len(ADVISOR_TOOLS_DISPATCH) == 50
-    assert len(NEW_50_TOOLS_SCHEMA) == 50
+    assert len(ADVISOR_TOOLS_DISPATCH) == 38
+    assert len(NEW_50_TOOLS_SCHEMA) == 38
     # Every tool in schema has a corresponding dispatcher function
     schema_names = {t["function"]["name"] for t in NEW_50_TOOLS_SCHEMA}
     dispatch_names = set(ADVISOR_TOOLS_DISPATCH.keys())
@@ -147,11 +147,6 @@ def test_tools_6_to_10_portfolio_and_allocation(test_db):
     res8 = ADVISOR_TOOLS_DISPATCH["calculate_portfolio_drift"](user_id, {"target_allocations": {"Equities": 0.80, "Fixed Income": 0.20}}, test_db)
     assert "rebalance_orders" in res8
 
-    # 9. calculate_compound_growth
-    res9 = ADVISOR_TOOLS_DISPATCH["calculate_compound_growth"](user_id, {"principal": 10000.0, "monthly_contribution": 500.0, "annual_return_pct": 7.0, "years": 10}, test_db)
-    assert res9["total_future_value"] > 10000.0
-    assert len(res9["milestones"]) > 0
-
     # 10. get_portfolio_dividend_projection
     res10 = ADVISOR_TOOLS_DISPATCH["get_portfolio_dividend_projection"](user_id, {"assumed_yield_pct": 2.5}, test_db)
     assert res10["projected_annual_dividends"] == 62.50
@@ -167,12 +162,6 @@ def test_tools_11_to_15_budgeting_and_pacing(test_db):
     # 12. delete_category_budget
     res12 = ADVISOR_TOOLS_DISPATCH["delete_category_budget"](user_id, {"category": "Dining"}, test_db)
     assert "deleted" in res12
-
-    # 13. auto_generate_50_30_20_budget
-    res13 = ADVISOR_TOOLS_DISPATCH["auto_generate_50_30_20_budget"](user_id, {"monthly_after_tax_income": 5000.0}, test_db)
-    assert res13["needs"]["amount"] == 2500.0
-    assert res13["wants"]["amount"] == 1500.0
-    assert res13["savings_and_debt"]["amount"] == 1000.0
 
     # 14. compare_period_spending
     res14 = ADVISOR_TOOLS_DISPATCH["compare_period_spending"](user_id, {}, test_db)
@@ -220,10 +209,6 @@ def test_tools_21_to_25_goals_and_milestones(test_db):
     res21 = ADVISOR_TOOLS_DISPATCH["get_savings_goals"](user_id, {}, test_db)
     assert res21["total_goals_count"] >= 1
 
-    # 24. calculate_goal_timeline
-    res24 = ADVISOR_TOOLS_DISPATCH["calculate_goal_timeline"](user_id, {"target_amount": 2000.0, "current_amount": 500.0, "monthly_contribution": 250.0}, test_db)
-    assert res24["months_to_completion"] == 6
-
     # 25. prioritize_savings_goals
     res25 = ADVISOR_TOOLS_DISPATCH["prioritize_savings_goals"](user_id, {}, test_db)
     assert "ranked_goals_by_priority" in res25
@@ -249,16 +234,6 @@ def test_tools_26_to_30_tax_planning(test_db):
     # 28. get_charitable_donations_summary
     res28 = ADVISOR_TOOLS_DISPATCH["get_charitable_donations_summary"](user_id, {}, test_db)
     assert "total_charitable_donations" in res28
-
-    # 29. calculate_hsa_fsa_tax_savings
-    res29 = ADVISOR_TOOLS_DISPATCH["calculate_hsa_fsa_tax_savings"](user_id, {"annual_contribution": 4150.0, "marginal_tax_rate_pct": 22.0}, test_db)
-    assert res29["total_tax_savings"] > 1000.0
-
-    # 30. estimate_capital_gains_tax
-    res30 = ADVISOR_TOOLS_DISPATCH["estimate_capital_gains_tax"](user_id, {"cost_basis": 5000.0, "sale_price": 8000.0, "holding_period_months": 18}, test_db)
-    assert res30["realized_gain"] == 3000.0
-    assert res30["classification"] == "Long-Term (>=1 Year)"
-    assert res30["estimated_tax_due"] == 450.0
 
 
 def test_tools_31_to_35_ledger_and_receipts(test_db):
@@ -314,40 +289,8 @@ def test_tools_36_to_40_loans_and_mortgages(test_db):
     assert res39["breakeven_horizon_months"] < 24
     assert res39["worth_refinancing"] is True
 
-    # 40. calculate_student_loan_payoff
-    res40 = ADVISOR_TOOLS_DISPATCH["calculate_student_loan_payoff"](user_id, {"loan_balance": 25000.0, "interest_rate_pct": 5.0, "monthly_payment": 300.0}, test_db)
-    assert res40["payoff_duration_months"] > 0
 
-
-def test_tools_41_to_45_retirement_and_fire(test_db):
-    user_id = "test_user_i"
-
-    # 41. calculate_fire_number
-    res41 = ADVISOR_TOOLS_DISPATCH["calculate_fire_number"](user_id, {"annual_expenses": 50000.0, "safe_withdrawal_rate_pct": 4.0}, test_db)
-    assert res41["fire_target_number"] == 1250000.0
-
-    # 42. calculate_401k_match_maximizer
-    res42 = ADVISOR_TOOLS_DISPATCH["calculate_401k_match_maximizer"](user_id, {"annual_salary": 100000.0, "match_pct": 50.0, "match_cap_pct": 6.0, "current_contribution_pct": 3.0}, test_db)
-    assert res42["maximum_free_match_dollars"] == 3000.0
-    assert res42["actual_employer_match_earned"] == 1500.0
-    assert res42["foregone_free_money"] == 1500.0
-
-    # 43. calculate_roth_conversion_tax
-    res43 = ADVISOR_TOOLS_DISPATCH["calculate_roth_conversion_tax"](user_id, {"conversion_amount": 20000.0, "current_marginal_bracket_pct": 22.0, "expected_retirement_bracket_pct": 24.0}, test_db)
-    assert res43["tax_due_at_conversion"] == 4400.0
-    assert res43["conversion_recommended"] is True
-
-    # 44. calculate_required_minimum_distributions
-    res44 = ADVISOR_TOOLS_DISPATCH["calculate_required_minimum_distributions"](user_id, {"age": 75, "pre_tax_balance": 600000.0}, test_db)
-    assert res44["rmd_required"] is True
-    assert res44["annual_rmd_amount"] > 20000.0
-
-    # 45. simulate_retirement_drawdown
-    res45 = ADVISOR_TOOLS_DISPATCH["simulate_retirement_drawdown"](user_id, {"starting_portfolio": 1000000.0, "annual_withdrawal": 40000.0, "years": 25}, test_db)
-    assert res45["remains_solvent_over_horizon"] is True
-
-
-def test_tools_46_to_50_fees_and_analytics(test_db):
+def test_tools_fees_and_analytics(test_db):
     user_id = "test_user_j"
     c = test_db.cursor()
     # Insert a bank fee
@@ -360,28 +303,25 @@ def test_tools_46_to_50_fees_and_analytics(test_db):
     """, (user_id, user_id))
     test_db.commit()
 
-    # 46. detect_bank_fee_leakage
+    # detect_bank_fee_leakage
     res46 = ADVISOR_TOOLS_DISPATCH["detect_bank_fee_leakage"](user_id, {}, test_db)
     assert res46["total_fee_leakage"] == 35.0
     assert len(res46["fee_transactions"]) == 1
 
-    # 47. get_duplicate_transactions
+    # get_duplicate_transactions
     res47 = ADVISOR_TOOLS_DISPATCH["get_duplicate_transactions"](user_id, {}, test_db)
     assert res47["duplicate_count"] >= 1
 
-    # 48. render_financial_chart
+    # render_financial_chart
     res48 = ADVISOR_TOOLS_DISPATCH["render_financial_chart"](user_id, {"chart_type": "category"}, test_db)
     assert res48["status"] == "success"
     assert res48["byte_size"] > 0
 
-    # 49. calculate_inflation_erosion
-    res49 = ADVISOR_TOOLS_DISPATCH["calculate_inflation_erosion"](user_id, {"cash_amount": 50000.0, "annual_inflation_pct": 3.0, "years": 10}, test_db)
-    assert res49["purchasing_power_lost"] > 10000.0
-
-    # 50. generate_weekly_financial_briefing
+    # generate_weekly_financial_briefing
     res50 = ADVISOR_TOOLS_DISPATCH["generate_weekly_financial_briefing"](user_id, {}, test_db)
     assert res50["briefing_period"] == "Past 7 Days"
     assert "financial_health_score" in res50
+
 
 
 def test_zero_interest_and_debt_rollover_logic(test_db):

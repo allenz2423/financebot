@@ -237,43 +237,6 @@ def tool_calculate_portfolio_drift(user_id: str, args: Dict[str, Any], conn: Opt
     return calculate_portfolio_drift(user_id=user_id, targets=targets, conn=conn)
 
 
-def tool_calculate_compound_growth(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """9. Computes compound interest schedule and future portfolio trajectory."""
-    principal = max(0.0, float(args.get("principal", 1000.0)))
-    monthly = max(0.0, float(args.get("monthly_contribution", 200.0)))
-    rate = float(args.get("annual_return_pct", 8.0)) / 100.0
-    years = max(1, min(60, int(args.get("years", 10))))
-
-    m_rate = rate / 12.0
-    total_months = years * 12
-
-    # FV of lump sum: P * (1 + r)^n
-    fv_principal = principal * math.pow(1.0 + m_rate, total_months)
-    # FV of series: PMT * [((1 + r)^n - 1) / r]
-    fv_contributions = (monthly * (math.pow(1.0 + m_rate, total_months) - 1.0) / m_rate) if m_rate > 0 else (monthly * total_months)
-
-    total_future_value = fv_principal + fv_contributions
-    total_contributed = principal + (monthly * total_months)
-    total_interest_earned = max(0.0, total_future_value - total_contributed)
-
-    milestones = []
-    for y in [1, 5, 10, 20, 30]:
-        if y <= years:
-            n = y * 12
-            fv = (principal * math.pow(1.0 + m_rate, n)) + ((monthly * (math.pow(1.0 + m_rate, n) - 1.0) / m_rate) if m_rate > 0 else (monthly * n))
-            milestones.append({"year": y, "value": round(fv, 2)})
-
-    return {
-        "initial_principal": round(principal, 2),
-        "monthly_contribution": round(monthly, 2),
-        "annual_return_pct": round(rate * 100.0, 2),
-        "horizon_years": years,
-        "total_contributed": round(total_contributed, 2),
-        "total_interest_earned": round(total_interest_earned, 2),
-        "total_future_value": round(total_future_value, 2),
-        "milestones": milestones,
-    }
-
 
 def tool_get_portfolio_dividend_projection(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
     """10. Projects estimated dividend/yield cash flows from portfolio holdings."""
@@ -328,56 +291,6 @@ def tool_delete_category_budget(user_id: str, args: Dict[str, Any], conn: Option
     with sqlite3.connect(DB_PATH) as db:
         return _eval(db)
 
-
-def tool_auto_generate_50_30_20_budget(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """13. Computes 50/30/20 budget framework allocations tailored to user income."""
-    _ensure_user_id(user_id, "auto_generate_50_30_20_budget")
-    income_input = args.get("monthly_after_tax_income")
-
-    def _eval(db_conn: sqlite3.Connection) -> Dict[str, Any]:
-        c = db_conn.cursor()
-        if income_input is not None and float(income_input) > 0:
-            monthly_income = float(income_input)
-        else:
-            # Query past 60-day income transactions
-            c.execute("""
-                SELECT SUM(ABS(amount))
-                FROM transactions
-                WHERE user_id = ? AND amount < 0 AND category IN ('Income', 'Payroll', 'Salary')
-                  AND date >= date('now', '-60 days')
-            """, (user_id,))
-            row = c.fetchone()
-            income_60 = float(row[0] or 0.0)
-            monthly_income = (income_60 / 2.0) if income_60 > 0 else 4000.0
-
-        needs = monthly_income * 0.50
-        wants = monthly_income * 0.30
-        savings = monthly_income * 0.20
-
-        return {
-            "monthly_net_income": round(monthly_income, 2),
-            "allocation_model": "50/30/20 Standard Framework",
-            "needs": {
-                "target_pct": 50,
-                "amount": round(needs, 2),
-                "examples": ["Rent/Mortgage", "Groceries", "Utilities", "Insurance", "Minimum Debt Payments"]
-            },
-            "wants": {
-                "target_pct": 30,
-                "amount": round(wants, 2),
-                "examples": ["Dining Out", "Entertainment", "Shopping", "Travel", "Hobbies"]
-            },
-            "savings_and_debt": {
-                "target_pct": 20,
-                "amount": round(savings, 2),
-                "examples": ["Emergency Fund", "Extra Debt Paydown", "Roth IRA", "401(k) / Investments", "Sinking Goals"]
-            }
-        }
-
-    if conn is not None:
-        return _eval(conn)
-    with sqlite3.connect(DB_PATH) as db:
-        return _eval(db)
 
 
 def tool_compare_period_spending(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
@@ -745,39 +658,6 @@ def tool_delete_savings_goal(user_id: str, args: Dict[str, Any], conn: Optional[
         return _eval(db)
 
 
-def tool_calculate_goal_timeline(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """24. Computes required monthly savings for a deadline or projected completion date."""
-    target_amt = float(args.get("target_amount", 5000.0))
-    cur_amt = float(args.get("current_amount", 0.0))
-    remaining = max(0.0, target_amt - cur_amt)
-    monthly_dep = float(args.get("monthly_contribution") or 0.0)
-    target_date_str = args.get("target_date")
-
-    result: Dict[str, Any] = {
-        "target_amount": round(target_amt, 2),
-        "current_amount": round(cur_amt, 2),
-        "remaining_deficit": round(remaining, 2),
-    }
-
-    if target_date_str:
-        try:
-            td = datetime.strptime(target_date_str[:10], "%Y-%m-%d").date()
-            today = datetime.now().date()
-            months = max(1, (td.year - today.year) * 12 + (td.month - today.month))
-            req_monthly = remaining / months
-            result["months_to_deadline"] = months
-            result["required_monthly_savings"] = round(req_monthly, 2)
-        except Exception:
-            pass
-
-    if monthly_dep > 0:
-        months_needed = math.ceil(remaining / monthly_dep)
-        comp_date = datetime.now().date() + timedelta(days=months_needed * 30)
-        result["months_to_completion"] = months_needed
-        result["estimated_completion_date"] = comp_date.strftime("%Y-%m-%d")
-
-    return result
-
 
 def tool_prioritize_savings_goals(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
     """25. Deterministically ranks savings goals by deadline urgency and shortfall percentage."""
@@ -893,54 +773,6 @@ def tool_get_charitable_donations_summary(user_id: str, args: Dict[str, Any], co
     with sqlite3.connect(DB_PATH) as db:
         return _eval(db)
 
-
-def tool_calculate_hsa_fsa_tax_savings(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """29. Calculates pre-tax savings from HSA/FSA contributions."""
-    contrib = max(0.0, float(args.get("annual_contribution", 4150.0)))
-    fed_rate = float(args.get("marginal_tax_rate_pct", 22.0)) / 100.0
-    fica_rate = 0.0765  # 7.65% Social Security + Medicare
-    state_rate = 0.05   # Average 5% state tax
-
-    total_rate = fed_rate + fica_rate + state_rate
-    savings = contrib * total_rate
-
-    return {
-        "contribution_amount": round(contrib, 2),
-        "federal_tax_saved": round(contrib * fed_rate, 2),
-        "fica_tax_saved": round(contrib * fica_rate, 2),
-        "state_tax_saved": round(contrib * state_rate, 2),
-        "total_tax_savings": round(savings, 2),
-        "effective_discount_pct": round(total_rate * 100.0, 1),
-    }
-
-
-def tool_estimate_capital_gains_tax(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """30. Computes short-term vs long-term capital gains tax on an asset sale."""
-    cost = max(0.0, float(args.get("cost_basis", 1000.0)))
-    sale = max(0.0, float(args.get("sale_price", 1500.0)))
-    months = int(args.get("holding_period_months", 14))
-    gain = max(0.0, sale - cost)
-
-    is_long_term = months >= 12
-    if is_long_term:
-        tax_rate = 0.15  # standard long term bracket
-        term = "Long-Term (>=1 Year)"
-    else:
-        tax_rate = 0.24  # ordinary income rate
-        term = "Short-Term (<1 Year)"
-
-    tax_due = gain * tax_rate
-
-    return {
-        "cost_basis": round(cost, 2),
-        "sale_price": round(sale, 2),
-        "realized_gain": round(gain, 2),
-        "holding_period_months": months,
-        "classification": term,
-        "tax_rate_pct": round(tax_rate * 100.0, 1),
-        "estimated_tax_due": round(tax_due, 2),
-        "net_proceeds_after_tax": round(sale - tax_due, 2),
-    }
 
 
 # ============================================================
@@ -1235,202 +1067,7 @@ def tool_calculate_mortgage_refinance_breakeven(user_id: str, args: Dict[str, An
     }
 
 
-def tool_calculate_student_loan_payoff(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """40. Simulates payoff duration and interest for student loan balances."""
-    bal = float(args.get("loan_balance", 35000.0))
-    rate = float(args.get("interest_rate_pct", 5.8)) / 100.0
-    monthly_pmt = float(args.get("monthly_payment", 400.0))
 
-    m_rate = rate / 12.0
-    cur_bal = bal
-    months = 0
-    total_interest = 0.0
-
-    if monthly_pmt <= cur_bal * m_rate:
-        return {"error": "Monthly payment is lower than monthly interest. The loan will never be paid off."}
-
-    while cur_bal > 0 and months < 360:
-        months += 1
-        m_int = cur_bal * m_rate
-        total_interest += m_int
-        cur_bal += m_int
-
-        pay = min(cur_bal, monthly_pmt)
-        cur_bal -= pay
-
-    return {
-        "original_balance": round(bal, 2),
-        "monthly_payment": round(monthly_pmt, 2),
-        "payoff_duration_months": months,
-        "payoff_duration_years": round(months / 12.0, 1),
-        "total_interest_paid": round(total_interest, 2),
-        "total_cost": round(bal + total_interest, 2),
-    }
-
-
-# ============================================================
-# Category I: Retirement & FI/RE Planning (Tools 41–45)
-# ============================================================
-
-def tool_calculate_fire_number(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """41. Computes Financial Independence (FI/RE) number and projected retirement year."""
-    _ensure_user_id(user_id, "calculate_fire_number")
-    swr = float(args.get("safe_withdrawal_rate_pct", 4.0)) / 100.0
-    input_exp = args.get("annual_expenses")
-
-    def _eval(db_conn: sqlite3.Connection) -> Dict[str, Any]:
-        c = db_conn.cursor()
-        if input_exp is not None and float(input_exp) > 0:
-            annual_spend = float(input_exp)
-        else:
-            c.execute("""
-                SELECT SUM(amount) FROM transactions
-                WHERE user_id = ? AND status = 'Evaluated' AND amount > 0
-                  AND category NOT IN ('Credit Card Bill Payment 💳', 'Transfer')
-                  AND date >= date('now', '-90 days')
-            """, (user_id,))
-            spend_90 = float(c.fetchone()[0] or 0.0)
-            annual_spend = (spend_90 * 4.0) if spend_90 > 0 else 60000.0
-
-        fire_number = annual_spend / swr
-
-        # Current portfolio
-        from src.services.portfolio import get_portfolio
-        port = get_portfolio(user_id=user_id, conn=db_conn)
-        cur_assets = port.get("total_portfolio_value", 0.0)
-        gap = max(0.0, fire_number - cur_assets)
-        pct_reached = (cur_assets / fire_number * 100.0) if fire_number > 0 else 0.0
-
-        return {
-            "annual_living_expenses": round(annual_spend, 2),
-            "safe_withdrawal_rate_pct": round(swr * 100.0, 1),
-            "fire_target_number": round(fire_number, 2),
-            "current_invested_assets": round(cur_assets, 2),
-            "remaining_wealth_gap": round(gap, 2),
-            "progress_to_fire_pct": round(pct_reached, 1),
-            "monthly_safe_drawdown": round(annual_spend / 12.0, 2),
-        }
-
-    if conn is not None:
-        return _eval(conn)
-    with sqlite3.connect(DB_PATH) as db:
-        return _eval(db)
-
-
-def tool_calculate_401k_match_maximizer(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """42. Calculates 401(k) employer match dollars and identifies missed free money."""
-    salary = float(args.get("annual_salary", 95000.0))
-    match_pct = float(args.get("match_pct", 50.0)) / 100.0      # e.g. 50% match
-    match_cap_pct = float(args.get("match_cap_pct", 6.0)) / 100.0 # up to 6%
-    user_contrib_pct = float(args.get("current_contribution_pct", 4.0)) / 100.0
-
-    max_employee_for_match = salary * match_cap_pct
-    max_employer_match = max_employee_for_match * match_pct
-
-    actual_employee_contrib = salary * user_contrib_pct
-    actual_match_eligible = min(actual_employee_contrib, max_employee_for_match)
-    actual_employer_match = actual_match_eligible * match_pct
-
-    missed_match = max(0.0, max_employer_match - actual_employer_match)
-
-    return {
-        "annual_salary": round(salary, 2),
-        "employer_match_terms": f"{match_pct*100:.0f}% match up to {match_cap_pct*100:.0f}% of salary",
-        "maximum_free_match_dollars": round(max_employer_match, 2),
-        "actual_employer_match_earned": round(actual_employer_match, 2),
-        "foregone_free_money": round(missed_match, 2),
-        "recommended_contribution_pct": round(match_cap_pct * 100.0, 1),
-        "optimal": missed_match <= 0.0,
-    }
-
-
-def tool_calculate_roth_conversion_tax(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """43. Analyzes the tax cost and long-term advantage of a Roth IRA conversion."""
-    conv_amt = float(args.get("conversion_amount", 10000.0))
-    cur_rate = float(args.get("current_marginal_bracket_pct", 24.0)) / 100.0
-    ret_rate = float(args.get("expected_retirement_bracket_pct", 22.0)) / 100.0
-
-    tax_now = conv_amt * cur_rate
-    favorable = cur_rate <= ret_rate
-
-    return {
-        "conversion_amount": round(conv_amt, 2),
-        "tax_due_at_conversion": round(tax_now, 2),
-        "current_bracket_pct": round(cur_rate * 100.0, 1),
-        "expected_retirement_bracket_pct": round(ret_rate * 100.0, 1),
-        "conversion_recommended": favorable,
-        "rationale": (
-            "Favorable: Your current tax bracket is lower than or equal to your expected retirement bracket."
-            if favorable
-            else "Caution: Your current bracket is higher than your expected retirement bracket; you may pay more tax today."
-        )
-    }
-
-
-def tool_calculate_required_minimum_distributions(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """44. Computes IRS Required Minimum Distribution (RMD) under SECURE 2.0 Act."""
-    age = int(args.get("age", 75))
-    balance = float(args.get("pre_tax_balance", 500000.0))
-
-    # IRS Uniform Lifetime Table Divisors
-    divisors = {
-        73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0,
-        79: 21.1, 80: 20.2, 81: 19.4, 82: 18.5, 83: 17.7, 84: 16.8,
-        85: 16.0, 86: 15.2, 87: 14.4, 88: 13.7, 89: 12.9, 90: 12.2,
-    }
-
-    if age < 73:
-        return {"age": age, "rmd_required": False, "rmd_amount": 0.0, "notes": "RMD age starts at 73 under the SECURE 2.0 Act."}
-
-    div = divisors.get(age, 12.0)
-    rmd = balance / div
-
-    return {
-        "age": age,
-        "rmd_required": True,
-        "pre_tax_balance": round(balance, 2),
-        "irs_distribution_period": div,
-        "annual_rmd_amount": round(rmd, 2),
-        "monthly_rmd_draw": round(rmd / 12.0, 2),
-    }
-
-
-def tool_simulate_retirement_drawdown(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """45. Simulates year-by-year portfolio longevity under variable withdrawal rates."""
-    portfolio = float(args.get("starting_portfolio", 1000000.0))
-    draw = float(args.get("annual_withdrawal", 40000.0))
-    inflation = float(args.get("annual_inflation_pct", 2.5)) / 100.0
-    growth = float(args.get("annual_return_pct", 6.5)) / 100.0
-    years = max(5, min(40, int(args.get("years", 30))))
-
-    bal = portfolio
-    cur_draw = draw
-    schedule = []
-    solvency = True
-
-    for y in range(1, years + 1):
-        # Growth
-        bal += bal * growth
-        # Withdrawal
-        bal -= cur_draw
-        if bal < 0:
-            bal = 0.0
-            solvency = False
-
-        schedule.append({"year": y, "annual_withdrawal": round(cur_draw, 2), "ending_balance": round(bal, 2)})
-        if not solvency:
-            break
-        # Inflation increase on withdrawal
-        cur_draw += cur_draw * inflation
-
-    return {
-        "starting_portfolio": round(portfolio, 2),
-        "initial_withdrawal_rate_pct": round(draw / portfolio * 100.0, 2) if portfolio > 0 else 0.0,
-        "remains_solvent_over_horizon": solvency,
-        "ending_portfolio_balance": round(bal, 2),
-        "years_simulated": len(schedule),
-        "schedule": schedule[::5] if len(schedule) > 10 else schedule,
-    }
 
 
 # ============================================================
@@ -1540,26 +1177,6 @@ def tool_render_financial_chart(user_id: str, args: Dict[str, Any], conn: Option
     }
 
 
-def tool_calculate_inflation_erosion(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
-    """49. Computes purchasing power loss on cash balances over time due to inflation."""
-    cash = max(0.0, float(args.get("cash_amount", 50000.0)))
-    inf_rate = float(args.get("annual_inflation_pct", 3.0)) / 100.0
-    years = max(1, min(50, int(args.get("years", 10))))
-
-    # Real purchasing power = Cash / (1 + i)^n
-    factor = math.pow(1.0 + inf_rate, years)
-    real_power = cash / factor
-    purchasing_loss = cash - real_power
-
-    return {
-        "initial_cash": round(cash, 2),
-        "annual_inflation_rate_pct": round(inf_rate * 100.0, 1),
-        "years": years,
-        "real_purchasing_power_remaining": round(real_power, 2),
-        "purchasing_power_lost": round(purchasing_loss, 2),
-        "percentage_loss": round((purchasing_loss / cash) * 100.0, 1) if cash > 0 else 0.0,
-    }
-
 
 def tool_generate_weekly_financial_briefing(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
     """50. Synthesizes weekly net worth change, 7-day spend, upcoming bills, and pacing."""
@@ -1618,13 +1235,11 @@ ADVISOR_TOOLS_DISPATCH: Dict[str, Callable[[str, Dict[str, Any], Optional[sqlite
     "get_portfolio_holdings": tool_get_portfolio_holdings,
     "set_portfolio_holding": tool_set_portfolio_holding,
     "calculate_portfolio_drift": tool_calculate_portfolio_drift,
-    "calculate_compound_growth": tool_calculate_compound_growth,
     "get_portfolio_dividend_projection": tool_get_portfolio_dividend_projection,
 
     # 11-15: Budgeting, Pacing & Allocations
     "get_category_budget_pacing": tool_get_category_budget_pacing,
     "delete_category_budget": tool_delete_category_budget,
-    "auto_generate_50_30_20_budget": tool_auto_generate_50_30_20_budget,
     "compare_period_spending": tool_compare_period_spending,
     "get_daily_spending_average": tool_get_daily_spending_average,
 
@@ -1639,15 +1254,12 @@ ADVISOR_TOOLS_DISPATCH: Dict[str, Callable[[str, Dict[str, Any], Optional[sqlite
     "get_savings_goals": tool_get_savings_goals,
     "fund_savings_goal": tool_fund_savings_goal,
     "delete_savings_goal": tool_delete_savings_goal,
-    "calculate_goal_timeline": tool_calculate_goal_timeline,
     "prioritize_savings_goals": tool_prioritize_savings_goals,
 
     # 26-30: Tax Planning, Deductions & Write-Offs
     "scan_tax_deductions": tool_scan_tax_deductions,
     "get_tax_bracket_estimate": tool_get_tax_bracket_estimate,
     "get_charitable_donations_summary": tool_get_charitable_donations_summary,
-    "calculate_hsa_fsa_tax_savings": tool_calculate_hsa_fsa_tax_savings,
-    "estimate_capital_gains_tax": tool_estimate_capital_gains_tax,
 
     # 31-35: Ledger, Receipts & Merchant Intelligence
     "get_transaction_ledger": tool_get_transaction_ledger,
@@ -1661,20 +1273,11 @@ ADVISOR_TOOLS_DISPATCH: Dict[str, Callable[[str, Dict[str, Any], Optional[sqlite
     "calculate_extra_payment_impact": tool_calculate_extra_payment_impact,
     "compare_rent_vs_buy": tool_compare_rent_vs_buy,
     "calculate_mortgage_refinance_breakeven": tool_calculate_mortgage_refinance_breakeven,
-    "calculate_student_loan_payoff": tool_calculate_student_loan_payoff,
 
-    # 41-45: Retirement & FI/RE Planning
-    "calculate_fire_number": tool_calculate_fire_number,
-    "calculate_401k_match_maximizer": tool_calculate_401k_match_maximizer,
-    "calculate_roth_conversion_tax": tool_calculate_roth_conversion_tax,
-    "calculate_required_minimum_distributions": tool_calculate_required_minimum_distributions,
-    "simulate_retirement_drawdown": tool_simulate_retirement_drawdown,
-
-    # 46-50: Banking, Fee Audit & Analytics
+    # Banking, Fee Audit & Analytics
     "detect_bank_fee_leakage": tool_detect_bank_fee_leakage,
     "get_duplicate_transactions": tool_get_duplicate_transactions,
     "render_financial_chart": tool_render_financial_chart,
-    "calculate_inflation_erosion": tool_calculate_inflation_erosion,
     "generate_weekly_financial_briefing": tool_generate_weekly_financial_briefing,
 }
 
@@ -1783,23 +1386,6 @@ NEW_50_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "calculate_compound_growth",
-            "description": "Computes future portfolio growth trajectory, total principal invested vs compound interest earned, and milestone year-by-year projections based on starting principal, recurring monthly contributions, investment horizon, and expected annual return rate. Use when projecting long-term wealth accumulation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "principal": {"type": "number", "description": "Initial starting balance"},
-                    "monthly_contribution": {"type": "number", "description": "Monthly deposit amount"},
-                    "annual_return_pct": {"type": "number", "description": "Annual return percentage (e.g. 7.0 for 7%)"},
-                    "years": {"type": "integer", "description": "Investment time horizon in years"}
-                },
-                "required": ["principal", "monthly_contribution", "annual_return_pct", "years"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "get_portfolio_dividend_projection",
             "description": "Projects annual, monthly, and daily dividend/yield cash flow from equity and fixed income holdings based on portfolio value and assumed or historical dividend yield percentages. Use when planning passive income, dividend reinvestment (DRIP), or living off yield.",
             "parameters": {
@@ -1836,19 +1422,6 @@ NEW_50_TOOLS_SCHEMA = [
                     "category": {"type": "string", "description": "Category name to remove budget for"}
                 },
                 "required": ["category"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "auto_generate_50_30_20_budget",
-            "description": "Calculates an optimal 50/30/20 budget blueprint (Needs: 50%, Wants: 30%, Savings/Debt Payoff: 20%) calibrated to the user's net after-tax income (auto-detected or manually specified). Use when establishing baseline budget envelopes or restructuring cash flow.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "monthly_after_tax_income": {"type": "number", "description": "Optional monthly net income override"}
-                }
             }
         }
     },
@@ -1996,23 +1569,6 @@ NEW_50_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "calculate_goal_timeline",
-            "description": "Solves savings timelines: calculates required monthly contribution to reach target by specific deadline date, OR calculates projected completion date given a fixed monthly deposit. Use when user plans major purchases (house down payment, car, wedding, travel).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_amount": {"type": "number", "description": "Total goal target dollar amount"},
-                    "current_amount": {"type": "number", "description": "Current balance saved"},
-                    "monthly_contribution": {"type": "number", "description": "Optional monthly deposit amount"},
-                    "target_date": {"type": "string", "description": "Optional target deadline YYYY-MM-DD"}
-                },
-                "required": ["target_amount"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "prioritize_savings_goals",
             "description": "Ranks all savings goals using deterministic prioritization algorithm balancing target deadline urgency, funding shortfall percentage, and essential vs discretionary priority. Use when user has limited savings capacity and needs optimal dollar allocation.",
             "parameters": {"type": "object", "properties": {}}
@@ -2059,37 +1615,6 @@ NEW_50_TOOLS_SCHEMA = [
                 "properties": {
                     "year": {"type": "integer", "description": "Tax year to summarize (default current year)"}
                 }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_hsa_fsa_tax_savings",
-            "description": "Calculates triple-tax advantage savings from pre-tax Health Savings Account (HSA) or Flexible Spending Account (FSA) contributions across Federal Income Tax, FICA (Social Security + Medicare 7.65%), and state taxes. Use when advising on open enrollment and medical budgeting.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "annual_contribution": {"type": "number", "description": "Annual dollar contribution to HSA or FSA"},
-                    "marginal_tax_rate_pct": {"type": "number", "description": "Marginal federal tax rate percentage"}
-                },
-                "required": ["annual_contribution"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "estimate_capital_gains_tax",
-            "description": "Computes capital gains tax on taxable asset sales, determining short-term vs long-term capital gains classification based on holding period (>12 months = preferential long-term rate) and estimated tax liability. Use before liquidating taxable investments or crypto.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cost_basis": {"type": "number", "description": "Total purchase cost of the asset"},
-                    "sale_price": {"type": "number", "description": "Total sale price of the asset"},
-                    "holding_period_months": {"type": "integer", "description": "Months asset was held"}
-                },
-                "required": ["cost_basis", "sale_price", "holding_period_months"]
             }
         }
     },
@@ -2240,106 +1765,7 @@ NEW_50_TOOLS_SCHEMA = [
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_student_loan_payoff",
-            "description": "Calculates total interest, payoff timeline in months and years, and monthly interest accrual for student loans under standard or accelerated payment schedules. Use when structuring student debt payoff strategies.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "loan_balance": {"type": "number", "description": "Current student loan balance"},
-                    "interest_rate_pct": {"type": "number", "description": "Annual interest rate percentage"},
-                    "monthly_payment": {"type": "number", "description": "Monthly payment amount"}
-                },
-                "required": ["loan_balance", "interest_rate_pct", "monthly_payment"]
-            }
-        }
-    },
-
-    # 41-45: Retirement & FI/RE Planning
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_fire_number",
-            "description": "Calculates Financial Independence / Retire Early (FI/RE) target portfolio number using the Trinity Study Safe Withdrawal Rate (default 4.0% = 25x annual expenses). Computes current FI/RE progress percentage and portfolio gap. Use when discussing early retirement and financial independence.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "annual_expenses": {"type": "number", "description": "Optional annual expenses override"},
-                    "safe_withdrawal_rate_pct": {"type": "number", "description": "Safe withdrawal rate percentage (default 4.0)"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_401k_match_maximizer",
-            "description": "Audits employer 401(k) matching formula (e.g. 50% match up to 6% salary), calculates guaranteed instant return on investment, quantifies missed employer match dollars ('free money left on the table'), and determines the exact optimal employee contribution percentage. Use when optimizing retirement contributions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "annual_salary": {"type": "number", "description": "Gross annual salary"},
-                    "match_pct": {"type": "number", "description": "Employer match percentage (e.g. 50.0 for 50% match)"},
-                    "match_cap_pct": {"type": "number", "description": "Maximum salary percentage matched (e.g. 6.0 for 6%)"},
-                    "current_contribution_pct": {"type": "number", "description": "User's current contribution percentage"}
-                },
-                "required": ["annual_salary", "match_pct", "match_cap_pct"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_roth_conversion_tax",
-            "description": "Evaluates the tax efficiency of converting Traditional pre-tax IRA/401(k) assets to a Roth IRA. Computes upfront tax liability at current marginal tax rate vs tax-free compounded growth in retirement. Use when planning Backdoor Roth or low-income year conversions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "conversion_amount": {"type": "number", "description": "Dollar amount to convert to Roth"},
-                    "current_marginal_bracket_pct": {"type": "number", "description": "Current federal marginal tax bracket percentage"},
-                    "expected_retirement_bracket_pct": {"type": "number", "description": "Expected tax bracket in retirement"}
-                },
-                "required": ["conversion_amount", "current_marginal_bracket_pct", "expected_retirement_bracket_pct"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_required_minimum_distributions",
-            "description": "Calculates IRS Required Minimum Distribution (RMD) for traditional retirement accounts (401k, Traditional IRA) using the IRS Uniform Lifetime Table based on account owner age and prior year-end balance. Use to prevent steep 25% IRS excise tax penalties.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "age": {"type": "integer", "description": "Account owner age"},
-                    "pre_tax_balance": {"type": "number", "description": "Pre-tax account balance as of Dec 31 prior year"}
-                },
-                "required": ["age", "pre_tax_balance"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "simulate_retirement_drawdown",
-            "description": "Simulates year-by-year retirement portfolio longevity under inflation-adjusted withdrawals, market returns, and tax drag across a 20-40 year horizon. Identifies portfolio depletion risks and safe terminal values. Use to stress-test retirement plans.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "starting_portfolio": {"type": "number", "description": "Starting portfolio balance"},
-                    "annual_withdrawal": {"type": "number", "description": "Initial annual withdrawal amount"},
-                    "annual_inflation_pct": {"type": "number", "description": "Annual inflation rate percentage (default 2.5)"},
-                    "annual_return_pct": {"type": "number", "description": "Expected annual investment return percentage (default 6.5)"},
-                    "years": {"type": "integer", "description": "Retirement horizon in years (default 30)"}
-                },
-                "required": ["starting_portfolio", "annual_withdrawal"]
-            }
-        }
-    },
-
-    # 46-50: Banking, Fee Audit & Analytics
+    # Banking, Fee Audit & Analytics
     {
         "type": "function",
         "function": {
@@ -2376,22 +1802,6 @@ NEW_50_TOOLS_SCHEMA = [
                     "days": {"type": "integer", "description": "Days to chart (default 30)"}
                 },
                 "required": ["chart_type"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_inflation_erosion",
-            "description": "Calculates the real purchasing power loss and cumulative inflation erosion on dormant cash balances over a multi-year horizon under specified inflation rates. Use to demonstrate the cost of holding excessive cash in non-yielding accounts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cash_amount": {"type": "number", "description": "Dormant cash dollar amount"},
-                    "annual_inflation_pct": {"type": "number", "description": "Annual inflation rate percentage (default 3.0)"},
-                    "years": {"type": "integer", "description": "Number of years (default 10)"}
-                },
-                "required": ["cash_amount"]
             }
         }
     },
