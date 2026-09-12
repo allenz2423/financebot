@@ -2,6 +2,7 @@ from src.core.discovery import explore_domain, list_domains
 from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
+from src.core.stochastic import calculate_stochastic_projection
 from src.db.prefs import get_user_timezone, set_user_timezone
 import src.core.state
 import json
@@ -9,6 +10,7 @@ from src.core.discovery import explore_domain, list_domains
 from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
+from src.core.stochastic import calculate_stochastic_projection
 from src.db.prefs import get_user_timezone, set_user_timezone
 
 import os
@@ -670,6 +672,22 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "simulate_stochastic_cash_flow",
+            "description": "Monte Carlo Cash Flow Simulator. Predicts the probability of going broke and calculates confidence intervals for future account balances by simulating thousands of possible futures based on the user's historical daily discretionary spending volatility and deterministic future events.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_ahead": {"type": "integer", "description": "Number of days to simulate (e.g. 30, 90)."},
+                    "paths": {"type": "integer", "description": "Number of parallel simulations to run (default 5000)."}
+                }
+            }
+        }
+    },
+
 
     {
         "type": "function",
@@ -2380,6 +2398,7 @@ EXPECTED_TOOL_NAMES = {
     "semantic_search_memory",
     "save_epistemic_memory",
     "get_temporal_projection",
+    "simulate_stochastic_cash_flow",
     "set_user_timezone",
     "get_user_timezone",
     "monitor_clear_all_rules"
@@ -5002,6 +5021,12 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             db_result = f"ERROR: {str(e)}"
                     elif func_name == "get_user_timezone":
                         db_result = f"Current timezone: {get_user_timezone(uid)}"
+                    elif func_name == "simulate_stochastic_cash_flow":
+                        db_result = calculate_stochastic_projection(
+                            user_id=uid,
+                            days_ahead=args.get("days_ahead", 90),
+                            paths=args.get("paths", 5000)
+                        )
                     elif func_name == "get_temporal_projection":
                         db_result = get_temporal_projection(
                             user_id=uid,
