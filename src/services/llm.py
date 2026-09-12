@@ -3,7 +3,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
-from src.rag.engine import query_knowledge_base
+from src.rag.engine import query_knowledge_base, save_to_knowledge_base
 from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
@@ -16,7 +16,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
-from src.rag.engine import query_knowledge_base
+from src.rag.engine import query_knowledge_base, save_to_knowledge_base
 from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
@@ -682,6 +682,25 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "save_to_knowledge_base",
+            "description": "Saves a new verified knowledge chunk into the RAG corpus. Use this after researching something via web search or synthesizing a novel financial insight. The knowledge is immediately indexed and persists across restarts. Only save VERIFIED, FACTUAL information — never save opinions or unverified claims.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chunk_id": {"type": "string", "description": "Unique snake_case ID (e.g. 'amex_return_protection_2025')"},
+                    "tags": {"type": "string", "description": "Comma-separated tags for retrieval (e.g. 'credit card, return, protection')"},
+                    "content": {"type": "string", "description": "The verified knowledge text to store (50+ chars)"},
+                    "source_context": {"type": "string", "description": "Where this info came from (e.g. 'Web search Sept 2026', 'User confirmed')"}
+                },
+                "required": ["chunk_id", "tags", "content"]
+            }
+        }
+    },
+
 
     {
         "type": "function",
@@ -2534,6 +2553,7 @@ EXPECTED_TOOL_NAMES = {
     "semantic_search_memory",
     "save_epistemic_memory",
     "get_temporal_projection",
+    "save_to_knowledge_base",
     "query_knowledge_base",
     "auto_reconcile_ledger",
     "calculate_lifestyle_creep",
@@ -5174,6 +5194,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = calculate_credit_float_velocity(uid)
                     elif func_name == "get_safe_to_spend_metrics":
                         db_result = get_safe_to_spend_metrics(uid)
+                    elif func_name == "save_to_knowledge_base":
+                        db_result = save_to_knowledge_base(
+                            chunk_id=args.get("chunk_id", ""),
+                            tags=args.get("tags", ""),
+                            content=args.get("content", ""),
+                            source_context=args.get("source_context", "")
+                        )
                     elif func_name == "query_knowledge_base":
                         db_result = query_knowledge_base(
                             question=args.get("question", ""),
