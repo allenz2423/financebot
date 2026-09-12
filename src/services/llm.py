@@ -3,6 +3,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.db.prefs import get_user_timezone, set_user_timezone
@@ -13,6 +14,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.db.prefs import get_user_timezone, set_user_timezone
@@ -676,6 +678,35 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_lifestyle_creep",
+            "description": "Runs a linear regression analysis on time-series discretionary spending to detect statistically significant upward trends (Lifestyle Creep).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_back": {"type": "integer", "description": "Number of days to analyze (default 180)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "allocate_next_best_dollar",
+            "description": "Algorithmic Routing Engine. Determines the mathematically optimal distribution of an influx of cash (a windfall) to maximize net worth.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "windfall_amount": {"type": "number", "description": "The dollar amount to allocate"}
+                },
+                "required": ["windfall_amount"]
+            }
+        }
+    },
+
 
     {
         "type": "function",
@@ -2472,6 +2503,8 @@ EXPECTED_TOOL_NAMES = {
     "semantic_search_memory",
     "save_epistemic_memory",
     "get_temporal_projection",
+    "calculate_lifestyle_creep",
+    "allocate_next_best_dollar",
     "simulate_what_if_scenario",
     "simulate_stochastic_cash_flow",
     "predict_next_paydays",
@@ -5108,6 +5141,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = calculate_credit_float_velocity(uid)
                     elif func_name == "get_safe_to_spend_metrics":
                         db_result = get_safe_to_spend_metrics(uid)
+                    elif func_name == "calculate_lifestyle_creep":
+                        db_result = calculate_lifestyle_creep(uid, args.get("days_back", 180))
+                    elif func_name == "allocate_next_best_dollar":
+                        db_result = allocate_next_best_dollar(uid, args.get("windfall_amount", 0.0))
                     elif func_name == "simulate_what_if_scenario":
                         db_result = run_what_if_scenario(
                             user_id=uid,
