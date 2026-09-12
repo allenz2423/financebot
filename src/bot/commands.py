@@ -25,6 +25,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
+from typing import Optional, List, Dict, Any, Tuple
+
 
 # --- UNIVERSAL CLOSE BUTTON PATCH ---
 class _UniversalCloseView(discord.ui.View):
@@ -1035,11 +1037,13 @@ TRANSACTION_BROWSER_VIEWS: dict[int, set["_TransactionPageView"]] = {}
 
 
 class _TransactionPageView(discord.ui.View):
-    def __init__(self, ctx: commands.Context, rows: list[tuple], *, locked: bool, page_size: int = 25):
+    def __init__(self, ctx: commands.Context, rows: list[tuple], *, locked: bool = False, title: str = "", color: Optional[discord.Color] = None, page_size: int = 25):
         super().__init__(timeout=300)
         self.ctx = ctx
         self.rows = rows
         self.locked = locked
+        self.custom_title = title
+        self.custom_color = color
         self.page_size = page_size
         self.page = 0
         self._message: discord.Message | None = None
@@ -1056,18 +1060,23 @@ class _TransactionPageView(discord.ui.View):
         self.page_indicator.label = f"{self.page + 1} / {self.total_pages}"
 
     def _embed(self) -> discord.Embed:
-        state_word = "Unlocked" if not self.locked else "Locked"
-        icon = "" if not self.locked else ""
         total = len(self.rows)
         start = self.page * self.page_size
         end = min(start + self.page_size, total)
+        if self.custom_title:
+            embed_title = f"{self.custom_title} ({total})"
+        else:
+            state_word = "Unlocked" if not self.locked else "Locked"
+            icon = "🔓" if not self.locked else "🔒"
+            embed_title = f"{icon} {state_word} Transactions ({total})"
+
         embed = discord.Embed(
-            title=f"{icon} {state_word} Transactions",
+            title=embed_title,
             description=(
                 f"Showing **{start + 1}–{end}** of **{total}** transactions.\n"
                 f"Page **{self.page + 1} / {self.total_pages}**"
             ),
-            color=discord.Color.orange() if not self.locked else discord.Color.green(),
+            color=self.custom_color or (discord.Color.orange() if not self.locked else discord.Color.green()),
         )
         page_rows = self.rows[start:end]
         if not page_rows:
@@ -1169,25 +1178,30 @@ class _TransactionPageView(discord.ui.View):
             pass
 
 
-async def _send_transaction_browser(ctx: commands.Context,
+async def _send_transaction_browser(
+    ctx: commands.Context,
     rows: list[tuple],
     *,
-    locked: bool,user_id: str,) -> None:
+    locked: bool = False,
+    title: str = "",
+    color: Optional[discord.Color] = None,
+    user_id: str,
+) -> None:
     if not user_id or not isinstance(user_id, str):
         raise ValueError(
             "_send_transaction_browser: forced isolation violation — user_id is required "
             "and must be a non-empty string."
         )
     if not rows:
-        state_word = "locked" if locked else "unlocked"
+        header = title or (f"{'Locked' if locked else 'Unlocked'} Transactions")
         embed = discord.Embed(
-            title=f" No {state_word.title()} Transactions",
-            description=f"No {state_word} transactions found.",
-            color=discord.Color.blurple(),
+            title=" No Transactions Found",
+            description=f"No transactions matched for **{header}**.",
+            color=color or discord.Color.blurple(),
         )
         await ctx.send(embed=embed)
         return
-    view = _TransactionPageView(ctx, rows, locked=locked)
+    view = _TransactionPageView(ctx, rows, locked=locked, title=title, color=color)
     view._message = await ctx.send(embed=view._embed(), view=view)
 
 
@@ -1235,6 +1249,153 @@ async def locked_command(ctx: commands.Context):
         await _send_transaction_browser(ctx, rows, locked=True, user_id=user_id)
     except Exception as exc:
         await _send_error_embed(ctx, " Locked Check Failed", exc, user_id=user_id)
+
+
+@bot.command(name="tx", aliases=["transactions", "recenttx"])
+async def tx_command(ctx: commands.Context, limit: int = 25):
+    """Browse recent transactions in your ledger with interactive pagination."""
+    user_id = str(ctx.author.id)
+    limit = max(1, min(limit, 200))
+    try:
+        with _open_verification_db(user_id=user_id) as vconn:
+            cur = vconn.cursor()
+            cur.execute(
+                """
+                SELECT id, date, merchant, amount, account_used, category, status
+                FROM transactions
+                WHERE user_id = ?
+                  AND merchant NOT LIKE '%System Balance Sync%'
+                ORDER BY datetime(date) DESC, id DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            )
+            rows = cur.fetchall()
+        await _send_transaction_browser(
+            ctx, rows, locked=False, title="💳 Recent Transactions", color=discord.Color.blue(), user_id=user_id
+        )
+    except Exception as exc:
+        await _send_error_embed(ctx, " Transaction Query Failed", exc, user_id=user_id)
+
+
+@bot.command(name="searchtx", aliases=["findtx", "txsearch"])
+async def searchtx_command(ctx: commands.Context, *, query: str):
+    """Search transactions by merchant, category, account, or amount filter (e.g. `!searchtx Uber`, `!searchtx >100`)."""
+    user_id = str(ctx.author.id)
+    q = query.strip()
+    if not q:
+        await ctx.send("⚠️ Please provide a search term or amount filter (e.g. `!searchtx Starbucks`, `!searchtx >50`).")
+        return
+
+    try:
+        with _open_verification_db(user_id=user_id) as vconn:
+            cur = vconn.cursor()
+            amt_match = re.match(r'^([><]=?|=)\s*([0-9]+(?:\.[0-9]{1,2})?)$', q)
+            if amt_match:
+                op, val = amt_match.groups()
+                val_float = float(val)
+                sql = f"""
+                    SELECT id, date, merchant, amount, account_used, category, status
+                    FROM transactions
+                    WHERE user_id = ?
+                      AND merchant NOT LIKE '%System Balance Sync%'
+                      AND amount {op} ?
+                    ORDER BY datetime(date) DESC, id DESC
+                    LIMIT 100
+                """
+                cur.execute(sql, (user_id, val_float))
+            else:
+                like = f"%{q.lower()}%"
+                cur.execute(
+                    """
+                    SELECT id, date, merchant, amount, account_used, category, status
+                    FROM transactions
+                    WHERE user_id = ?
+                      AND merchant NOT LIKE '%System Balance Sync%'
+                      AND (
+                          LOWER(COALESCE(merchant, '')) LIKE ?
+                          OR LOWER(COALESCE(clean_merchant, '')) LIKE ?
+                          OR LOWER(COALESCE(category, '')) LIKE ?
+                          OR LOWER(COALESCE(account_used, '')) LIKE ?
+                      )
+                    ORDER BY datetime(date) DESC, id DESC
+                    LIMIT 100
+                    """,
+                    (user_id, like, like, like, like),
+                )
+            rows = cur.fetchall()
+
+        await _send_transaction_browser(
+            ctx, rows, locked=False, title=f"🔎 Search: '{q}'", color=discord.Color.teal(), user_id=user_id
+        )
+    except Exception as exc:
+        await _send_error_embed(ctx, " Transaction Search Failed", exc, user_id=user_id)
+
+
+@bot.command(name="txview", aliases=["txdetail", "transaction"])
+async def txview_command(ctx: commands.Context, tx_id: int):
+    """View full details, receipt items, tags, and notes for a specific transaction."""
+    user_id = str(ctx.author.id)
+    try:
+        with _open_verification_db(user_id=user_id) as vconn:
+            cur = vconn.cursor()
+            cur.execute(
+                """
+                SELECT id, transaction_id, date, merchant, clean_merchant, category, amount,
+                       override_amount, account_used, status, is_locked, context
+                FROM transactions
+                WHERE user_id = ? AND id = ?
+                """,
+                (user_id, tx_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                await ctx.send(f"❌ Transaction `#{tx_id}` not found.")
+                return
+
+            (tid, plaid_id, date, merch, clean_m, cat, amt, override_amt, acc, status, locked, context) = row
+
+            cur.execute(
+                """
+                SELECT id, item_name, quantity, unit_price, total_price, source
+                FROM transaction_items
+                WHERE user_id = ? AND transaction_row_id = ?
+                ORDER BY id ASC
+                """,
+                (user_id, tx_id),
+            )
+            items = cur.fetchall()
+
+        embed = discord.Embed(
+            title=f"🧾 Transaction #{tx_id} Details",
+            color=discord.Color.green() if locked else discord.Color.blue()
+        )
+        amt_str = f"${float(amt):,.2f}"
+        if override_amt is not None and float(override_amt) != float(amt):
+            amt_str += f" (Override: **${float(override_amt):,.2f}**)"
+
+        embed.add_field(name="Merchant", value=f"**{clean_m or merch or 'Unknown'}**\n*(Raw: `{merch}`)*", inline=True)
+        embed.add_field(name="Amount", value=amt_str, inline=True)
+        embed.add_field(name="Date", value=str(date)[:19], inline=True)
+        embed.add_field(name="Category", value=str(cat or 'Uncategorized'), inline=True)
+        embed.add_field(name="Account", value=str(acc or 'Unknown'), inline=True)
+        embed.add_field(name="Status", value=f"{status} {'🔒 Locked' if locked else '🔓 Unlocked'}", inline=True)
+
+        if items:
+            item_lines = [
+                f"• #{it[0]} {it[1]} — {it[2]} × ${it[3]:,.2f} = **${it[4]:,.2f}**"
+                for it in items
+            ]
+            embed.add_field(name=f"Itemized Receipt Items ({len(items)})", value="\n".join(item_lines)[:1024], inline=False)
+
+        if context:
+            embed.add_field(name="Notes & Context", value=str(context)[:1024], inline=False)
+
+        embed.set_footer(text=f"Plaid ID: {plaid_id or 'Manual/Synthetic'}")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, " Transaction View Failed", exc, user_id=user_id)
+
 
 
 # ============================================================
