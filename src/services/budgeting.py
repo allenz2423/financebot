@@ -188,11 +188,21 @@ def get_safe_to_spend_metrics(user_id: str) -> str:
             target_date = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
             
             # calculate liabilities
-            # (simplified internal logic for speed)
             total_liability = 0.0
             c.execute("SELECT expected_amount FROM planned_transactions WHERE user_id = ? AND status = 'Expected' AND direction = 'outbound' AND expected_date < ?", (user_id, target_date))
             for row in c.fetchall():
                 total_liability += float(row[0] or 0.0)
+
+            # Subscriptions due before target date
+            c.execute("SELECT last_amount, last_date FROM subscriptions WHERE user_id = ? AND status = 'Active'", (user_id,))
+            for amt, last_date_str in c.fetchall():
+                try:
+                    last_date = datetime.strptime(last_date_str[:10], "%Y-%m-%d")
+                    next_date = last_date + timedelta(days=30)
+                    if datetime.now() <= next_date <= datetime.strptime(target_date, "%Y-%m-%d"):
+                        total_liability += float(amt or 0.0)
+                except Exception:
+                    pass
                 
             true_free_cash = liquid - cc_float - sinking_funds - total_liability
             daily_safe = true_free_cash / 14.0 if true_free_cash > 0 else 0.0
@@ -214,3 +224,113 @@ def get_safe_to_spend_metrics(user_id: str) -> str:
             return "\n".join(report)
     except Exception as e:
         return f"ERROR calculating safe-to-spend: {str(e)}"
+
+
+def calculate_emergency_fund_health(user_id: str) -> str:
+    """
+    Emergency Fund Runway & Bare-Bones Survival Calculator.
+    Distinguishes essential baseline expenses (housing, groceries, utilities, debt minimums)
+    from discretionary lifestyle spending, calculating the exact survival runway in months.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            
+            # Liquid Cash
+            c.execute("""
+                SELECT SUM(current_balance) 
+                FROM plaid_accounts 
+                WHERE user_id = ? AND type = 'depository' AND active = 1
+            """, (user_id,))
+            liquid = c.fetchone()[0] or 0.0
+            
+            # Dedicated Emergency Sinking Fund
+            c.execute("""
+                SELECT SUM(current_amount) 
+                FROM savings_buckets 
+                WHERE user_id = ? AND name LIKE '%Emergency%'
+            """, (user_id,))
+            ef_bucket = c.fetchone()[0] or 0.0
+            
+            effective_emergency_cash = max(liquid, ef_bucket)
+
+            # Minimum debt obligations
+            c.execute("""
+                SELECT SUM(COALESCE(min_payment, balance * 0.025)) 
+                FROM user_debts 
+                WHERE user_id = ? AND balance > 0
+            """, (user_id,))
+            debt_mins = c.fetchone()[0] or 0.0
+
+            # 90-day expenses
+            ninety_days_ago = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+            c.execute("""
+                SELECT category, amount 
+                FROM transactions 
+                WHERE user_id = ? AND date >= ? AND amount > 0 
+                  AND merchant NOT LIKE '%System Balance Sync%'
+                  AND category NOT IN ('Credit Card Bill Payment 💳', 'Financial Transfer 💰')
+            """, (user_id, ninety_days_ago))
+            rows = c.fetchall()
+
+            if not rows:
+                return "Insufficient transaction history (last 90 days) to calculate emergency runway."
+
+            essential_cats = {
+                'housing', 'rent', 'mortgage', 'groceries', 'utilities', 
+                'insurance', 'healthcare', 'medical', 'transit', 'gasoline', 'gas'
+            }
+
+            total_spend_90d = 0.0
+            essential_spend_90d = 0.0
+
+            for cat, amt in rows:
+                amount = float(amt)
+                total_spend_90d += amount
+                cat_lower = (cat or "").lower()
+                if any(k in cat_lower for k in essential_cats):
+                    essential_spend_90d += amount
+
+            # Normalize to monthly (90 days = ~3 months)
+            months = 3.0
+            monthly_lifestyle_burn = total_spend_90d / months
+            monthly_essential_burn = (essential_spend_90d / months) + debt_mins
+
+            survival_runway = effective_emergency_cash / monthly_essential_burn if monthly_essential_burn > 0 else 999.0
+            lifestyle_runway = effective_emergency_cash / monthly_lifestyle_burn if monthly_lifestyle_burn > 0 else 999.0
+
+            target_3mo = monthly_essential_burn * 3.0
+            target_6mo = monthly_essential_burn * 6.0
+            gap_3mo = max(0.0, target_3mo - effective_emergency_cash)
+
+            report = [
+                "🛡️ EMERGENCY FUND HEALTH & RUNWAY AUDIT",
+                f"Liquid Reserves Available:     ${effective_emergency_cash:,.2f}",
+                "-" * 45,
+                f"Monthly Bare-Bones Burn Rate:  ${monthly_essential_burn:,.2f}/mo",
+                f"  ↳ Essentials:                ${essential_spend_90d / months:,.2f}/mo",
+                f"  ↳ Debt Minimum Obligations:  ${debt_mins:,.2f}/mo",
+                f"Monthly Full Lifestyle Burn:   ${monthly_lifestyle_burn:,.2f}/mo",
+                "-" * 45,
+                f"⏱️ Bare-Bones Survival Runway:  {survival_runway:.1f} Months",
+                f"⏱️ Current Lifestyle Runway:   {lifestyle_runway:.1f} Months",
+                "-" * 45,
+                "🎯 TARGET BENCHMARKS:",
+                f" • 3-Month Buffer Target:      ${target_3mo:,.2f} (Shortfall: ${gap_3mo:,.2f})",
+                f" • 6-Month Buffer Target:      ${target_6mo:,.2f}"
+            ]
+
+            if survival_runway < 1.0:
+                report.append("\n🚨 RED ALERT: Less than 1 month of emergency cash reserves. Critical risk if income is interrupted.")
+            elif survival_runway < 3.0:
+                report.append("\n⚠️ VULNERABLE: Under 3 months of emergency buffer. Prioritize building the emergency fund before investing.")
+            elif survival_runway < 6.0:
+                report.append("\n✅ ADEQUATE: Over 3 months of survival runway. Stable baseline.")
+            else:
+                report.append("\n🏆 FORTRESS BALANCE SHEET: 6+ months of reserves. You have high financial shock resilience.")
+
+            return "\n".join(report)
+
+    except Exception as e:
+        return f"ERROR calculating emergency fund health: {str(e)}"
+

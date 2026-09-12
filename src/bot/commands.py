@@ -2719,6 +2719,59 @@ async def rewards_audit_cmd(ctx: commands.Context, days_back: int = 90):
         await ctx.send(f"❌ Rewards audit failed: `{type(exc).__name__}: {exc}`")
 
 
+# ============================================================
+# Zero-Based Budgeting & Runway Commands
+# ============================================================
+
+@bot.command(name="safetospend", aliases=["safe", "freedollar"])
+async def safe_to_spend_cmd(ctx: commands.Context):
+    """Calculate exact safe-to-spend free cash after locking funds for credit float, sinking funds, and upcoming bills."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.budgeting import get_safe_to_spend_metrics
+        report = get_safe_to_spend_metrics(user_id)
+        await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Safe-to-Spend calculation failed: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="paydays", aliases=["paycheck", "incomeschedule"])
+async def paydays_cmd(ctx: commands.Context):
+    """Predict upcoming payday dates, income cadence, and average paycheck amounts."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.budgeting import predict_next_paydays
+        report = predict_next_paydays(user_id)
+        await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Payday prediction failed: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="float", aliases=["creditfloat", "velocity"])
+async def float_velocity_cmd(ctx: commands.Context):
+    """Analyze reliance on credit card float and calculate debt velocity."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.budgeting import calculate_credit_float_velocity
+        report = calculate_credit_float_velocity(user_id)
+        await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Float velocity analysis failed: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="emergencyfund", aliases=["efund", "runway"])
+async def emergency_fund_cmd(ctx: commands.Context):
+    """Audit emergency fund reserves, bare-bones survival burn rate, and runway in months."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.budgeting import calculate_emergency_fund_health
+        report = calculate_emergency_fund_health(user_id)
+        await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Emergency fund health check failed: `{type(exc).__name__}: {exc}`")
+
+
+
 
 
 # ============================================================

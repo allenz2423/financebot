@@ -7,7 +7,7 @@ from src.rag.engine import query_knowledge_base, save_to_knowledge_base
 from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar, analyze_recurring_leakage
 from src.services.sandbox import run_what_if_scenario
-from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
+from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics, calculate_emergency_fund_health
 from src.db.prefs import get_user_timezone, set_user_timezone
 import src.core.state
 import json
@@ -836,6 +836,14 @@ BOT_TOOLS_SCHEMA = [
         "function": {
             "name": "get_safe_to_spend_metrics",
             "description": "Master Zero-Based Budgeting calculation. Determines exactly how much cash is 'Safe to Spend' today by locking away money needed for CC float, sinking funds, and upcoming bills.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_emergency_fund_health",
+            "description": "Emergency Fund Health & Runway Audit. Computes monthly bare-bones essential survival burn rate vs current lifestyle burn, determining exact survival runway in months and benchmarks.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -2592,6 +2600,7 @@ EXPECTED_TOOL_NAMES = {
     "calculate_locked_liabilities",
     "calculate_credit_float_velocity",
     "get_safe_to_spend_metrics",
+    "calculate_emergency_fund_health",
     "set_user_timezone",
     "get_user_timezone",
     "monitor_clear_all_rules"
@@ -5222,6 +5231,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = calculate_credit_float_velocity(uid)
                     elif func_name == "get_safe_to_spend_metrics":
                         db_result = get_safe_to_spend_metrics(uid)
+                    elif func_name == "calculate_emergency_fund_health":
+                        db_result = calculate_emergency_fund_health(uid)
                     elif func_name == "save_to_knowledge_base":
                         db_result = save_to_knowledge_base(
                             chunk_id=args.get("chunk_id", ""),
