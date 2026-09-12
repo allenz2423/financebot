@@ -4821,74 +4821,143 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # ================================================================
     # INTENT-BASED TOOL PRE-SEEDING
     # ================================================================
-    # For broad financial queries the model would otherwise need 3-5
-    # sequential explore_domain + load_tool_schemas round-trips before
-    # being able to call any real tools. Pre-populate dynamically_loaded_tools
-    # here so the model starts turn 1 with the full tool set already
-    # unlocked, eliminating the discovery overhead entirely.
+    # For known query patterns the model would otherwise need 3-5 sequential
+    # explore_domain + load_tool_schemas round-trips before calling any real
+    # tools. Pre-populate dynamically_loaded_tools with a focused subset of
+    # tools that match the detected intent so the model starts turn 1 with
+    # the right tools already unlocked.
+    #
+    # IMPORTANT: Do NOT pre-seed all tools at once — the free-tier model
+    # (nemotron-120b) returns empty responses when given 70+ tool schemas
+    # simultaneously. Keep each pre-seed set to ≤20 focused tools.
     #
     # The audit-mode gate in _tool_schema_for_mode() takes precedence —
     # this only affects the non-audit path where core_tools union
     # dynamically_loaded_tools is the effective allowlist.
     # ================================================================
-    from src.core.discovery import CAPABILITY_REGISTRY as _REGISTRY  # local import to avoid circular at module level
-
-    # Flatten all tool names from the registry into one set.
-    _ALL_REGISTRY_TOOLS: set[str] = {
-        tool
-        for caps in _REGISTRY.values()
-        for tool_list in caps.values()
-        for tool in tool_list
-    }
-
-    # Terms that indicate a broad financial intent — pre-seed everything.
-    _broad_financial_terms = (
-        "reconcile",
-        "dashboard",
-        "position",
-        "cash flow",
-        "cashflow",
-        "net worth",
-        "digest",
-        "overview",
-        "summary",
-        "status",
-        "report",
-        "analyze",
-        "analysis",
-        "spending",
-        "budget",
-        "income",
-        "transaction",
-        "transactions",
-        "balance",
-        "balances",
-        "savings",
-        "debt",
-        "subscription",
-        "upcoming",
-        "planned",
-        "projection",
-        "audit",
-        "ledger",
-        "peek",
-        "check",
-        "how am i doing",
-        "financial health",
-    )
 
     _prompt_lower = str(prompt_text or "").lower()
-    _is_broad_financial = any(term in _prompt_lower for term in _broad_financial_terms)
 
-    if _is_broad_financial and not gmail_only_turn:
-        # Expose ALL registry tools immediately — no discovery round-trips needed.
-        dynamically_loaded_tools: set[str] = set(_ALL_REGISTRY_TOOLS)
-        print(
-            f" [TOOL PRE-SEED] Broad financial intent detected. "
-            f"Pre-loaded {len(dynamically_loaded_tools)} tools — skipping discovery."
-        )
-    else:
-        dynamically_loaded_tools: set[str] = set()
+    # Core read tools useful in almost every financial query.
+    _CORE_READ_TOOLS = {
+        "get_current_financial_position",
+        "get_financial_dashboard",
+        "get_safe_to_spend_metrics",
+        "end_turn",
+    }
+
+    # Intent → focused tool set mapping.
+    # Each entry: (keywords_tuple, tools_set)
+    # First matching entry wins; fallback stays empty (pure discovery mode).
+    _INTENT_TOOL_MAP: list[tuple[tuple[str, ...], set[str]]] = [
+        # Reconcile / ledger sync
+        (
+            ("reconcile", "ledger", "sync"),
+            _CORE_READ_TOOLS | {
+                "get_recent_transactions",
+                "get_unlocked_transactions",
+                "get_transaction_ledger",
+                "get_expected_income",
+                "get_planned_transactions",
+                "get_upcoming_cash_flow",
+                "reconcile_expected_and_planned_transactions",
+                "auto_reconcile_ledger",
+            },
+        ),
+        # Dashboard / full overview / how am I doing
+        (
+            ("dashboard", "overview", "how am i doing", "financial health", "digest", "report"),
+            _CORE_READ_TOOLS | {
+                "get_financial_dashboard",
+                "get_spending_breakdown",
+                "get_upcoming_cash_flow",
+                "get_cash_flow_summary",
+                "get_expected_income",
+                "get_debt_overview",
+                "get_savings_buckets",
+                "get_net_worth_history",
+                "generate_financial_digest",
+            },
+        ),
+        # Transactions / spending
+        (
+            ("transaction", "transactions", "spending", "spent", "purchase", "expenses"),
+            _CORE_READ_TOOLS | {
+                "get_recent_transactions",
+                "get_unlocked_transactions",
+                "query_spending",
+                "get_spending_breakdown",
+                "check_budget_status",
+                "search_transactions",
+            },
+        ),
+        # Balance / position / net worth
+        (
+            ("balance", "balances", "position", "net worth", "account", "accounts"),
+            _CORE_READ_TOOLS | {
+                "get_accounts_overview",
+                "get_net_worth_history",
+                "get_debt_overview",
+                "get_savings_buckets",
+            },
+        ),
+        # Cash flow / upcoming / planned / budget
+        (
+            ("cash flow", "cashflow", "upcoming", "planned", "projection", "budget", "bills"),
+            _CORE_READ_TOOLS | {
+                "get_upcoming_cash_flow",
+                "get_cash_flow_summary",
+                "get_planned_transactions",
+                "get_temporal_projection",
+                "check_budget_status",
+                "get_expected_income",
+            },
+        ),
+        # Income / paycheck / salary
+        (
+            ("income", "paycheck", "salary", "payday", "deposit"),
+            _CORE_READ_TOOLS | {
+                "get_expected_income",
+                "get_recent_income",
+                "get_upcoming_cash_flow",
+                "add_expected_income",
+                "update_expected_income",
+            },
+        ),
+        # Savings / debt / net worth
+        (
+            ("savings", "saving", "debt", "loan", "credit", "payoff"),
+            _CORE_READ_TOOLS | {
+                "get_savings_buckets",
+                "get_debt_overview",
+                "get_net_worth_history",
+                "get_sinking_funds_overview",
+                "adjust_savings_bucket",
+            },
+        ),
+        # Status / peek / summary
+        (
+            ("status", "peek", "summary", "check", "update"),
+            _CORE_READ_TOOLS | {
+                "get_financial_dashboard",
+                "get_recent_transactions",
+                "get_upcoming_cash_flow",
+                "get_expected_income",
+                "get_cash_flow_summary",
+            },
+        ),
+    ]
+
+    dynamically_loaded_tools: set[str] = set()
+    if not gmail_only_turn:
+        for keywords, tool_set in _INTENT_TOOL_MAP:
+            if any(kw in _prompt_lower for kw in keywords):
+                dynamically_loaded_tools = set(tool_set)
+                print(
+                    f" [TOOL PRE-SEED] Intent match {keywords[0]!r}. "
+                    f"Pre-loaded {len(dynamically_loaded_tools)} tools — skipping discovery."
+                )
+                break
 
     # Audit mode is a runtime contract, not merely a prompt suggestion.
 
