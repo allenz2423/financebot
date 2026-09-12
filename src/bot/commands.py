@@ -2869,6 +2869,26 @@ async def tax_export_cmd(ctx: commands.Context, year: int = None):
         await ctx.send(f" Tax export failed: `{type(exc).__name__}: {exc}`")
 
 
+@tax_group.command(name="scan", aliases=["discover", "audit", "find"])
+async def tax_scan_subcmd(ctx: commands.Context, year: Optional[int] = None, mode: str = "preview"):
+    """Scan ledger for untagged tax deductions and estimate tax savings (mode: apply or preview)."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.tax_deductions import scan_and_discover_deductions, format_tax_discovery_embed
+        auto_apply = mode.lower() in ("apply", "tag", "auto")
+        data = scan_and_discover_deductions(user_id=user_id, year=year, auto_apply=auto_apply)
+        embed = format_tax_discovery_embed(data)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Tax Deduction Discovery Failed", exc, user_id=user_id)
+
+
+@bot.command(name="taxscan", aliases=["autotax"])
+async def taxscan_cmd(ctx: commands.Context, year: Optional[int] = None, mode: str = "preview"):
+    """Scan and discover missing tax write-offs across your ledger."""
+    await tax_scan_subcmd(ctx, year=year, mode=mode)
+
+
 # ============================================================
 # "What-If?" Scenario & Cash Flow Runway Simulator
 # ============================================================

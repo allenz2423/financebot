@@ -2690,6 +2690,26 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["action", "merchant"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_and_auto_tag_deductions",
+            "description": "Scans transaction ledger for eligible tax deductions (software, cloud, office, telecom, travel, meals, charity), computes estimated tax savings, and optionally tags matching transactions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "integer",
+                        "description": "Tax year to audit (default: current year)."
+                    },
+                    "auto_apply": {
+                        "type": "boolean",
+                        "description": "If true, writes tax_deductible tags directly to the database."
+                    }
+                }
+            }
+        }
     }
 ]
 
@@ -2792,6 +2812,7 @@ EXPECTED_TOOL_NAMES = {
     "add_merchant_alias",
     "get_upcoming_bills_calendar",
     "manage_subscription",
+    "scan_and_auto_tag_deductions",
     "explore_domain",
 
     "load_tool_schemas",
@@ -6160,6 +6181,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 next_due_date=args.get("next_due_date"),
                                 category=args.get("category", "Subscriptions"),
                             )
+                    elif func_name == "scan_and_auto_tag_deductions":
+                        from src.services.tax_deductions import scan_and_discover_deductions
+                        db_result = scan_and_discover_deductions(
+                            user_id=uid,
+                            year=args.get("year"),
+                            auto_apply=args.get("auto_apply", False),
+                        )
 
 
                     elif func_name == "get_net_worth_history":
