@@ -48,6 +48,7 @@ RULE_KINDS = {
     "cash_flow_change",
     "large_deposit",
     "trial_expiring_soon",
+    "duplicate_charge_detected",
 }
 
 
@@ -183,10 +184,12 @@ def _validate_rule(kind: str, config: Dict[str, Any]) -> Tuple[bool, str, Dict[s
 
     if kind == "large_deposit":
         try:
-            cfg["min_amount"] = float(cfg.get("min_amount", 1000.0))
+            amt = cfg.get("min_amount") if "min_amount" in cfg else cfg.get("threshold", 1000.0)
+            cfg["min_amount"] = float(amt)
         except (TypeError, ValueError):
             return False, "large_deposit requires numeric 'min_amount'", {}
         cfg["min_amount"] = max(0.0, cfg["min_amount"])
+        cfg["threshold"] = cfg["min_amount"]
         return True, "", cfg
 
     if kind == "trial_expiring_soon":
@@ -195,6 +198,20 @@ def _validate_rule(kind: str, config: Dict[str, Any]) -> Tuple[bool, str, Dict[s
         except (TypeError, ValueError):
             return False, "trial_expiring_soon requires integer 'days_notice'", {}
         cfg["days_notice"] = max(1, min(cfg["days_notice"], 30))
+        return True, "", cfg
+
+    if kind == "duplicate_charge_detected":
+        try:
+            cfg["window_days"] = int(cfg.get("window_days", 3))
+        except (TypeError, ValueError):
+            return False, "duplicate_charge_detected requires integer 'window_days'", {}
+        cfg["window_days"] = max(1, min(cfg["window_days"], 30))
+        try:
+            cfg["min_amount"] = float(cfg.get("min_amount", 5.0))
+        except (TypeError, ValueError):
+            return False, "duplicate_charge_detected requires numeric 'min_amount'", {}
+        cfg["min_amount"] = max(0.0, cfg["min_amount"])
+        cfg["merchant"] = str(cfg.get("merchant", "")).strip()
         return True, "", cfg
 
     return False, f"Unhandled rule kind '{kind}'", {}
@@ -618,6 +635,39 @@ def _eval_trial_expiring_soon(conn, config: dict, user_id: str) -> Optional[str]
     )
 
 
+def _eval_duplicate_charge_detected(conn: sqlite3.Connection, cfg: dict, user_id: str) -> Optional[str]:
+    uid = _fetch_user_id(conn, user_id)
+    window = int(cfg.get("window_days", 3))
+    min_amount = float(cfg.get("min_amount", 5.0))
+    merchant = str(cfg.get("merchant", "")).strip()
+
+    cutoff = (datetime.now() - timedelta(days=window)).strftime("%Y-%m-%d")
+
+    query = """
+        SELECT COALESCE(clean_merchant, merchant) AS m_name, amount, COUNT(*) AS cnt, MAX(date) AS latest_date
+        FROM transactions
+        WHERE user_id = ?
+          AND status = 'Evaluated'
+          AND amount >= ?
+          AND merchant NOT LIKE '%System Balance Sync%'
+          AND date >= ?
+    """
+    params: List[Any] = [uid, min_amount, cutoff]
+    if merchant:
+        query += " AND (clean_merchant LIKE ? OR merchant LIKE ?)"
+        params.extend([f"%{merchant}%", f"%{merchant}%"])
+    query += " GROUP BY m_name, amount HAVING cnt >= 2 ORDER BY latest_date DESC LIMIT 1"
+
+    row = conn.execute(query, params).fetchone()
+    if not row:
+        return None
+    m_name, amt, cnt, latest_date = row
+    return (
+        f"Potential duplicate charge: {cnt} charges of ${float(amt):,.2f} from "
+        f"'{m_name or 'unknown'}' within {window} days (latest on {latest_date})."
+    )
+
+
 EVALUATORS = {
     "projected_balance_low": _eval_projected_balance_low,
     "category_spend_exceeded": _eval_category_spend_exceeded,
@@ -628,6 +678,7 @@ EVALUATORS = {
     "cash_flow_change": _eval_cash_flow_change,
     "large_deposit": _eval_large_deposit,
     "trial_expiring_soon": _eval_trial_expiring_soon,
+    "duplicate_charge_detected": _eval_duplicate_charge_detected,
 }
 
 
@@ -1173,7 +1224,7 @@ def compile_natural_language_rule(text: str) -> Dict[str, Any]:
     dep_match = re.search(r'deposit[s]?\s+(?:over|above|exceeding|more than|greater than)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)', lowered)
     if dep_match:
         threshold = float(dep_match.group(1).replace(",", ""))
-        config = {"threshold": threshold}
+        config = {"min_amount": threshold}
         ok, err, norm = _validate_rule("large_deposit", config)
         if not ok:
             raise ValueError(err)
@@ -1183,6 +1234,31 @@ def compile_natural_language_rule(text: str) -> Dict[str, Any]:
             "config": norm,
             "severity": "info",
             "cooldown_hours": 6,
+        }
+
+    # 2b. Duplicate charge detection
+    # e.g. "Alert me on duplicate charges within 3 days" or "warn if charged twice at Starbucks"
+    if "duplicate" in lowered or "double charge" in lowered or "charged twice" in lowered:
+        w_m = re.search(r'(?:within|in|over)\s+(\d+)\s*(?:days|d)', lowered)
+        window_days = int(w_m.group(1)) if w_m else 3
+        amt_m = re.search(r'(?:over|above|exceeding|more than)?\s*[\$]?([0-9]+(?:\.[0-9]{1,2})?)', lowered)
+        min_amount = float(amt_m.group(1)) if amt_m else 5.0
+
+        merch_m = re.search(r'(?:from|at|for)\s+([A-Za-z0-9\s]+?)(?:\s+within|\s+over|\s+in|\s+more than|\s+above|\s*$)', cleaned, re.IGNORECASE)
+        merchant = merch_m.group(1).strip() if merch_m else ""
+        if merchant.lower() in {"duplicate", "double charge", "charges", "any"}:
+            merchant = ""
+
+        config = {"window_days": window_days, "min_amount": min_amount, "merchant": merchant}
+        ok, err, norm = _validate_rule("duplicate_charge_detected", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "duplicate_charge_detected",
+            "name": f"Duplicate Charge Alert ({merchant or 'All Merchants'})",
+            "config": norm,
+            "severity": "warning",
+            "cooldown_hours": 24,
         }
 
     # 3. Subscription price change

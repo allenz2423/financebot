@@ -222,3 +222,34 @@ def test_delete_rule_cascade_and_user_isolation():
     )
     assert ok2
     assert "not found" in mon.delete_monitor_rule(conn, rid2, "1")
+
+
+def test_duplicate_charge_detected_evaluator():
+    conn = _fresh_conn()
+    today = mon.datetime.now().strftime("%Y-%m-%d")
+    # Insert two identical charges for Starbucks
+    conn.execute(
+        "INSERT INTO transactions (user_id, merchant, clean_merchant, amount, status, date) "
+        "VALUES ('1', 'STARBUCKS #1234', 'Starbucks', 6.75, 'Evaluated', ?)",
+        (today,)
+    )
+    conn.execute(
+        "INSERT INTO transactions (user_id, merchant, clean_merchant, amount, status, date) "
+        "VALUES ('1', 'STARBUCKS #1234', 'Starbucks', 6.75, 'Evaluated', ?)",
+        (today,)
+    )
+    conn.commit()
+
+    ok, _, rid = mon.add_monitor_rule(
+        conn, "1", "dupe check", "duplicate_charge_detected",
+        {"window_days": 3, "min_amount": 5.0, "merchant": "Starbucks"}
+    )
+    assert ok
+
+    res = mon.run_monitor_pass(conn, "1", deliver=False)
+    assert res["rules_fired"] == 1
+    alerts = mon.list_alerts(conn, "1")
+    assert len(alerts) == 1
+    assert "Potential duplicate charge" in alerts[0]["detail"]
+    assert "$6.75" in alerts[0]["detail"]
+

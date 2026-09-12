@@ -69,3 +69,15 @@ def test_add_monitor_rule_from_nl_integration(monitor_db):
     assert rules[0]["id"] == res["id"]
     assert rules[0]["kind"] == "category_spend_exceeded"
     assert rules[0]["config"]["limit"] == 150.0
+
+
+def test_compile_duplicate_charge_rule():
+    spec = compile_natural_language_rule("Alert me on duplicate charges over $10 within 5 days")
+    assert spec["kind"] == "duplicate_charge_detected"
+    assert spec["config"]["min_amount"] == 10.0
+    assert spec["config"]["window_days"] == 5
+
+    spec2 = compile_natural_language_rule("warn if charged twice at Starbucks")
+    assert spec2["kind"] == "duplicate_charge_detected"
+    assert spec2["config"]["merchant"] == "Starbucks"
+
