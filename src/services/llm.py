@@ -2316,13 +2316,13 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "generate_negotiation_script",
-            "description": "Generates a negotiation script for calling customer retention.",
+            "description": "Autonomous Bill Negotiation Agent. Searches the web for competitor pricing, calculates user loyalty metrics from the DB, and generates an aggressive multi-step escalation script to lower a bill.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "service_name": {"type": "string", "description": "The name of the service to negotiate"},
-                    "competitor_name": {"type": "string", "description": "Optional name of a competitor offering a better rate"},
-                    "competitor_price": {"type": "number", "description": "Optional price of the competitor's service"}
+                    "service_name": {"type": "string", "description": "The name of the service to negotiate (e.g. Spectrum, Geico)"},
+                    "zip_code": {"type": "string", "description": "User's zip code for local web search"},
+                    "current_price": {"type": "number", "description": "Current monthly bill amount"}
                 },
                 "required": ["service_name"]
             }

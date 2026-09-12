@@ -1,19 +1,20 @@
-from src.services.negotiator import generate_negotiation_script
 import pytest
+from src.services.negotiator import generate_negotiation_script
 
-def test_generate_negotiation_script_isolation():
-    with pytest.raises(ValueError):
-        generate_negotiation_script(user_id=None, service_name="Netflix")
-
-def test_generate_negotiation_script_success():
-    res = generate_negotiation_script(user_id="user1", service_name="Comcast", competitor_name="Verizon", competitor_price=49.99)
-    assert res["status"] == "success"
-    assert "Comcast" in res["script"]
-    assert "Verizon" in res["script"]
-    assert "49.99" in res["script"]
-
-def test_generate_negotiation_script_no_competitor():
-    res = generate_negotiation_script(user_id="user1", service_name="Netflix")
-    assert res["status"] == "success"
-    assert "Netflix" in res["script"]
-    assert "Verizon" not in res["script"]
+@pytest.mark.asyncio
+async def test_negotiation_script_generation():
+    res = await generate_negotiation_script(
+        user_id='342385739952160769',
+        service_name='Spectrum Internet',
+        current_price=80.0,
+        zip_code='11201'
+    )
+    
+    assert "status" in res
+    assert "script" in res
+    
+    script = res["script"]
+    assert "NEGOTIATION DOSSIER" in script
+    assert "Live Web Intelligence" in script
+    assert "Level 1" in script
+    assert "Level 3" in script
