@@ -81,3 +81,15 @@ def test_compile_duplicate_charge_rule():
     assert spec2["kind"] == "duplicate_charge_detected"
     assert spec2["config"]["merchant"] == "Starbucks"
 
+
+def test_compile_category_budget_overpacing_rule():
+    spec = compile_natural_language_rule("Alert me if dining budget is overpacing by 130%")
+    assert spec["kind"] == "category_budget_overpacing"
+    assert spec["config"]["category"] == "Dining"
+    assert spec["config"]["pace_threshold_pct"] == 130.0
+
+    spec2 = compile_natural_language_rule("warn if any category burn rate is too fast")
+    assert spec2["kind"] == "category_budget_overpacing"
+    assert spec2["config"]["category"] == "*"
+    assert spec2["config"]["pace_threshold_pct"] == 120.0
+

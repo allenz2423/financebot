@@ -253,3 +253,98 @@ def test_duplicate_charge_detected_evaluator():
     assert "Potential duplicate charge" in alerts[0]["detail"]
     assert "$6.75" in alerts[0]["detail"]
 
+
+def test_validate_rule_category_budget_overpacing():
+    ok, _, cfg = mon._validate_rule(
+        "category_budget_overpacing",
+        {"category": "Dining Out", "pace_threshold_pct": 135.0, "min_spent": 30.0}
+    )
+    assert ok is True
+    assert cfg["category"] == "Dining Out"
+    assert cfg["pace_threshold_pct"] == 135.0
+    assert cfg["min_spent"] == 30.0
+
+    # Default values
+    ok2, _, cfg2 = mon._validate_rule("category_budget_overpacing", {})
+    assert ok2 is True
+    assert cfg2["category"] == "*"
+    assert cfg2["pace_threshold_pct"] == 120.0
+    assert cfg2["min_spent"] == 25.0
+
+
+def test_category_budget_overpacing_evaluator(monkeypatch):
+    conn = _fresh_conn()
+    user_id = "user_pacing_test"
+
+    # Set up category budget of $500 for Dining Out
+    conn.execute(
+        "INSERT INTO category_budgets (user_id, category, monthly_limit) VALUES (?, ?, ?)",
+        (user_id, "Dining Out", 500.0)
+    )
+    conn.commit()
+
+    # Insert transactions in current month
+    # We fix the date to day 10 of current month
+    from datetime import datetime
+    now_dt = datetime.now()
+    tx_date = f"{now_dt.year:04d}-{now_dt.month:02d}-05"
+
+    conn.execute(
+        "INSERT INTO transactions (user_id, merchant, category, amount, status, date) "
+        "VALUES (?, ?, ?, ?, 'Evaluated', ?)",
+        (user_id, "Fancy Bistro", "Dining Out", 350.0, tx_date)
+    )
+    conn.commit()
+
+    # Add pacing monitor rule for Dining Out
+    ok, _, rid = mon.add_monitor_rule(
+        conn, user_id, "Dining pacing alert", "category_budget_overpacing",
+        {"category": "Dining Out", "pace_threshold_pct": 120.0, "min_spent": 25.0}
+    )
+    assert ok is True
+
+    # Run monitor pass
+    res = mon.run_monitor_pass(conn, user_id, deliver=False)
+    assert res["rules_fired"] == 1
+    alerts = mon.list_alerts(conn, user_id)
+    assert len(alerts) == 1
+    assert "Dining Out budget" in alerts[0]["detail"]
+    assert "$350.00" in alerts[0]["detail"]
+
+    # Other user isolation: user_2 should not fire any alerts
+    res_other = mon.run_monitor_pass(conn, "user_isolated_other", deliver=False)
+    assert res_other["rules_fired"] == 0
+
+
+def test_category_budget_overpacing_not_triggered_when_on_track():
+    conn = _fresh_conn()
+    user_id = "user_on_track"
+
+    conn.execute(
+        "INSERT INTO category_budgets (user_id, category, monthly_limit) VALUES (?, ?, ?)",
+        (user_id, "Groceries", 1000.0)
+    )
+    conn.commit()
+
+    from datetime import datetime
+    now_dt = datetime.now()
+    tx_date = f"{now_dt.year:04d}-{now_dt.month:02d}-02"
+
+    conn.execute(
+        "INSERT INTO transactions (user_id, merchant, category, amount, status, date) "
+        "VALUES (?, ?, ?, ?, 'Evaluated', ?)",
+        (user_id, "Supermarket", "Groceries", 20.0, tx_date)
+    )
+    conn.commit()
+
+    # Rule with min_spent 25.0 should not fire
+    ok, _, rid = mon.add_monitor_rule(
+        conn, user_id, "Groceries pacing alert", "category_budget_overpacing",
+        {"category": "Groceries", "pace_threshold_pct": 120.0, "min_spent": 25.0}
+    )
+    assert ok is True
+
+    res = mon.run_monitor_pass(conn, user_id, deliver=False)
+    assert res["rules_fired"] == 0
+    assert mon.list_alerts(conn, user_id) == []
+

@@ -49,6 +49,7 @@ RULE_KINDS = {
     "large_deposit",
     "trial_expiring_soon",
     "duplicate_charge_detected",
+    "category_budget_overpacing",
 }
 
 
@@ -212,6 +213,20 @@ def _validate_rule(kind: str, config: Dict[str, Any]) -> Tuple[bool, str, Dict[s
             return False, "duplicate_charge_detected requires numeric 'min_amount'", {}
         cfg["min_amount"] = max(0.0, cfg["min_amount"])
         cfg["merchant"] = str(cfg.get("merchant", "")).strip()
+        return True, "", cfg
+
+    if kind == "category_budget_overpacing":
+        cfg["category"] = str(cfg.get("category", "*")).strip()
+        try:
+            cfg["pace_threshold_pct"] = float(cfg.get("pace_threshold_pct", 120.0))
+        except (TypeError, ValueError):
+            return False, "category_budget_overpacing requires numeric 'pace_threshold_pct'", {}
+        cfg["pace_threshold_pct"] = max(101.0, min(cfg["pace_threshold_pct"], 500.0))
+        try:
+            cfg["min_spent"] = float(cfg.get("min_spent", 25.0))
+        except (TypeError, ValueError):
+            return False, "category_budget_overpacing requires numeric 'min_spent'", {}
+        cfg["min_spent"] = max(0.0, cfg["min_spent"])
         return True, "", cfg
 
     return False, f"Unhandled rule kind '{kind}'", {}
@@ -668,6 +683,58 @@ def _eval_duplicate_charge_detected(conn: sqlite3.Connection, cfg: dict, user_id
     )
 
 
+def _eval_category_budget_overpacing(conn: sqlite3.Connection, cfg: dict, user_id: str) -> Optional[str]:
+    uid = _fetch_user_id(conn, user_id)
+    target_category = str(cfg.get("category", "*")).strip()
+    pace_threshold_pct = float(cfg.get("pace_threshold_pct", 120.0))
+    min_spent = float(cfg.get("min_spent", 25.0))
+
+    from src.services.budgeting import calculate_spending_pace_and_forecast
+    pace_data = calculate_spending_pace_and_forecast(user_id=uid, conn=conn)
+    budgets = pace_data.get("category_budgets", [])
+    if not budgets:
+        return None
+
+    overpaced = []
+    for b in budgets:
+        cat = b["category"]
+        if target_category != "*" and cat.lower() != target_category.lower():
+            continue
+
+        spent = float(b.get("spent", 0.0))
+        limit = float(b.get("monthly_limit", 0.0))
+        pace_ratio = float(b.get("pace_ratio", 1.0))
+        pacing_pct = pace_ratio * 100.0
+        projected = float(b.get("projected_spend", 0.0))
+        pct_used = float(b.get("pct_used", 0.0))
+
+        period = pace_data.get("period", {})
+        days_remaining = period.get("remaining_days", 0)
+        days_elapsed = period.get("elapsed_days", 1)
+        days_in_month = period.get("days_in_month", 30)
+
+        if spent >= min_spent and (spent >= limit or pacing_pct >= pace_threshold_pct):
+            if spent >= limit:
+                msg = (
+                    f"{cat} budget BLOWN: ${spent:,.2f} spent of ${limit:,.2f} limit ({pct_used:.1f}%) "
+                    f"with {days_remaining} days remaining. Projected spend: ${projected:,.2f}."
+                )
+            else:
+                overage = max(0.0, projected - limit)
+                msg = (
+                    f"{cat} budget overpacing: ${spent:,.2f} spent of ${limit:,.2f} limit ({pct_used:.1f}%) "
+                    f"at day {days_elapsed} of {days_in_month}. "
+                    f"Pacing at {pacing_pct:.0f}% of budget burn rate; projected at ${projected:,.2f} (${overage:,.2f} over budget)."
+                )
+            overpaced.append(msg)
+
+    if not overpaced:
+        return None
+    if len(overpaced) == 1:
+        return f"⚠️ {overpaced[0]}"
+    return f"⚠️ Budget overpacing detected in {len(overpaced)} categories:\n" + "\n".join(f"• {m}" for m in overpaced)
+
+
 EVALUATORS = {
     "projected_balance_low": _eval_projected_balance_low,
     "category_spend_exceeded": _eval_category_spend_exceeded,
@@ -679,6 +746,7 @@ EVALUATORS = {
     "large_deposit": _eval_large_deposit,
     "trial_expiring_soon": _eval_trial_expiring_soon,
     "duplicate_charge_detected": _eval_duplicate_charge_detected,
+    "category_budget_overpacing": _eval_category_budget_overpacing,
 }
 
 
@@ -1295,7 +1363,35 @@ def compile_natural_language_rule(text: str) -> Dict[str, Any]:
             "cooldown_hours": 12,
         }
 
-    # 5. Category spending exceeded
+    # 5. Category budget overpacing / burn rate anomaly
+    # e.g. "alert if dining budget is overpacing", "warn if spending burn rate exceeds 120%", "alert when groceries pacing is too fast"
+    if any(k in lowered for k in ["overpac", "pacing", "burn rate", "burn too fast", "burning too fast"]):
+        pct_match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*%', lowered)
+        threshold = float(pct_match.group(1)) if pct_match else 120.0
+
+        cat = "*"
+        cat_match = re.search(r'^(?:on|for|in)?\s*([a-zA-Z\s]+?)\s+(?:budget|pacing|burn)', cleaned, re.IGNORECASE)
+        if not cat_match:
+            cat_match = re.search(r'(?:on|for|in)\s+([a-zA-Z\s]+?)(?:\s+budget|\s+pacing|\s+burn|\s+rate|\s*$)', cleaned, re.IGNORECASE)
+        if cat_match:
+            candidate = cat_match.group(1).strip().title()
+            words = set(candidate.lower().split())
+            if not words.intersection({"budget", "budgets", "any", "all", "category", "categories", "spending"}):
+                cat = candidate
+
+        config = {"category": cat, "pace_threshold_pct": threshold, "min_spent": 25.0}
+        ok, err, norm = _validate_rule("category_budget_overpacing", config)
+        if not ok:
+            raise ValueError(err)
+        return {
+            "kind": "category_budget_overpacing",
+            "name": f"Budget Pacing ({cat} > {threshold:.0f}%)",
+            "config": norm,
+            "severity": "warning",
+            "cooldown_hours": 24,
+        }
+
+    # 6. Category spending exceeded
     # e.g. "spend more than $200 on dining out in 7 days" or "groceries exceeds $400 this month"
     cat_match1 = re.search(r'(?:spend|spending)\s+(?:more than|over|above|exceeding)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)\s+(?:on|for|in)\s+([a-zA-Z\s]+)', lowered)
     cat_match2 = re.search(r'([a-zA-Z\s]+?)\s+(?:exceeds|over|more than|above)\s*[\$]?([0-9,]+(?:\.[0-9]{2})?)', lowered)
