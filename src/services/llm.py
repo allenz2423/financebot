@@ -3,6 +3,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.db.prefs import get_user_timezone, set_user_timezone
 import src.core.state
 import json
@@ -11,6 +12,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.db.prefs import get_user_timezone, set_user_timezone
 
 import os
@@ -672,6 +674,46 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "predict_next_paydays",
+            "description": "Analyzes historical income transactions to mathematically infer the cadence, date, and expected amount of the user's next paychecks.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_locked_liabilities",
+            "description": "Calculates exact cash required for fixed bills, subscriptions, and planned transactions that will hit BEFORE a specified date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "until_date": {"type": "string", "description": "YYYY-MM-DD"}
+                },
+                "required": ["until_date"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_credit_float_velocity",
+            "description": "Calculates the user's reliance on the credit card float and determines the exact mathematical velocity of their debt (expanding or shrinking).",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_safe_to_spend_metrics",
+            "description": "Master Zero-Based Budgeting calculation. Determines exactly how much cash is 'Safe to Spend' today by locking away money needed for CC float, sinking funds, and upcoming bills.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+
 
     {
         "type": "function",
@@ -2399,6 +2441,10 @@ EXPECTED_TOOL_NAMES = {
     "save_epistemic_memory",
     "get_temporal_projection",
     "simulate_stochastic_cash_flow",
+    "predict_next_paydays",
+    "calculate_locked_liabilities",
+    "calculate_credit_float_velocity",
+    "get_safe_to_spend_metrics",
     "set_user_timezone",
     "get_user_timezone",
     "monitor_clear_all_rules"
@@ -5021,6 +5067,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             db_result = f"ERROR: {str(e)}"
                     elif func_name == "get_user_timezone":
                         db_result = f"Current timezone: {get_user_timezone(uid)}"
+                    elif func_name == "predict_next_paydays":
+                        db_result = predict_next_paydays(uid)
+                    elif func_name == "calculate_locked_liabilities":
+                        db_result = calculate_locked_liabilities(uid, args.get("until_date", ""))
+                    elif func_name == "calculate_credit_float_velocity":
+                        db_result = calculate_credit_float_velocity(uid)
+                    elif func_name == "get_safe_to_spend_metrics":
+                        db_result = get_safe_to_spend_metrics(uid)
                     elif func_name == "simulate_stochastic_cash_flow":
                         db_result = calculate_stochastic_projection(
                             user_id=uid,
