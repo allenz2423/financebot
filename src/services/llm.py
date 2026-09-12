@@ -59,7 +59,7 @@ from src.services.search import *
 from src.services.gmail import *
 from src.db.queries import *
 from src.services.negotiator import generate_negotiation_script
-from src.services.rewards import recommend_best_card
+from src.services.rewards import recommend_best_card, audit_wallet_rewards
 from src.services.portfolio import calculate_rebalancing_drift
 from src.services.price_drop import analyze_price_drop_and_draft_refund
 from src.services.monitor import (
@@ -2440,6 +2440,19 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "audit_wallet_rewards",
+            "description": "Credit Card Rewards Optimization Audit. Evaluates recent credit card purchases against optimal cards in user's wallet, calculating missed cash back dollars and largest sub-optimal swipes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_back": {"type": "integer", "description": "Number of days of history to audit (default 90)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calculate_rebalancing_drift",
             "description": "Calculates the drift of the current portfolio allocation against a target allocation and returns recommended trades.",
             "parameters": {
@@ -2558,6 +2571,7 @@ EXPECTED_TOOL_NAMES = {
     "generate_financial_digest",
     "generate_negotiation_script",
     "recommend_best_card",
+    "audit_wallet_rewards",
     "calculate_rebalancing_drift",
         "analyze_price_drop_and_draft_refund",
     "explore_domain",
@@ -5827,6 +5841,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             user_id=uid,
                             category=args.get("category"),
                             merchant=args.get("merchant")
+                        )
+                    elif func_name == "audit_wallet_rewards":
+                        db_result = audit_wallet_rewards(
+                            user_id=uid,
+                            days_back=args.get("days_back", 90)
                         )
                     elif func_name == "calculate_rebalancing_drift":
                         db_result = calculate_rebalancing_drift(

@@ -2674,6 +2674,52 @@ async def next_dollar_cmd(ctx: commands.Context, amount: float):
         await ctx.send(f"❌ Next best dollar allocation failed: `{type(exc).__name__}: {exc}`")
 
 
+@bot.command(name="bestcard", aliases=["card", "whichcard"])
+async def best_card_cmd(ctx: commands.Context, *, query: str):
+    """Recommend the optimal credit card from your wallet or market for a merchant or purchase category."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.rewards import recommend_best_card
+        res = recommend_best_card(user_id=user_id, category=query, merchant=query)
+        card = res.get("recommended_card") or "Default Card"
+        mult = res.get("multiplier", 1.0)
+        cat = res.get("category", query)
+        count = res.get("wallet_cards_count", 0)
+
+        embed = discord.Embed(
+            title="💳 Optimal Card Recommendation",
+            color=0x2ECC71
+        )
+        embed.add_field(name="Target Purchase", value=f"`{query}` (Category: **{cat.title()}**)", inline=False)
+        embed.add_field(name="Recommended Card", value=f"**{card}**", inline=True)
+        embed.add_field(name="Reward Multiplier", value=f"**{mult:.1f}% Cash Back / Points**", inline=True)
+        if count > 0:
+            embed.set_footer(text=f"Matched against {count} cards in your personal wallet")
+        else:
+            embed.set_footer(text="Market benchmark profile (No credit cards linked yet)")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"❌ Best card lookup failed: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="rewardsaudit", aliases=["walletaudit"])
+async def rewards_audit_cmd(ctx: commands.Context, days_back: int = 90):
+    """Quantify earned rewards vs optimal wallet swipes and uncover missed cash back."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.rewards import audit_wallet_rewards
+        report = audit_wallet_rewards(user_id=user_id, days_back=days_back)
+        if len(report) > 1900:
+            parts = [report[i:i+1900] for i in range(0, len(report), 1900)]
+            for part in parts:
+                await ctx.send(f"```text\n{part}\n```")
+        else:
+            await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Rewards audit failed: `{type(exc).__name__}: {exc}`")
+
+
+
 
 # ============================================================
 # Free-Trial & Zombie Subscription Watchdog
