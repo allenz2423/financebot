@@ -3264,6 +3264,20 @@ async def cashdrag_cmd(ctx: commands.Context, apy: Optional[float] = None):
         await ctx.send(f"❌ Cash drag analysis failed: `{type(exc).__name__}: {exc}`")
 
 
+@bot.command(name="health", aliases=["score", "healthscore", "financialhealth"])
+async def health_cmd(ctx: commands.Context):
+    """View authoritative 5-pillar Financial Health Scorecard (0-100), letter grade, and priority action."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.scorecard import calculate_financial_health_scorecard, format_scorecard_embed
+        with _open_verification_db(user_id=user_id) as vconn:
+            data = calculate_financial_health_scorecard(user_id=user_id, conn=vconn)
+        embed = format_scorecard_embed(data)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await ctx.send(f"❌ Financial health audit failed: `{type(exc).__name__}: {exc}`")
+
+
 @bot.command(name="networth", aliases=["nw", "balancesheet"])
 async def networth_cmd(ctx: commands.Context):
     """View authoritative unified balance sheet, asset/debt breakdown, solvency rating, and net worth."""
