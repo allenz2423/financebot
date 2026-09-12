@@ -182,153 +182,97 @@ class _HelpPageView(discord.ui.View):
 @bot.command(name="help")
 async def help_command(ctx: commands.Context, *, section: str = ""):
     user_id = str(ctx.author.id)
-    
-    embed = discord.Embed(
-        title=" Delilah Help",
-        description="Quick reference for advisor controls, database verification, and ledger commands.",
-        color=discord.Color.blurple(),
-    )
-
-    embed.add_field(
-        name=" Advisor Control",
-        value=(
-            "`!status` — Live advisor state, elapsed time, tool calls, and phase.\n"
-            "`!peek` — Spy on the advisor's current thought process and recent tool results.\n"
-            "`!auditstatus` — View the live state of the audit controller and research queue.\n"
-            "`!pause` — Pause the active advisor run.\n"
-            "`!cancel` — Cancel the active advisor run.\n"
-            "`!switch <local|cloud>` — Hot-swap between Ollama and OpenAI-compatible.\n"
-            "`!model list|get|set` — Manage models (e.g., `!model set cloud:<model_name>`).\n`!timezone` — View or set your personal timezone (e.g., `!timezone America/Chicago`).\n"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name=" Database / Audit — Direct SQLite",
-        value=(
-            "`!dbstatus` — Full database health snapshot.\n"
-            "`!unlocked` — Every currently unlocked transaction.\n"
-            "`!locked` — Every locked/finalized transaction.\n"
-            "`!override <id>` — Admin force-unlock a locked transaction.\n"
-            "`!corrections [limit]` — Recent correction history with before/after details.\n"
-            "`!merchantstatus` — Cross-reference ledger merchants against known merchants and aliases.\n"
-            "`!researchstatus` — Unmatched merchants that require research.\n"
-            "`!snapshot` — Compare live transaction identity against the original snapshot.\n"
-            "`!integrity` — Deterministic integrity checks; no LLM involved.\n"
-            "`!txaudit <transaction_row_id>` — Full forensic history for one transaction."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name=" Chat / Ledger — Part 1",
-        value=(
-            "`!chart [days]` — Generate a spending pie chart for the trailing X days.\n"
-            "`!export` — Download the entire transaction ledger as a .csv file.\n"
-            "`!clear` — Clear current chat/context state where supported.\n"
-            "`!clearchat` — Clear persisted chat history where supported.\n"
-            "`!setbudget <amount>` — Set the configured budget.\n"
-            "`!checknow` — Run the configured financial check now.\n"
-            "`!plaidstatus` — Pings Plaid API for a status check regarding accounts."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name=" Chat / Ledger — Part 2",
-        value=(
-            "`!plaidsetup` — Securely input your Plaid `client_id`/`secret` (and tokens, if you already have them).\n"
-            "`!plaidlink` — First-time bank connection: opens a real Plaid Link login and saves the new access token automatically.\n"
-            "`!fixbank <index>` — Re-authenticate an existing but broken bank connection via a Tailscale URL.\n"
-            "`!testpush [msg]` — Send a test push notification to your phone.\n"
-            "`!ntfysetup` — DM yourself the secret ntfy topic and instructions.\n"
-            "`!gmail connect` — Connect a Gmail account using read-only Google OAuth.\n"
-            "`!gmail status` — Show the connected Gmail account.\n"
-            "`!gmail disconnect` — Remove the Gmail connection."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name=" Financial Monitor",
-        value=(
-            "`!monitor list` — Show all monitor rules (including disabled).\n"
-            "`!monitor add <kind> <name> <json-config>` — Add a rule.\n"
-            "`!monitor run` — Evaluate rules now.\n"
-            "`!monitor alerts [limit]` — Show recent unacked alerts.\n"
-            "`!monitor ack <id>` — Acknowledge an alert.\n"
-            "`!monitor on <id>` / `!monitor off <id>` — Enable/disable a rule.\n"
-            "`!monitor del <id>` — Delete a rule.\n"
-            "`!monitor clear` — Delete ALL rules and alerts.\n\n"
-            "Rule kinds: projected_balance_low, category_spend_exceeded, "
-            "income_overdue, subscription_price_changed, unusual_transaction, "
-            "recurring_bill_missing, cash_flow_change, large_deposit."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name=" Important",
-        value=(
-            "Database verification commands bypass Delilah and query SQLite directly. "
-            "They are the source of truth for counts, locks, corrections, and transaction integrity."
-        ),
-        inline=False,
-    )
 
     # Build the full help text, then paginate it so no single embed
     # field exceeds Discord's 1024-char limit.
     sections = [
-        ("Advisor Control",
+        ("Financial Health & Wealth Solvency",
+         "`!health` (aliases: `!score`, `!healthscore`) — Comprehensive 5-Pillar Financial Health Scorecard (0-100), letter grade (A+ to F), and #1 priority action plan.\n"
+         "`!networth` (aliases: `!nw`, `!balancesheet`) — Authoritative balance sheet, assets vs liabilities breakdown, and solvency rating.\n"
+         "`!portfolio` (aliases: `!holdings`, `!investments`) — Track investment holdings across equities, bonds, crypto, and unrealized P&L.\n"
+         "`!rebalance` (alias: `!drift`) — Portfolio target allocation drift analysis and recommended rebalancing buy/sell orders.\n"
+         "`!setholding <symbol> <shares> [price] [cost] [class]` — Update an investment holding (shares=0 removes it).\n"
+         "`!emergencyfund` (aliases: `!efund`, `!runway`) — Bare-bones survival runway in months by separating essential vs discretionary burn."),
+
+        ("Budgeting, Bills & Cash Flow",
+         "`!budget` (aliases: `!budgets`) — View monthly category budgets, spending pace velocity, and month-end forecast.\n"
+         "`!budget set <category> <limit>` — Set monthly category budget ceiling.\n"
+         "`!budget del <category>` — Delete category budget.\n"
+         "`!pacing` (alias: `!burnrate`) — Real-time spending velocity and overpacing burn-rate anomalies.\n"
+         "`!bills` (aliases: `!subscriptions`, `!calendar`, `!subs`) — Upcoming recurring bills calendar and 30-day outflow forecast.\n"
+         "`!bills add <merchant> <amount> [cadence] [due_day]` — Track recurring bill or fixed expense.\n"
+         "`!safetospend` (alias: `!safe`) — Calculate safe unallocated cash after bills, goals, and working buffer.\n"
+         "`!paydays` (alias: `!paycheck`) — Mathematically predicted next paycheck dates and cadence.\n"
+         "`!float` — Credit float ratio and payment cycle coverage."),
+
+        ("Credit, Debt & Yield Optimization",
+         "`!utilization` (aliases: `!credit`, `!debtratio`) — Revolving credit card utilization audit, FICO score impact tiers, and exact paydown amounts to reach <30% or <10%.\n"
+         "`!cashdrag` (aliases: `!idlecash`, `!hysa`, `!yield`) — Identify uninvested idle checking cash, 1.5x operating buffer, and lost high-yield interest.\n"
+         "`!goals` (alias: `!goal`) — Sinking fund savings goals, target deadlines, and progress bars.\n"
+         "`!goals deficit` — Sinking fund deficit audit, required monthly savings rate, and shortfall flags.\n"
+         "`!fundgoal <name> <amount>` — Deposit funds into a dedicated savings goal.\n"
+         "`!bestcard <merchant>` — Recommend optimal credit card in your wallet for maximum cash back/rewards.\n"
+         "`!rewardsaudit` (alias: `!walletaudit`) — Audit lost cash back across all historical card transactions.\n"
+         "`!recurringleakage` (alias: `!leakage`) — Detect phantom subscriptions and zombie recurring payments.\n"
+         "`!lifestylecreep` — Measure year-over-year fixed commitment expansion.\n"
+         "`!nextdollar` — Mathematical surplus cash routing waterfall (emergency -> 401k -> debt -> IRA -> taxable)."),
+
+        ("Ledger, Receipts, Tax & Charts",
+         "`!tx [limit] [offset]` — Interactive paginated transaction ledger browser with status and categories.\n"
+         "`!searchtx <query>` — Search transactions by merchant, category, or note.\n"
+         "`!txview <id>` — Comprehensive forensic drill-down for a transaction.\n"
+         "`!receipts parse <text>` — Parse receipt line items, compute tax/total, and fuzzy-match candidate bank transactions.\n"
+         "`!tax scan` (alias: `!taxscan`) — Discover tax deductions, Schedule C write-offs, and estimated tax bracket savings.\n"
+         "`!chart [category|cashflow|networth] [days]` — Visual dark-mode PNG charts generated via native Pillow.\n"
+         "`!export` — Download entire transaction ledger as a CSV file.\n"
+         "`!merchants` — View top merchant frequencies and alias mappings.\n"
+         "`!cleanmerchants` — Batch canonicalize raw statement strings into clean merchant names.\n"
+         "`!addalias <raw_string> -> <canonical>` — Register manual merchant normalization alias."),
+
+        ("Financial Monitor & Alerts",
+         "`!monitor list` — Show all monitor rules (including active/disabled).\n"
+         "`!monitor add <kind> <name> <json-config>` — Add a deterministic monitor rule.\n"
+         "`!monitor run` — Evaluate monitor rules immediately.\n"
+         "`!monitor alerts [limit]` — Show recent unacknowledged alerts.\n"
+         "`!monitor ack <id>` — Acknowledge an alert.\n"
+         "`!monitor on <id>` / `!monitor off <id>` — Enable or disable a rule.\n"
+         "`!monitor del <id>` — Delete a monitor rule.\n"
+         "`!monitor clear` — Delete all rules and alerts.\n\n"
+         "**Supported Rule Kinds:**\n"
+         "• `credit_utilization_high` — Warn when card utilization exceeds threshold (default: 30%)\n"
+         "• `category_budget_overpacing` — Warn when mid-month burn exceeds pace threshold\n"
+         "• `duplicate_charge_detected` — Warn on identical charges within 48h\n"
+         "• `projected_balance_low` — Warn if checking balance drops under threshold\n"
+         "• `category_spend_exceeded` — Warn if category spending exceeds limit\n"
+         "• `subscription_price_changed` — Warn on price hikes\n"
+         "• `income_overdue`, `unusual_transaction`, `recurring_bill_missing`, `large_deposit`"),
+
+        ("Advisor & System Controls",
          "`!status` — Live advisor state, elapsed time, tool calls, and phase.\n"
-         "`!peek` — Spy on the advisor's current thought process and recent tool results.\n"
+         "`!peek` — Inspect the advisor's current thought process and recent tool results.\n"
          "`!auditstatus` — View the live state of the audit controller and research queue.\n"
-         "`!pause` — Pause the active advisor run.\n"
-         "`!cancel` — Cancel the active advisor run.\n"
+         "`!pause` / `!cancel` — Pause or cancel active advisor run.\n"
          "`!switch <local|cloud>` — Hot-swap between Ollama and OpenAI-compatible.\n"
-         "`!model list|get|set` — Manage models (e.g., `!model set cloud:<model_name>`).\n`!timezone` — View or set your personal timezone (e.g., `!timezone America/Chicago`).\n"),
-        ("Database / Audit — Direct SQLite",
+         "`!model list|get|set` — Manage models (e.g., `!model set cloud:<model_name>`).\n"
+         "`!timezone` — View or set your personal timezone.\n"
+         "`!clear` / `!clearchat` — Clear chat history or context.\n"
+         "`!testpush [msg]` — Send a test push notification to your phone via ntfy.\n"
+         "`!ntfysetup` — DM yourself secret ntfy topic and instructions.\n"
+         "`!gmail connect|status|disconnect` — Connect Gmail account via read-only OAuth."),
+
+        ("Database Verification & Banking Sync",
          "`!dbstatus` — Full database health snapshot.\n"
          "`!unlocked` — Every currently unlocked transaction.\n"
          "`!locked` — Every locked/finalized transaction.\n"
          "`!override <id>` — Admin force-unlock a locked transaction.\n"
          "`!corrections [limit]` — Recent correction history with before/after details.\n"
-         "`!merchantstatus` — Cross-reference ledger merchants against known merchants and aliases.\n"
-         "`!researchstatus` — Unmatched merchants that require research.\n"
          "`!snapshot` — Compare live transaction identity against the original snapshot.\n"
          "`!integrity` — Deterministic integrity checks; no LLM involved.\n"
-         "`!txaudit <transaction_row_id>` — Full forensic history for one transaction."),
-        ("Chat / Ledger",
-         "`!chart [days]` — Generate a spending pie chart for the trailing X days.\n"
-         "`!export` — Download the entire transaction ledger as a .csv file.\n"
-         "`!clear` — Clear current chat/context state where supported.\n"
-         "`!clearchat` — Clear persisted chat history where supported.\n"
-         "`!setbudget <amount>` — Set the configured budget.\n"
-         "`!checknow` — Run the configured financial check now.\n"
-         "`!plaidstatus` — Pings Plaid API for a status check regarding accounts.\n"
-         "`!plaidsetup` — Securely input your Plaid `client_id`/`secret` (and tokens, if you already have them).\n"
-         "`!plaidlink` — First-time bank connection: opens a real Plaid Link login and saves the new access token automatically.\n"
-         "`!fixbank <index>` — Re-authenticate an existing but broken bank connection via a Tailscale URL.\n"
-         "`!testpush [msg]` — Send a test push notification to your phone.\n"
-         "`!ntfysetup` — DM yourself the secret ntfy topic and instructions.\n"
-         "`!gmail connect` — Connect a Gmail account using read-only Google OAuth.\n"
-         "`!gmail status` — Show the connected Gmail account.\n"
-         "`!gmail disconnect` — Remove the Gmail connection."),
-        ("Financial Monitor",
-         "`!monitor list` — Show all monitor rules (including disabled).\n"
-         "`!monitor add <kind> <name> <json-config>` — Add a rule.\n"
-         "`!monitor run` — Evaluate rules now.\n"
-         "`!monitor alerts [limit]` — Show recent unacked alerts.\n"
-         "`!monitor ack <id>` — Acknowledge an alert.\n"
-         "`!monitor on <id>` / `!monitor off <id>` — Enable/disable a rule.\n"
-         "`!monitor del <id>` — Delete a rule.\n"
-            "`!monitor clear` — Delete ALL rules and alerts.\n\n"
-         "Rule kinds: projected_balance_low, category_spend_exceeded, "
-         "income_overdue, subscription_price_changed, unusual_transaction, "
-         "recurring_bill_missing, cash_flow_change, large_deposit."),
-        ("Important",
-         "Database verification commands bypass Delilah and query SQLite directly. "
-         "They are the source of truth for counts, locks, corrections, and transaction integrity."),
+         "`!txaudit <id>` — Full forensic audit history for one transaction.\n"
+         "`!plaidstatus` — Check Plaid bank connection statuses.\n"
+         "`!plaidsetup` — Securely input Plaid credentials.\n"
+         "`!plaidlink` — Interactive bank connection login flow.\n"
+         "`!fixbank <index>` — Re-authenticate expired or broken bank connection.")
     ]
 
     # Optional section filter: `!help <name>` jumps straight to that section.
