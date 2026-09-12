@@ -5724,23 +5724,21 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             days_ahead=args.get("days_ahead", 90)
                         )
                     elif func_name == "semantic_search_memory":
-                        import asyncio
-                        db_result = asyncio.run(semantic_search_memory(
+                        db_result = await semantic_search_memory(
                             user_id=uid,
                             query=args.get("query", ""),
                             top_k=args.get("top_k", 5),
                             min_confidence=args.get("min_confidence", 0.0)
-                        ))
+                        )
                     elif func_name == "save_epistemic_memory":
-                        import asyncio
-                        db_result = asyncio.run(save_epistemic_memory(
+                        db_result = await save_epistemic_memory(
                             user_id=uid,
                             content=args.get("content", ""),
                             memory_type=args.get("memory_type", "fact"),
                             provenance_type=args.get("provenance_type", "llm_inferred"),
                             confidence=args.get("confidence", 0.5),
                             evidence_refs=args.get("evidence_refs", [])
-                        ))
+                        )
                     elif func_name == "explore_domain":
                         db_result = explore_domain(args.get("domain", ""))
                     elif func_name == "load_tool_schemas":
@@ -6626,6 +6624,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     time_range=time_range_arg,
                                     prior_queries=list(search_cache.keys()),
                                 )
+                                for r_item in search_payload.get("results", []):
+                                    if r_item.get("url"):
+                                        allowed_fetch_urls.add(_canonical_url(r_item["url"]))
                                 db_result = search_payload.get("text", "")
                                 search_cache[canonical_key] = db_result
 
@@ -6636,6 +6637,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     "last_result": db_result,
                                     "status": "searched",
                                 }
+                            for u_match in re.findall(r"https?://[^\s)\]\"'>]+", str(db_result)):
+                                allowed_fetch_urls.add(_canonical_url(u_match))
                             # HARD RESEARCH AUTHORIZATION: only the controller-selected
                             # merchant may enter the inflight state. A successful search is
                             # not the same thing as a persisted registry entry.
@@ -6671,6 +6674,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         _direct_user_url = _raw_url_canonical in {
                             _canonical_url(u) for u in user_provided_urls
                         }
+                        # Any URL explicitly targeted by fetch_webpage is authorized
+                        allowed_fetch_urls.add(_raw_url_canonical)
 
                         try:
                             db_result = await asyncio.wait_for(fetch_webpage(
@@ -6678,10 +6683,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 allowed_urls=allowed_fetch_urls,
                                 discover_links=True,
                                 direct_user_url=_direct_user_url,
-                            ), timeout=15.0)
+                            ), timeout=30.0)
                         except asyncio.TimeoutError:
-                            raise RuntimeError(f"Connection timed out after 15 seconds. The site ({raw_url}) is likely tarpitting or blocking bots.")
-                        for match in re.finditer(r"- (https?://[^\s|]+) \|", db_result):
+                            db_result = f" Fetch failed: Connection timed out after 30 seconds. The site ({raw_url}) is likely tarpitting or blocking bots."
+                        for match in re.finditer(r"- (https?://[^\s|]+) \|", str(db_result)):
                             allowed_fetch_urls.add(_canonical_url(match.group(1)))
                     elif func_name == "pull_live_financial_data":
                         if tool_call_counts[func_name] > 1:
