@@ -3141,7 +3141,21 @@ async def pacing_cmd(ctx: commands.Context):
 # Investment Portfolio & Rebalancing Commands
 # ============================================================
 
+@bot.command(name="networth", aliases=["nw", "balancesheet"])
+async def networth_cmd(ctx: commands.Context):
+    """View authoritative unified balance sheet, asset/debt breakdown, solvency rating, and net worth."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.net_worth import calculate_unified_net_worth, format_net_worth_embed
+        data = calculate_unified_net_worth(user_id=user_id)
+        embed = format_net_worth_embed(data)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, " Net Worth Calculation Failed", exc, user_id=user_id)
+
+
 @bot.command(name="portfolio", aliases=["holdings", "investments"])
+
 async def portfolio_cmd(ctx: commands.Context):
     """View investment holdings, asset class breakdown, unrealized P&L, and target allocation."""
     user_id = str(ctx.author.id)

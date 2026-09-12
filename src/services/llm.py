@@ -2543,6 +2543,17 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["category", "monthly_limit"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_unified_net_worth",
+            "description": "Calculates authoritative unified balance sheet: total depository cash, investment holdings, sinking fund reserves, revolving credit, term debts, solvency/leverage ratios, and historical net worth momentum.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
     }
 ]
 
@@ -2638,7 +2649,9 @@ EXPECTED_TOOL_NAMES = {
     "parse_and_attach_receipt",
     "get_budget_pacing_and_forecast",
     "set_category_budget",
+    "get_unified_net_worth",
     "explore_domain",
+
     "load_tool_schemas",
     "verify_claim",
     "semantic_search_memory",
@@ -5957,6 +5970,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             category=args.get("category", ""),
                             monthly_limit=args.get("monthly_limit", 0.0),
                         )
+                    elif func_name == "get_unified_net_worth":
+                        from src.services.net_worth import calculate_unified_net_worth
+                        db_result = calculate_unified_net_worth(user_id=uid)
 
 
                     elif func_name == "get_net_worth_history":
