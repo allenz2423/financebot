@@ -382,3 +382,18 @@ def test_tools_46_to_50_fees_and_analytics(test_db):
     res50 = ADVISOR_TOOLS_DISPATCH["generate_weekly_financial_briefing"](user_id, {}, test_db)
     assert res50["briefing_period"] == "Past 7 Days"
     assert "financial_health_score" in res50
+
+
+def test_zero_interest_and_debt_rollover_logic(test_db):
+    user_id = "test_user_zero_rate"
+
+    # Test 0% loan calculations do not throw ZeroDivisionError
+    r1 = ADVISOR_TOOLS_DISPATCH["calculate_extra_payment_impact"](user_id, {"principal": 10000.0, "annual_interest_rate_pct": 0.0, "term_years": 5, "extra_monthly_payment": 50.0}, test_db)
+    assert r1["standard_monthly_payment"] > 0
+    assert r1["total_interest_saved"] == 0.0
+
+    r2 = ADVISOR_TOOLS_DISPATCH["compare_rent_vs_buy"](user_id, {"home_price": 200000.0, "mortgage_rate_pct": 0.0, "monthly_rent": 1200.0}, test_db)
+    assert r2["monthly_mortgage_pi"] > 0
+
+    r3 = ADVISOR_TOOLS_DISPATCH["calculate_mortgage_refinance_breakeven"](user_id, {"current_balance": 100000.0, "current_rate_pct": 0.0, "new_rate_pct": 0.0, "remaining_years": 15}, test_db)
+    assert r3["monthly_savings"] == 0.0

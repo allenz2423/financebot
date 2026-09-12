@@ -136,10 +136,11 @@ def tool_calculate_debt_snowball_vs_avalanche(user_id: str, args: Dict[str, Any]
             cur = [dict(d) for d in sorted_debts]
             months = 0
             total_interest = 0.0
+            rolled_over_mins = 0.0
 
             while any(d["balance"] > 0 for d in cur) and months < 360:
                 months += 1
-                available_extra = extra
+                available_extra = extra + rolled_over_mins
 
                 # Apply minimums and accrue interest
                 for d in cur:
@@ -152,7 +153,9 @@ def tool_calculate_debt_snowball_vs_avalanche(user_id: str, args: Dict[str, Any]
                     pay = min(d["balance"], d["min_payment"])
                     d["balance"] -= pay
                     if d["balance"] <= 0:
-                        available_extra += d["min_payment"]  # Roll over freed up minimum
+                        # Once paid off, roll this minimum payment into all future months
+                        rolled_over_mins += d["min_payment"]
+                        available_extra += d["min_payment"]
 
                 # Apply extra payment to target debt
                 for d in cur:
@@ -630,7 +633,7 @@ def tool_detect_unusual_bill_increases(user_id: str, args: Dict[str, Any], conn:
     def _eval(db_conn: sqlite3.Connection) -> Dict[str, Any]:
         c = db_conn.cursor()
         c.execute("""
-            SELECT merchant, amount, date
+            SELECT merchant, amount, date, category
             FROM transactions
             WHERE user_id = ? AND amount > 0 AND status = 'Evaluated'
               AND date >= date('now', '-180 days')
@@ -638,17 +641,44 @@ def tool_detect_unusual_bill_increases(user_id: str, args: Dict[str, Any], conn:
         """, (user_id,))
         rows = c.fetchall()
 
-        merch_txs: Dict[str, List[float]] = {}
-        for m, a, _ in rows:
+        # Gather confirmed recurring bills / subscriptions
+        known_recurring = set()
+        try:
+            c.execute("SELECT service_name FROM subscription_trials WHERE user_id = ?", (user_id,))
+            for r in c.fetchall():
+                if r[0]: known_recurring.add(str(r[0]).lower())
+        except Exception:
+            pass
+
+        merch_txs: Dict[str, List[Dict[str, Any]]] = {}
+        for m, a, d, cat in rows:
             if m:
-                merch_txs.setdefault(m, []).append(float(a))
+                merch_txs.setdefault(m, []).append({"amount": float(a), "date": d, "category": cat or ""})
 
         flagged = []
-        for m, amounts in merch_txs.items():
-            if len(amounts) >= 2:
-                recent = amounts[-1]
-                prior = amounts[-2]
-                if recent > prior and prior > 5.0:
+        for m, txs in merch_txs.items():
+            if len(txs) >= 2:
+                recent_tx = txs[-1]
+                prior_tx = txs[-2]
+                recent = recent_tx["amount"]
+                prior = prior_tx["amount"]
+
+                # If merchant is recognized as recurring OR has typical recurring categories OR charges spaced ~15-45 days apart
+                is_recurring_cat = any(rc in recent_tx["category"].lower() for rc in ("bill", "utilities", "subscription", "recurring", "insurance", "rent", "internet", "phone"))
+                is_known_rec = m.lower() in known_recurring
+
+                # Check spacing between charges in days
+                days_apart = 30
+                try:
+                    d1 = datetime.strptime(prior_tx["date"][:10], "%Y-%m-%d")
+                    d2 = datetime.strptime(recent_tx["date"][:10], "%Y-%m-%d")
+                    days_apart = abs((d2 - d1).days)
+                except Exception:
+                    pass
+
+                is_cadence_match = 15 <= days_apart <= 45
+
+                if (is_known_rec or is_recurring_cat or is_cadence_match) and recent > prior and prior > 5.0:
                     pct = ((recent - prior) / prior) * 100.0
                     if pct >= thresh:
                         flagged.append({
@@ -1086,11 +1116,14 @@ def tool_calculate_extra_payment_impact(user_id: str, args: Dict[str, Any], conn
 
     m_rate = rate / 12.0
     n = years * 12
-    factor = math.pow(1.0 + m_rate, n)
-    base_pmt = principal * (m_rate * factor) / (factor - 1.0)
+    if m_rate > 0:
+        factor = math.pow(1.0 + m_rate, n)
+        base_pmt = principal * (m_rate * factor) / (factor - 1.0)
+    else:
+        base_pmt = principal / n if n > 0 else 0.0
 
     # Standard schedule
-    std_interest = (base_pmt * n) - principal
+    std_interest = max(0.0, (base_pmt * n) - principal)
 
     # Accelerated schedule
     bal = principal
@@ -1131,11 +1164,14 @@ def tool_compare_rent_vs_buy(user_id: str, args: Dict[str, Any], conn: Optional[
     horizon_yrs = int(args.get("years", 10))
 
     down_payment = price * down_pct
-    loan_amt = price - down_payment
+    loan_amt = max(0.0, price - down_payment)
     m_rate = mort_rate / 12.0
     n = 30 * 12
-    factor = math.pow(1.0 + m_rate, n)
-    mort_pmt = loan_amt * (m_rate * factor) / (factor - 1.0)
+    if m_rate > 0:
+        factor = math.pow(1.0 + m_rate, n)
+        mort_pmt = loan_amt * (m_rate * factor) / (factor - 1.0)
+    else:
+        mort_pmt = loan_amt / n if n > 0 else 0.0
 
     # Monthly costs of owning: mortgage + property tax (1.2%) + insurance (0.5%) + maintenance (1%)
     monthly_prop_tax = (price * 0.012) / 12.0
@@ -1172,8 +1208,17 @@ def tool_calculate_mortgage_refinance_breakeven(user_id: str, args: Dict[str, An
     m_cur = cur_rate / 12.0
     m_new = new_rate / 12.0
 
-    pmt_cur = balance * (m_cur * math.pow(1.0 + m_cur, n)) / (math.pow(1.0 + m_cur, n) - 1.0)
-    pmt_new = balance * (m_new * math.pow(1.0 + m_new, n)) / (math.pow(1.0 + m_new, n) - 1.0)
+    if m_cur > 0:
+        factor_cur = math.pow(1.0 + m_cur, n)
+        pmt_cur = balance * (m_cur * factor_cur) / (factor_cur - 1.0)
+    else:
+        pmt_cur = balance / n if n > 0 else 0.0
+
+    if m_new > 0:
+        factor_new = math.pow(1.0 + m_new, n)
+        pmt_new = balance * (m_new * factor_new) / (factor_new - 1.0)
+    else:
+        pmt_new = balance / n if n > 0 else 0.0
 
     monthly_savings = max(0.0, pmt_cur - pmt_new)
     breakeven_months = math.ceil(costs / monthly_savings) if monthly_savings > 0 else 999
