@@ -463,11 +463,89 @@ async def receipts_cmd(ctx: commands.Context):
     if ctx.invoked_subcommand is None:
         await ctx.send(
             "**Receipt Reconciliation & Itemization**\n"
+            "`!receipts parse [tx_id] <receipt_text>` — Deterministically parse receipt text into line items and attach to transaction.\n"
             "`!receipts scan [days]` — Reconcile recent transactions against Gmail receipts.\n"
             "`!receipts view <tx_id>` — View itemized breakdown for a transaction.\n"
             "`!receipts add <tx_id> <item_name> <price> [qty]` — Manually add an itemized line item.\n"
             "`!receipts del <item_id>` — Delete an itemized line item."
         )
+
+
+@receipts_cmd.command(name="parse")
+async def receipts_parse_cmd(ctx: commands.Context, *, content: str):
+    """Deterministically parse pasted receipt text into itemized line items and link to a transaction."""
+    user_id = str(ctx.author.id)
+    raw = content.strip()
+    if not raw:
+        await ctx.send("⚠️ Please provide receipt text: `!receipts parse [tx_id] <receipt_text>`")
+        return
+
+    # Check if first token is a numeric transaction ID
+    parts = raw.split(None, 1)
+    tx_id = None
+    receipt_text = raw
+    if parts and parts[0].isdigit() and len(parts) > 1 and parts[1].strip():
+        tx_id = int(parts[0])
+        receipt_text = parts[1].strip()
+
+    try:
+        from src.services.receipt_parser import parse_and_attach_receipt
+        res = parse_and_attach_receipt(
+            receipt_text,
+            user_id=user_id,
+            transaction_id=tx_id,
+            source="manual_paste"
+        )
+        if not res.get("success"):
+            embed = discord.Embed(
+                title="❌ Receipt Parsing / Matching Failed",
+                description=res.get("error", "Unable to parse receipt."),
+                color=discord.Color.red()
+            )
+            candidates = res.get("candidates", [])
+            if candidates:
+                cand_lines = [
+                    f"• **Tx #{c['id']}**: {c['merchant']} — ${c['amount']:,.2f} ({c['date']})"
+                    for c in candidates[:5]
+                ]
+                embed.add_field(
+                    name="Possible Candidate Transactions",
+                    value="\n".join(cand_lines) + "\n\n*Specify the ID explicitly:* `!receipts parse <tx_id> <receipt_text>`",
+                    inline=False
+                )
+            await ctx.send(embed=embed)
+            return
+
+        target_tx = res["transaction"]
+        items = res.get("items", [])
+        items_count = res.get("items_count", len(items))
+        items_sum = res.get("items_sum", 0.0)
+        declared_total = res.get("receipt_total")
+
+        embed = discord.Embed(
+            title=f"🧾 Attached {items_count} Items to Tx #{res['transaction_id']}",
+            color=discord.Color.green(),
+            description=(
+                f"**Merchant:** {target_tx.get('merchant', 'Unknown')}\n"
+                f"**Transaction Amount:** ${target_tx.get('amount', 0.0):,.2f}\n"
+                f"**Total Itemized:** ${items_sum:,.2f}"
+            )
+        )
+        if declared_total is not None and abs(declared_total - items_sum) > 0.01:
+            embed.description += f"\n**Receipt Declared Total:** ${declared_total:,.2f} *(Diff: ${abs(declared_total - items_sum):,.2f})*"
+
+        item_preview = [
+            f"• #{it['id']} **{it['item_name']}** — {it.get('quantity', 1.0)} × ${it.get('unit_price', it['total_price']):,.2f} = **${it['total_price']:,.2f}**"
+            for it in items[:12]
+        ]
+        if len(items) > 12:
+            item_preview.append(f"... and {len(items) - 12} more items")
+        embed.add_field(name=f"Parsed Line Items ({items_count})", value="\n".join(item_preview)[:1024], inline=False)
+        embed.set_footer(text=f"View with `!receipts view {res['transaction_id']}` or `!txview {res['transaction_id']}`")
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, " Receipt Parse Failed", exc, user_id=user_id)
+
 
 
 @receipts_cmd.command(name="scan")

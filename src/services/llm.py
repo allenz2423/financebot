@@ -2490,6 +2490,27 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["item_name", "merchant", "purchase_price", "current_price"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "parse_and_attach_receipt",
+            "description": "Deterministically parse pasted or extracted receipt text into itemized line items and attach them to a transaction in the user's ledger. If transaction_id is omitted, automatically finds the closest matching transaction.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "receipt_text": {
+                        "type": "string",
+                        "description": "The raw text, OCR output, or email body containing line items and prices."
+                    },
+                    "transaction_id": {
+                        "type": "integer",
+                        "description": "Optional ledger transaction ID (row ID) to bind the items to."
+                    }
+                },
+                "required": ["receipt_text"]
+            }
+        }
     }
 ]
 
@@ -2581,7 +2602,8 @@ EXPECTED_TOOL_NAMES = {
     "recommend_best_card",
     "audit_wallet_rewards",
     "calculate_rebalancing_drift",
-        "analyze_price_drop_and_draft_refund",
+    "analyze_price_drop_and_draft_refund",
+    "parse_and_attach_receipt",
     "explore_domain",
     "load_tool_schemas",
     "verify_claim",
@@ -2641,6 +2663,7 @@ MUTATION_TOOLS = {
     "delete_memory",
     "save_known_merchant",
     "mark_audit_unresolved",
+    "parse_and_attach_receipt",
 }
 
 def refresh_knowledge_base(*,user_id: str) -> dict:
@@ -5873,6 +5896,22 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             purchase_price=args.get("purchase_price"),
                             current_price=args.get("current_price")
                         )
+                    elif func_name == "parse_and_attach_receipt":
+                        from src.services.receipt_parser import parse_and_attach_receipt
+                        tx_id_raw = args.get("transaction_id")
+                        tx_id = None
+                        if tx_id_raw is not None:
+                            try:
+                                tx_id = int(tx_id_raw)
+                            except (ValueError, TypeError):
+                                tx_id = None
+                        db_result = parse_and_attach_receipt(
+                            args.get("receipt_text", ""),
+                            user_id=uid,
+                            transaction_id=tx_id,
+                            source="llm_assistant"
+                        )
+
                     elif func_name == "get_net_worth_history":
                         db_result = get_net_worth_history(
                             days=args.get("days", 365), limit=args.get("limit", 100)
