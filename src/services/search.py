@@ -1550,9 +1550,9 @@ async def fetch_webpage(
         if r.status_code == 200:
             content_type = r.headers.get("content-type", "").split(";")[0].strip().lower()
             if content_type == "application/pdf" or url.lower().endswith(".pdf"):
-                parsed_pdf = await _extract_pdf_content(r.content)
+                parsed_pdf = await asyncio.to_thread(_extract_pdf_content, r.content)
                 result = f"[fetched PDF: {r.url}]\n{parsed_pdf['text']}"
-                if parsed_pdf["image_pages"]:
+                if parsed_pdf.get("image_pages"):
                     result += f"\n[{len(parsed_pdf['image_pages'])} page(s) had no usable text layer and were rendered as images.]"
                 WEB_PAGE_CACHE[key] = (now, result, False)
                 return result
