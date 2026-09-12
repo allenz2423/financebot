@@ -3390,6 +3390,81 @@ async def trials_zombies_cmd(ctx: commands.Context):
 
 
 # ============================================================
+# Recurring Bills & Subscription Calendar Commands
+# ============================================================
+
+@bot.group(name="bills", aliases=["subscriptions", "calendar", "subs"], invoke_without_command=True)
+async def bills_group(ctx: commands.Context):
+    """View recurring bills calendar, upcoming cash requirements (7d/14d/30d), and monthly burn."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.subscriptions import get_billing_calendar, format_billing_calendar_embed
+        data = get_billing_calendar(user_id=user_id, days_ahead=30)
+        embed = format_billing_calendar_embed(data)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Billing Calendar Query Failed", exc, user_id=user_id)
+
+
+@bills_group.command(name="list")
+async def bills_list_subcmd(ctx: commands.Context, days: int = 30):
+    """List upcoming recurring bills due within specified days (default: 30)."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.subscriptions import get_billing_calendar, format_billing_calendar_embed
+        data = get_billing_calendar(user_id=user_id, days_ahead=days)
+        embed = format_billing_calendar_embed(data)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Bills List Failed", exc, user_id=user_id)
+
+
+@bills_group.command(name="add")
+async def bills_add_subcmd(ctx: commands.Context, merchant: str, amount: float, cadence: str = "monthly", due_date: Optional[str] = None, category: str = "Subscriptions"):
+    """Add or update a recurring subscription bill."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.subscriptions import set_subscription
+        res = set_subscription(user_id=user_id, merchant=merchant, amount=amount, cadence=cadence, next_due_date=due_date, category=category)
+        await ctx.send(
+            f"📅 Tracked recurring bill **{res['merchant']}** (${res['amount']:,.2f}/{res['cadence']}). "
+            f"Next due: `{res['next_due_date']}` ({res['category']})."
+        )
+    except Exception as exc:
+        await _send_error_embed(ctx, "Add Bill Failed", exc, user_id=user_id)
+
+
+@bills_group.command(name="cancel")
+async def bills_cancel_subcmd(ctx: commands.Context, *, merchant: str):
+    """Mark a recurring subscription as cancelled."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.subscriptions import cancel_subscription
+        res = cancel_subscription(user_id=user_id, merchant=merchant)
+        await ctx.send(f"🗑️ {res['message']}")
+    except Exception as exc:
+        await _send_error_embed(ctx, "Cancel Bill Failed", exc, user_id=user_id)
+
+
+@bot.command(name="upcomingbills")
+async def upcomingbills_cmd(ctx: commands.Context, days: int = 30):
+    """View upcoming recurring bills hitting in the next N days."""
+    await bills_list_subcmd(ctx, days=days)
+
+
+@bot.command(name="addbill")
+async def addbill_cmd(ctx: commands.Context, merchant: str, amount: float, cadence: str = "monthly", due_date: Optional[str] = None, category: str = "Subscriptions"):
+    """Add a recurring bill (e.g. !addbill Netflix 15.49 monthly 2026-10-01 Entertainment)."""
+    await bills_add_subcmd(ctx, merchant=merchant, amount=amount, cadence=cadence, due_date=due_date, category=category)
+
+
+@bot.command(name="cancelbill")
+async def cancelbill_cmd(ctx: commands.Context, *, merchant: str):
+    """Cancel a recurring bill from tracking."""
+    await bills_cancel_subcmd(ctx, merchant=merchant)
+
+
+# ============================================================
 # Savings Goals, Milestones & Deficit Tracker
 # ============================================================
 

@@ -2635,6 +2635,61 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["alias", "canonical_name"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_upcoming_bills_calendar",
+            "description": "Retrieves upcoming recurring subscription charges, billing dates, cash outflow requirements (7d/14d/30d), and monthly recurring burn rate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "Number of days ahead to forecast upcoming charges (default: 30)."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_subscription",
+            "description": "Adds, updates, or cancels a recurring subscription or bill.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["set", "cancel"],
+                        "description": "Action to perform: 'set' (add/update) or 'cancel'."
+                    },
+                    "merchant": {
+                        "type": "string",
+                        "description": "Name of the subscription service or merchant."
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "Recurring charge amount in dollars (required for 'set')."
+                    },
+                    "cadence": {
+                        "type": "string",
+                        "enum": ["monthly", "annual", "weekly", "biweekly", "quarterly"],
+                        "description": "Billing cadence (default: 'monthly')."
+                    },
+                    "next_due_date": {
+                        "type": "string",
+                        "description": "Optional next billing date in YYYY-MM-DD format."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Optional category (e.g. 'Entertainment', 'Utilities', 'Software', 'Gym')."
+                    }
+                },
+                "required": ["action", "merchant"]
+            }
+        }
     }
 ]
 
@@ -2735,6 +2790,8 @@ EXPECTED_TOOL_NAMES = {
     "set_savings_goal",
     "canonicalize_transactions",
     "add_merchant_alias",
+    "get_upcoming_bills_calendar",
+    "manage_subscription",
     "explore_domain",
 
     "load_tool_schemas",
@@ -6083,6 +6140,26 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             canonical_name=args.get("canonical_name", ""),
                             category=args.get("category"),
                         )
+                    elif func_name == "get_upcoming_bills_calendar":
+                        from src.services.subscriptions import get_billing_calendar
+                        db_result = get_billing_calendar(
+                            user_id=uid,
+                            days_ahead=args.get("days_ahead", 30),
+                        )
+                    elif func_name == "manage_subscription":
+                        from src.services.subscriptions import set_subscription, cancel_subscription
+                        action = str(args.get("action", "set")).lower()
+                        if action == "cancel":
+                            db_result = cancel_subscription(user_id=uid, merchant=args.get("merchant", ""))
+                        else:
+                            db_result = set_subscription(
+                                user_id=uid,
+                                merchant=args.get("merchant", ""),
+                                amount=args.get("amount", 0.0),
+                                cadence=args.get("cadence", "monthly"),
+                                next_due_date=args.get("next_due_date"),
+                                category=args.get("category", "Subscriptions"),
+                            )
 
 
                     elif func_name == "get_net_worth_history":
