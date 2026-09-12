@@ -3,6 +3,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
@@ -14,6 +15,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
@@ -678,6 +680,16 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "auto_reconcile_ledger",
+            "description": "Fuzzy-Match Ledger Self-Cleaning Engine. Scans the ledger to detect and merge orphaned 'pending' transactions that duplicate 'posted' transactions, ensuring the user's budget is not artificially inflated.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+
 
     {
         "type": "function",
@@ -2503,6 +2515,7 @@ EXPECTED_TOOL_NAMES = {
     "semantic_search_memory",
     "save_epistemic_memory",
     "get_temporal_projection",
+    "auto_reconcile_ledger",
     "calculate_lifestyle_creep",
     "allocate_next_best_dollar",
     "simulate_what_if_scenario",
@@ -5141,6 +5154,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = calculate_credit_float_velocity(uid)
                     elif func_name == "get_safe_to_spend_metrics":
                         db_result = get_safe_to_spend_metrics(uid)
+                    elif func_name == "auto_reconcile_ledger":
+                        db_result = auto_reconcile_ledger(uid)
                     elif func_name == "calculate_lifestyle_creep":
                         db_result = calculate_lifestyle_creep(uid, args.get("days_back", 180))
                     elif func_name == "allocate_next_best_dollar":
