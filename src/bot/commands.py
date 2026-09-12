@@ -3314,6 +3314,94 @@ async def trials_zombies_cmd(ctx: commands.Context):
 
 
 # ============================================================
+# Savings Goals, Milestones & Deficit Tracker
+# ============================================================
+
+@bot.group(name="goals", aliases=["goal"], invoke_without_command=True)
+async def goals_group(ctx: commands.Context):
+    """View and manage deadline-aware savings goals, required monthly deposits, and deficits."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.goals import calculate_goal_milestones_and_deficits, format_goals_embed
+        data = calculate_goal_milestones_and_deficits(user_id=user_id)
+        embed = format_goals_embed(data, show_deficit_only=False)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Goals Query Failed", exc, user_id=user_id)
+
+
+@goals_group.command(name="list")
+async def goals_list_subcmd(ctx: commands.Context):
+    """List all savings goals, progress bars, and completion deadlines."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.goals import calculate_goal_milestones_and_deficits, format_goals_embed
+        data = calculate_goal_milestones_and_deficits(user_id=user_id)
+        embed = format_goals_embed(data, show_deficit_only=False)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Goals Query Failed", exc, user_id=user_id)
+
+
+@goals_group.command(name="deficit", aliases=["shortfall", "behind"])
+async def goals_deficit_subcmd(ctx: commands.Context):
+    """Filter to only goals that are behind schedule or overdue."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.goals import calculate_goal_milestones_and_deficits, format_goals_embed
+        data = calculate_goal_milestones_and_deficits(user_id=user_id)
+        embed = format_goals_embed(data, show_deficit_only=True)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Goals Deficit Query Failed", exc, user_id=user_id)
+
+
+@bot.command(name="setgoal")
+async def setgoal_cmd(ctx: commands.Context, name: str, target: float, deadline: Optional[str] = None, category: str = "General"):
+    """Set or update a savings goal with target amount and optional deadline (YYYY-MM-DD)."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.goals import set_savings_goal
+        res = set_savings_goal(user_id=user_id, name=name, target_amount=target, target_date=deadline, category=category)
+        msg = f"🎯 Goal **{res['name']}** ({res['category']}) configured for **${res['target_amount']:,.2f}**"
+        if res.get("target_date"):
+            msg += f" with deadline `{res['target_date']}`."
+        else:
+            msg += " (no deadline set)."
+        await ctx.send(msg)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Set Goal Failed", exc, user_id=user_id)
+
+
+@bot.command(name="fundgoal", aliases=["contributegoal"])
+async def fundgoal_cmd(ctx: commands.Context, name: str, amount: float):
+    """Deposit money into a savings goal envelope."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.goals import record_goal_contribution
+        res = record_goal_contribution(user_id=user_id, name=name, amount=amount, source="manual_deposit")
+        await ctx.send(
+            f"💰 Deposited **${amount:,.2f}** into **{res['name']}**.\n"
+            f"Current Balance: **${res['new_balance']:,.2f}** / ${res['target_amount']:,.2f} "
+            f"(${res['remaining']:,.2f} remaining to reach target)."
+        )
+    except Exception as exc:
+        await _send_error_embed(ctx, "Fund Goal Failed", exc, user_id=user_id)
+
+
+@bot.command(name="delgoal")
+async def delgoal_cmd(ctx: commands.Context, name: str):
+    """Remove a savings goal."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.goals import delete_savings_goal
+        res = delete_savings_goal(user_id=user_id, name=name)
+        await ctx.send(f"🗑️ {res['message']}")
+    except Exception as exc:
+        await _send_error_embed(ctx, "Delete Goal Failed", exc, user_id=user_id)
+
+
+# ============================================================
 # Virtual Round-Up & Sinking Fund Envelopes
 # ============================================================
 @bot.group(name="sinking", aliases=["roundup", "bucket"], invoke_without_command=True)

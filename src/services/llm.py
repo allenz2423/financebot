@@ -2554,6 +2554,46 @@ BOT_TOOLS_SCHEMA = [
                 "properties": {}
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_savings_goals_and_deficits",
+            "description": "Retrieves user's savings goals, progress milestones, required monthly contribution schedules, and deficit shortfalls against target deadlines.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_savings_goal",
+            "description": "Creates or updates a savings goal with target amount, category, and optional target deadline (YYYY-MM-DD).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the savings goal (e.g. 'Emergency Fund', 'New Car', 'Vacation')."
+                    },
+                    "target_amount": {
+                        "type": "number",
+                        "description": "The total target dollar amount to save."
+                    },
+                    "target_date": {
+                        "type": "string",
+                        "description": "Optional deadline in YYYY-MM-DD format."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Optional goal category (e.g. 'Emergency', 'Travel', 'Vehicle', 'Property Tax')."
+                    }
+                },
+                "required": ["name", "target_amount"]
+            }
+        }
     }
 ]
 
@@ -2650,6 +2690,8 @@ EXPECTED_TOOL_NAMES = {
     "get_budget_pacing_and_forecast",
     "set_category_budget",
     "get_unified_net_worth",
+    "get_savings_goals_and_deficits",
+    "set_savings_goal",
     "explore_domain",
 
     "load_tool_schemas",
@@ -5973,6 +6015,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     elif func_name == "get_unified_net_worth":
                         from src.services.net_worth import calculate_unified_net_worth
                         db_result = calculate_unified_net_worth(user_id=uid)
+                    elif func_name == "get_savings_goals_and_deficits":
+                        from src.services.goals import calculate_goal_milestones_and_deficits
+                        db_result = calculate_goal_milestones_and_deficits(user_id=uid)
+                    elif func_name == "set_savings_goal":
+                        from src.services.goals import set_savings_goal
+                        db_result = set_savings_goal(
+                            user_id=uid,
+                            name=args.get("name", ""),
+                            target_amount=args.get("target_amount", 0.0),
+                            target_date=args.get("target_date"),
+                            category=args.get("category", "General"),
+                        )
 
 
                     elif func_name == "get_net_worth_history":
