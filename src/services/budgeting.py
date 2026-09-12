@@ -334,3 +334,240 @@ def calculate_emergency_fund_health(user_id: str) -> str:
     except Exception as e:
         return f"ERROR calculating emergency fund health: {str(e)}"
 
+
+def render_progress_bar(percentage: float, width: int = 10) -> str:
+    """Render a clean text progress bar, e.g. [██████░░░░] 60%."""
+    clamped = max(0.0, min(percentage, 200.0))
+    filled = int(round((min(clamped, 100.0) / 100.0) * width))
+    empty = width - filled
+    bar = "█" * filled + "░" * empty
+    return f"[{bar}] {percentage:.0f}%"
+
+
+def calculate_spending_pace_and_forecast(
+    user_id: str,
+    now: Optional[datetime] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """
+    Computes real-time mid-month spending velocity, category budget pacing,
+    and end-of-month cash burn projections.
+    """
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("calculate_spending_pace_and_forecast: forced isolation violation — user_id is required")
+
+    dt = now or datetime.now()
+    year = dt.year
+    month = dt.month
+    day = dt.day
+
+    start_of_month = datetime(year, month, 1)
+    if month == 12:
+        next_month_start = datetime(year + 1, 1, 1)
+    else:
+        next_month_start = datetime(year, month + 1, 1)
+
+    days_in_month = (next_month_start - start_of_month).days
+    elapsed_days = max(1, day)
+    remaining_days = max(0, days_in_month - day)
+    elapsed_pct = (elapsed_days / days_in_month) * 100.0
+
+    def _execute(db_conn):
+        c = db_conn.cursor()
+        month_start_str = start_of_month.strftime("%Y-%m-%d")
+        month_end_str = next_month_start.strftime("%Y-%m-%d")
+
+        # 1. Realized month spending by category
+        c.execute("""
+            SELECT COALESCE(category, 'Uncategorized'), SUM(amount), COUNT(*)
+            FROM transactions
+            WHERE user_id = ? AND amount > 0
+              AND date >= ? AND date < ?
+              AND category != 'Credit Card Bill Payment 💳'
+              AND merchant NOT LIKE '%System Balance Sync%'
+            GROUP BY COALESCE(category, 'Uncategorized')
+        """, (user_id, month_start_str, month_end_str))
+
+        cat_spending = {}
+        for row in c.fetchall():
+            cat_spending[row[0]] = {
+                "spent": float(row[1] or 0.0),
+                "count": int(row[2] or 0)
+            }
+
+        # 2. Configured category budgets
+        c.execute("""
+            SELECT category, monthly_limit
+            FROM category_budgets
+            WHERE user_id = ?
+            ORDER BY category ASC
+        """, (user_id,))
+        budgets_raw = c.fetchall()
+        budget_map = {r[0]: float(r[1]) for r in budgets_raw}
+
+        # 3. Monthly realized income
+        c.execute("""
+            SELECT SUM(amount)
+            FROM transactions
+            WHERE user_id = ? AND amount < 0
+              AND date >= ? AND date < ?
+              AND category != 'Credit Card Bill Payment 💳'
+              AND merchant NOT LIKE '%System Balance Sync%'
+        """, (user_id, month_start_str, month_end_str))
+        income_row = c.fetchone()
+        realized_income = abs(float(income_row[0] or 0.0)) if income_row and income_row[0] else 0.0
+
+        # 4. Total spending
+        total_spent = sum(v["spent"] for v in cat_spending.values())
+        daily_burn_rate = total_spent / elapsed_days
+        projected_total_spend = daily_burn_rate * days_in_month
+
+        # 5. Build category breakdown
+        categories_result = []
+        total_budgeted_limit = sum(budget_map.values())
+
+        # Process budgeted categories
+        for cat, limit in budget_map.items():
+            spent_data = cat_spending.get(cat, {"spent": 0.0, "count": 0})
+            spent = spent_data["spent"]
+            pct_used = (spent / limit * 100.0) if limit > 0 else 0.0
+            expected_spent_to_date = limit * (elapsed_days / days_in_month)
+            pace_ratio = (spent / expected_spent_to_date) if expected_spent_to_date > 0 else 1.0
+            projected_spend = (spent / elapsed_days) * days_in_month
+            remaining_budget = limit - spent
+            daily_cap = (max(0.0, remaining_budget) / remaining_days) if remaining_days > 0 else 0.0
+
+            if spent >= limit:
+                status = "BLOWN"
+                icon = "🔴"
+            elif pace_ratio > 1.15:
+                status = "OVERPACING"
+                icon = "🟡"
+            else:
+                status = "ON TRACK"
+                icon = "🟢"
+
+            categories_result.append({
+                "category": cat,
+                "monthly_limit": round(limit, 2),
+                "spent": round(spent, 2),
+                "remaining": round(remaining_budget, 2),
+                "pct_used": round(pct_used, 1),
+                "progress_bar": render_progress_bar(pct_used),
+                "pace_ratio": round(pace_ratio, 2),
+                "projected_spend": round(projected_spend, 2),
+                "remaining_daily_cap": round(daily_cap, 2),
+                "status": status,
+                "status_icon": icon,
+                "transaction_count": spent_data["count"]
+            })
+
+        # Process unbudgeted categories with spend
+        unbudgeted = []
+        for cat, data in sorted(cat_spending.items(), key=lambda x: x[1]["spent"], reverse=True):
+            if cat not in budget_map:
+                spent = data["spent"]
+                unbudgeted.append({
+                    "category": cat,
+                    "spent": round(spent, 2),
+                    "count": data["count"],
+                    "projected_spend": round((spent / elapsed_days) * days_in_month, 2)
+                })
+
+        # Overall pacing
+        overall_pace_ratio = None
+        remaining_total_budget = None
+        remaining_daily_allowance = None
+        if total_budgeted_limit > 0:
+            expected_total_to_date = total_budgeted_limit * (elapsed_days / days_in_month)
+            overall_pace_ratio = round(total_spent / expected_total_to_date, 2) if expected_total_to_date > 0 else 1.0
+            remaining_total_budget = round(total_budgeted_limit - total_spent, 2)
+            remaining_daily_allowance = round(max(0.0, remaining_total_budget) / remaining_days, 2) if remaining_days > 0 else 0.0
+
+        projected_net_savings = round(realized_income - projected_total_spend, 2)
+
+        return {
+            "user_id": user_id,
+            "period": {
+                "year": year,
+                "month": month,
+                "month_name": dt.strftime("%B %Y"),
+                "current_day": day,
+                "days_in_month": days_in_month,
+                "elapsed_days": elapsed_days,
+                "remaining_days": remaining_days,
+                "elapsed_pct": round(elapsed_pct, 1),
+            },
+
+            "spending_summary": {
+                "total_spent_to_date": round(total_spent, 2),
+                "current_daily_burn": round(daily_burn_rate, 2),
+                "projected_month_spend": round(projected_total_spend, 2),
+                "realized_income": round(realized_income, 2),
+                "projected_net_savings": projected_net_savings,
+            },
+            "budget_summary": {
+                "total_budgeted_limit": round(total_budgeted_limit, 2),
+                "remaining_budget": remaining_total_budget,
+                "overall_pace_ratio": overall_pace_ratio,
+                "remaining_daily_allowance": remaining_daily_allowance,
+            },
+            "category_budgets": categories_result,
+            "unbudgeted_categories": unbudgeted,
+        }
+
+    if conn is not None:
+        return _execute(conn)
+    with sqlite3.connect(DB_PATH) as db_conn:
+        return _execute(db_conn)
+
+
+def format_spending_pace_report(data: Dict[str, Any]) -> str:
+    """Format spending velocity and budget pacing as clean markdown report."""
+    period = data["period"]
+    spend = data["spending_summary"]
+    budget = data["budget_summary"]
+    cats = data["category_budgets"]
+    unbudgeted = data.get("unbudgeted_categories", [])
+
+    lines = [
+        f"📊 MONTHLY BUDGET & PACING: {period['month_name'].upper()}",
+        f"Timeline: Day {period['current_day']} of {period['days_in_month']} ({period['elapsed_pct']}% elapsed, {period['remaining_days']} days left)",
+        "-" * 55,
+        f"Total Spent to Date:       ${spend['total_spent_to_date']:,.2f}",
+        f"Current Daily Burn Rate:   ${spend['current_daily_burn']:,.2f}/day",
+        f"Projected Month-End Spend: ${spend['projected_month_spend']:,.2f}",
+    ]
+
+    if spend["realized_income"] > 0:
+        net_str = f"+${spend['projected_net_savings']:,.2f}" if spend['projected_net_savings'] >= 0 else f"-${abs(spend['projected_net_savings']):,.2f}"
+        lines.append(f"Realized Income:           ${spend['realized_income']:,.2f}")
+        lines.append(f"Projected Net Cash Flow:   {net_str}")
+
+    lines.append("-" * 55)
+
+    if cats:
+        lines.append("CATEGORY BUDGETS & BURN VELOCITY:")
+        for c in cats:
+            lines.append(
+                f" • {c['status_icon']} {c['category']}: ${c['spent']:,.2f} / ${c['monthly_limit']:,.2f} {c['progress_bar']}"
+            )
+            lines.append(
+                f"   Pace: {c['pace_ratio']}x ({c['status']}) · Remaining: ${c['remaining']:,.2f} · Safe Cap: ${c['remaining_daily_cap']:,.2f}/day"
+            )
+    else:
+        lines.append("No category budgets set yet. Use `!setbudget <category> <monthly_limit>` to add targets.")
+
+    if unbudgeted:
+        lines.append("-" * 55)
+        lines.append("TOP UNBUDGETED CATEGORIES:")
+        for u in unbudgeted[:4]:
+            lines.append(f" • {u['category']}: ${u['spent']:,.2f} (proj ${u['projected_spend']:,.2f})")
+
+    lines.append("-" * 55)
+    if budget.get("remaining_daily_allowance") is not None:
+        lines.append(f"🎯 Target Daily Burn to finish month on budget: ${budget['remaining_daily_allowance']:,.2f}/day")
+
+    return "\n".join(lines)
+
+

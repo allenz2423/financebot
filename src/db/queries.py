@@ -875,6 +875,71 @@ def get_budget_settings(*, user_id: str) -> tuple[float, float]:
     row = c.fetchone()
     return (float(row[0]), float(row[1])) if row else (150.00, 50.00)
 
+
+def set_category_budget(*, user_id: str, category: str, monthly_limit: float) -> dict:
+    """Create or update a monthly category budget limit for a user."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("set_category_budget: forced isolation violation — user_id is required")
+    category = str(category or "").strip()
+    if not category:
+        raise ValueError("category cannot be empty")
+    limit_val = float(monthly_limit)
+    if limit_val <= 0:
+        raise ValueError("monthly_limit must be a positive number")
+
+    c.execute(
+        """
+        INSERT INTO category_budgets (user_id, category, monthly_limit, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(user_id, category) DO UPDATE SET
+            monthly_limit = excluded.monthly_limit,
+            updated_at = datetime('now')
+        """,
+        (user_id, category, limit_val)
+    )
+    safe_commit()
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "category": category,
+        "monthly_limit": limit_val,
+    }
+
+
+def delete_category_budget(*, user_id: str, category: str) -> bool:
+    """Delete a monthly category budget limit."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("delete_category_budget: forced isolation violation — user_id is required")
+    category = str(category or "").strip()
+    c.execute(
+        "DELETE FROM category_budgets WHERE user_id = ? AND LOWER(category) = LOWER(?)",
+        (user_id, category)
+    )
+    affected = c.rowcount > 0
+    safe_commit()
+    return affected
+
+
+def get_category_budgets(*, user_id: str) -> list[dict]:
+    """Retrieve all category budgets configured for a user."""
+    if not user_id or not isinstance(user_id, str):
+        raise ValueError("get_category_budgets: forced isolation violation — user_id is required")
+    c.execute(
+        "SELECT id, category, monthly_limit, updated_at FROM category_budgets WHERE user_id = ? ORDER BY category ASC",
+        (user_id,)
+    )
+    budgets = []
+    for r in c.fetchall():
+        budgets.append({
+            "id": r[0],
+            "category": r[1],
+            "monthly_limit": float(r[2]),
+            "updated_at": r[3],
+        })
+    return budgets
+
+
+
 # ============================================================
 # Income Reconciliation & Subscriptions
 # ============================================================
@@ -4679,8 +4744,9 @@ __all__ = [
     'add_subscription_trial', 'list_subscription_trials', 'update_trial_status',
     'detect_zombie_subscriptions', 'get_roundup_settings', 'set_roundup_settings',
     'calculate_transaction_roundup', 'apply_transaction_roundups', 'get_sinking_funds_overview',
-    'generate_financial_digest'
+    'generate_financial_digest', 'set_category_budget', 'delete_category_budget', 'get_category_budgets'
 ]
+
 
 def get_plaid_credential(user_id, key: str) -> str | None:
     """Look up a Plaid credential saved via !plaidsetup, falling back to .env."""

@@ -2511,6 +2511,38 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["receipt_text"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_budget_pacing_and_forecast",
+            "description": "Calculates real-time monthly spending velocity, category budget pacing (progress bars, burn rate, on-track vs overpacing), and end-of-month cash projections.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_category_budget",
+            "description": "Set or update a monthly spending budget limit for a specific category (e.g. Groceries, Dining Out, Entertainment).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "The category name to budget (e.g. 'Groceries', 'Dining Out', 'Shopping')."
+                    },
+                    "monthly_limit": {
+                        "type": "number",
+                        "description": "The monthly spending target in dollars."
+                    }
+                },
+                "required": ["category", "monthly_limit"]
+            }
+        }
     }
 ]
 
@@ -2604,6 +2636,8 @@ EXPECTED_TOOL_NAMES = {
     "calculate_rebalancing_drift",
     "analyze_price_drop_and_draft_refund",
     "parse_and_attach_receipt",
+    "get_budget_pacing_and_forecast",
+    "set_category_budget",
     "explore_domain",
     "load_tool_schemas",
     "verify_claim",
@@ -2664,7 +2698,9 @@ MUTATION_TOOLS = {
     "save_known_merchant",
     "mark_audit_unresolved",
     "parse_and_attach_receipt",
+    "set_category_budget",
 }
+
 
 def refresh_knowledge_base(*,user_id: str) -> dict:
     user_id = str(user_id or "").strip()
@@ -5911,6 +5947,17 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             transaction_id=tx_id,
                             source="llm_assistant"
                         )
+                    elif func_name == "get_budget_pacing_and_forecast":
+                        from src.services.budgeting import calculate_spending_pace_and_forecast
+                        db_result = calculate_spending_pace_and_forecast(user_id=uid)
+                    elif func_name == "set_category_budget":
+                        from src.db.queries import set_category_budget
+                        db_result = set_category_budget(
+                            user_id=uid,
+                            category=args.get("category", ""),
+                            monthly_limit=args.get("monthly_limit", 0.0),
+                        )
+
 
                     elif func_name == "get_net_worth_history":
                         db_result = get_net_worth_history(

@@ -3010,6 +3010,133 @@ async def emergency_fund_cmd(ctx: commands.Context):
         await ctx.send(f"❌ Emergency fund health check failed: `{type(exc).__name__}: {exc}`")
 
 
+@bot.group(name="budget", invoke_without_command=True, aliases=["budgets", "monthlybudget"])
+async def budget_cmd(ctx: commands.Context):
+    """View monthly budget dashboard, category burn rates, progress bars, and pacing forecast."""
+    if ctx.invoked_subcommand is not None:
+        return
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.budgeting import calculate_spending_pace_and_forecast
+        data = calculate_spending_pace_and_forecast(user_id=user_id)
+        period = data["period"]
+        spend = data["spending_summary"]
+        budget = data["budget_summary"]
+        cats = data["category_budgets"]
+        unbudgeted = data.get("unbudgeted_categories", [])
+
+        pace_ratio = budget.get("overall_pace_ratio")
+        if pace_ratio is not None and pace_ratio > 1.35:
+            color = discord.Color.red()
+        elif pace_ratio is not None and pace_ratio > 1.15:
+            color = discord.Color.gold()
+        else:
+            color = discord.Color.teal()
+
+        embed = discord.Embed(
+            title=f"📊 Monthly Budget & Pacing — {period['month_name']}",
+            color=color,
+            description=(
+                f"**Timeline:** Day **{period['current_day']}** of **{period['days_in_month']}** ({period['elapsed_pct']}% elapsed · {period['remaining_days']} days left)\n"
+                f"**Total Spent:** ${spend['total_spent_to_date']:,.2f} · **Daily Burn:** ${spend['current_daily_burn']:,.2f}/day\n"
+                f"**Projected Month Spend:** ${spend['projected_month_spend']:,.2f}"
+            )
+        )
+
+        if spend["realized_income"] > 0:
+            net = spend["projected_net_savings"]
+            net_icon = "📈" if net >= 0 else "📉"
+            net_str = f"+${net:,.2f}" if net >= 0 else f"-${abs(net):,.2f}"
+            embed.description += f"\n**Realized Income:** ${spend['realized_income']:,.2f} · **Proj Net:** {net_icon} **{net_str}**"
+
+        if cats:
+            cat_lines = []
+            for c in cats:
+                line = (
+                    f"**{c['status_icon']} {c['category']}**: ${c['spent']:,.2f} / ${c['monthly_limit']:,.2f} {c['progress_bar']}\n"
+                    f"*(Pace: {c['pace_ratio']}x {c['status']} · Rem: ${c['remaining']:,.2f} · Daily Cap: ${c['remaining_daily_cap']:,.2f}/day)*"
+                )
+                cat_lines.append(line)
+            embed.add_field(name=f"Category Budgets ({len(cats)})", value="\n".join(cat_lines)[:1024], inline=False)
+        else:
+            embed.add_field(
+                name="Category Budgets",
+                value="*No category budgets set yet.*\nUse `!budget set <category> <limit>` or `!setcatbudget <category> <limit>` to establish monthly targets (e.g. `!budget set Groceries 600`).",
+                inline=False
+            )
+
+        if unbudgeted:
+            unbud_lines = [
+                f"• **{u['category']}**: ${u['spent']:,.2f} (proj ${u['projected_spend']:,.2f})"
+                for u in unbudgeted[:4]
+            ]
+            embed.add_field(name="Top Unbudgeted Categories", value="\n".join(unbud_lines)[:1024], inline=False)
+
+        if budget.get("remaining_daily_allowance") is not None:
+            allowance = budget["remaining_daily_allowance"]
+            rem_b = budget["remaining_budget"]
+            embed.set_footer(text=f"Target Daily Burn to finish month on budget: ${allowance:,.2f}/day (Rem: ${rem_b:,.2f})")
+        else:
+            embed.set_footer(text="Set category targets with !budget set <category> <monthly_limit>")
+
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, " Budget Dashboard Failed", exc, user_id=user_id)
+
+
+@budget_cmd.command(name="set")
+async def budget_set_subcmd(ctx: commands.Context, category: str, monthly_limit: float):
+    """Set or update a monthly category budget limit (e.g. `!budget set Groceries 600`)."""
+    await set_cat_budget_cmd(ctx, category=category, monthly_limit=monthly_limit)
+
+
+@budget_cmd.command(name="del", aliases=["delete", "remove"])
+async def budget_del_subcmd(ctx: commands.Context, *, category: str):
+    """Delete a monthly category budget limit (e.g. `!budget del Groceries`)."""
+    await del_cat_budget_cmd(ctx, category=category)
+
+
+@bot.command(name="setcatbudget", aliases=["catbudget", "addcatbudget"])
+async def set_cat_budget_cmd(ctx: commands.Context, category: str, monthly_limit: float):
+    """Set or update a monthly category budget limit (e.g. `!setcatbudget Groceries 600`)."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import set_category_budget
+        res = set_category_budget(user_id=user_id, category=category, monthly_limit=monthly_limit)
+        await ctx.send(f"✅ Set monthly budget for **{res['category']}** to **${res['monthly_limit']:,.2f}/mo**.")
+    except Exception as exc:
+        await ctx.send(f"❌ Failed to set budget: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="delcatbudget", aliases=["removecatbudget"])
+async def del_cat_budget_cmd(ctx: commands.Context, *, category: str):
+    """Delete a monthly category budget limit (e.g. `!delcatbudget Groceries`)."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.db.queries import delete_category_budget
+        if delete_category_budget(user_id=user_id, category=category):
+            await ctx.send(f"🗑️ Removed monthly budget for **{category}**.")
+        else:
+            await ctx.send(f"⚠️ No budget found for category **{category}**.")
+    except Exception as exc:
+        await ctx.send(f"❌ Failed to delete budget: `{type(exc).__name__}: {exc}`")
+
+
+@bot.command(name="pacing", aliases=["burnrate", "spendpace"])
+async def pacing_cmd(ctx: commands.Context):
+    """View spending burn rate and recommended daily target for the rest of the month."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.budgeting import calculate_spending_pace_and_forecast, format_spending_pace_report
+        data = calculate_spending_pace_and_forecast(user_id=user_id)
+        report = format_spending_pace_report(data)
+        await ctx.send(f"```text\n{report}\n```")
+    except Exception as exc:
+        await ctx.send(f"❌ Pacing analysis failed: `{type(exc).__name__}: {exc}`")
+
+
+
+
 # ============================================================
 # Investment Portfolio & Rebalancing Commands
 # ============================================================
