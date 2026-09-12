@@ -22,7 +22,14 @@ from src.services.intelligence import calculate_lifestyle_creep, allocate_next_b
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.services.advisor_tools import NEW_50_TOOLS_SCHEMA, ADVISOR_TOOLS_DISPATCH
-from src.services.world_model import build_world_model_context, explain_claim, upsert_entity, assert_claim
+from src.services.world_model import (
+    build_world_model_context,
+    explain_claim,
+    upsert_entity,
+    assert_claim,
+    run_counterfactual_comparison,
+    audit_world_model_health
+)
 
 import os
 import re
@@ -2354,6 +2361,50 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "simulate_counterfactual_scenario",
+            "description": "Evaluate a What-If financial scenario (e.g. buying a laptop cash vs leasing, quitting a job, cutting expenses) using deterministic numerical simulation without altering production data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scenario_name": {
+                        "type": "string",
+                        "description": "Descriptive name for the scenario (e.g. 'MacBook Cash Buyout', 'FWS Ends Early')."
+                    },
+                    "starting_cash_delta": {
+                        "type": "number",
+                        "description": "Immediate cash change in dollars (e.g. -4082.01 for cash purchase, 200.0 for cash deposit)."
+                    },
+                    "monthly_expense_delta": {
+                        "type": "number",
+                        "description": "Monthly recurring expense delta in dollars (e.g. 77.69 for lease payment, -50.0 for cancelled subscription)."
+                    },
+                    "fws_terminated": {
+                        "type": "boolean",
+                        "description": "Set to true if simulating an early termination of FWS income."
+                    },
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "Number of days to simulate forward (default 60)."
+                    }
+                },
+                "required": ["scenario_name"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "audit_cognitive_health",
+            "description": "Audit the health, due predictions, and unresolved contradictions inside the Active World Model.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "schedule_reminder",
             "description": "Schedule a time-based reminder. You can pass an exact time like 'YYYY-MM-DD HH:MM:SS' OR use relative math like '+30s', '+5m', '+2h', '+1d'. ALWAYS prefer relative math when the user asks for 'in X minutes/seconds' so Python handles the math for you.",
             "parameters": {
@@ -3007,6 +3058,8 @@ EXPECTED_TOOL_NAMES = {
     "get_memories",
     "delete_memory",
     "explain_world_model_claim",
+    "simulate_counterfactual_scenario",
+    "audit_cognitive_health",
     "crawl_deeper",
     "send_push_alert",
     "schedule_reminder",
@@ -7240,6 +7293,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         else:
                             exp = explain_claim(claim_id)
                             db_result = json.dumps(exp, indent=2)
+                    elif func_name == "simulate_counterfactual_scenario":
+                        s_name = str(args.get("scenario_name", "Hypothetical Scenario")).strip()
+                        days_ahead = int(args.get("days_ahead", 60))
+                        overrides = {}
+                        if "starting_cash_delta" in args:
+                            overrides["starting_cash_delta"] = float(args["starting_cash_delta"])
+                        if "monthly_expense_delta" in args:
+                            overrides["monthly_expense_delta"] = float(args["monthly_expense_delta"])
+                        if "fws_terminated" in args:
+                            overrides["fws_terminated"] = bool(args["fws_terminated"])
+                        db_result = run_counterfactual_comparison(uid, s_name, overrides, days_ahead=days_ahead)
+                    elif func_name == "audit_cognitive_health":
+                        health = audit_world_model_health()
+                        db_result = json.dumps(health, indent=2)
                     elif func_name == "schedule_reminder":
                         c.execute(
                             "CREATE TABLE IF NOT EXISTS scheduled_reminders "

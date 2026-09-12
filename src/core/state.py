@@ -1124,10 +1124,39 @@ CREATE VIRTUAL TABLE IF NOT EXISTS kg_search_fts USING fts5(
 )
 """)
 
+c.execute("""
+CREATE TABLE IF NOT EXISTS kg_predictions (
+    prediction_id TEXT PRIMARY KEY,
+    model_name TEXT NOT NULL,
+    target_entity TEXT NOT NULL,
+    predicted_property TEXT NOT NULL,
+    predicted_value REAL NOT NULL,
+    target_valid_time TEXT NOT NULL,
+    input_claim_ids TEXT NOT NULL,
+    status TEXT DEFAULT 'PENDING',
+    actual_value REAL,
+    error_delta REAL,
+    created_at TEXT DEFAULT (datetime('now'))
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS kg_causal_rules (
+    rule_id TEXT PRIMARY KEY,
+    cause_pattern TEXT NOT NULL,
+    target_pattern TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    formula TEXT,
+    conditions TEXT,
+    is_active INTEGER DEFAULT 1
+)
+""")
+
 c.execute("CREATE INDEX IF NOT EXISTS idx_claims_subj ON kg_claims(subject_id, predicate)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_claims_obj ON kg_claims(object_id, predicate)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_claims_temporal ON kg_claims(subject_id, valid_from, valid_to, tx_retracted_at)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_claims_active ON kg_claims(subject_id, tx_retracted_at) WHERE tx_retracted_at IS NULL")
+c.execute("CREATE INDEX IF NOT EXISTS idx_predictions_target ON kg_predictions(target_valid_time, status)")
 conn.commit()
 
 

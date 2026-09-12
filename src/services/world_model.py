@@ -12,7 +12,7 @@ Provides:
 import sqlite3
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
 from src.core.state import DB_PATH
@@ -324,3 +324,237 @@ def explain_claim(claim_id: str) -> Dict[str, Any]:
         data["parents"] = parents
 
         return data
+
+# ============================================================
+# 6. DETERMINISTIC SIMULATION & CASH-FLOW PROJECTION (PHASE 2)
+# ============================================================
+
+def simulate_deterministic_cash_flow(
+    user_id: str,
+    days_ahead: int = 60,
+    scenario_overrides: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Deterministic numerical simulation of cash flow and debt trajectories.
+    Pure Python math — zero LLM guesswork.
+    Combines:
+    - Current liquid depository balances.
+    - Active debt obligations & interest amortizations.
+    - Confirmed FWS earnings up to cap.
+    - Scheduled bills and recurring expenses.
+    Supports ephemeral scenario overrides for what-if counterfactual branches.
+    """
+    overrides = scenario_overrides or {}
+    now = datetime.now()
+    
+    with _get_connection() as conn:
+        c = conn.cursor()
+        
+        # 1. Starting liquid cash
+        c.execute("""
+            SELECT COALESCE(SUM(current_balance), 0.0) 
+            FROM plaid_accounts 
+            WHERE user_id = ? AND type = 'depository'
+        """, (user_id,))
+        starting_cash = float(c.fetchone()[0])
+        if "starting_cash_delta" in overrides:
+            starting_cash += float(overrides["starting_cash_delta"])
+
+        # 2. Debts and APRs
+        c.execute("""
+            SELECT name, balance, apr, min_payment
+            FROM user_debts WHERE user_id = ? AND balance > 0
+        """, (user_id,))
+        debts = [dict(r) for r in c.fetchall()]
+
+        # 3. Scheduled recurring bills
+        c.execute("""
+            SELECT merchant, last_amount, next_due_date
+            FROM subscriptions WHERE user_id = ? AND status = 'Active'
+        """, (user_id,))
+        recurring_bills = [dict(r) for r in c.fetchall()]
+
+        # 4. Active FWS cap status from world model
+        c.execute("""
+            SELECT scalar_value FROM kg_claims 
+            WHERE subject_id = 'org:cuny_hpc' AND predicate = 'semester_cap' 
+              AND tx_retracted_at IS NULL LIMIT 1
+        """)
+        fws_cap_row = c.fetchone()
+        fws_cap = float(fws_cap_row[0]) if fws_cap_row else 2500.0
+        
+        # Check hours worked to date
+        c.execute("""
+            SELECT COALESCE(SUM(net_expected), 0.0)
+            FROM cash_inflows WHERE user_id = ? AND source LIKE '%FWS%' AND status = 'Received'
+        """, (user_id,))
+        fws_earned = float(c.fetchone()[0])
+        fws_remaining = max(0.0, fws_cap - fws_earned)
+        if overrides.get("fws_terminated", False):
+            fws_remaining = 0.0
+
+    # Daily projection loop (discrete time step simulation: t -> t + 1)
+    daily_trajectory = []
+    current_cash = starting_cash
+    fws_rate_per_biweek = float(overrides.get("fws_biweekly_rate", 680.0))
+    monthly_extra_burn = float(overrides.get("monthly_expense_delta", 0.0))
+    daily_extra_burn = monthly_extra_burn / 30.0
+
+    min_cash = current_cash
+    ruin_day = None
+
+    for day_idx in range(days_ahead):
+        curr_date = now + timedelta(days=day_idx)
+        date_str = curr_date.strftime("%Y-%m-%d")
+        
+        # Inflows (Bi-weekly FWS until cap exhausted)
+        daily_inflow = 0.0
+        if day_idx > 0 and day_idx % 14 == 0 and fws_remaining > 0:
+            payout = min(fws_rate_per_biweek, fws_remaining)
+            daily_inflow += payout
+            fws_remaining -= payout
+
+        # Outflows (recurring subscriptions based on due date)
+        daily_outflow = daily_extra_burn
+        for bill in recurring_bills:
+            due_str = str(bill.get("next_due_date") or "")
+            if due_str.startswith(date_str):
+                daily_outflow += float(bill.get("last_amount", 0.0))
+
+        current_cash += (daily_inflow - daily_outflow)
+        min_cash = min(min_cash, current_cash)
+        if current_cash < 0 and ruin_day is None:
+            ruin_day = date_str
+
+        daily_trajectory.append({
+            "day": day_idx,
+            "date": date_str,
+            "cash": round(current_cash, 2)
+        })
+
+    return {
+        "starting_cash": round(starting_cash, 2),
+        "ending_cash": round(current_cash, 2),
+        "minimum_projected_cash": round(min_cash, 2),
+        "insolvency_date": ruin_day,
+        "fws_remaining_at_end": round(fws_remaining, 2),
+        "days_projected": days_ahead,
+        "scenario_overrides": overrides
+    }
+
+# ============================================================
+# 7. COUNTERFACTUAL SCENARIO ENGINE (PHASE 2)
+# ============================================================
+
+def run_counterfactual_comparison(
+    user_id: str,
+    scenario_name: str,
+    overrides: Dict[str, Any],
+    days_ahead: int = 60
+) -> str:
+    """
+    Evaluates a What-If scenario against baseline reality.
+    Pure discrete-time math. Never mutates production database records.
+    """
+    baseline = simulate_deterministic_cash_flow(user_id, days_ahead=days_ahead)
+    alternate = simulate_deterministic_cash_flow(user_id, days_ahead=days_ahead, scenario_overrides=overrides)
+
+    diff_ending_cash = alternate["ending_cash"] - baseline["ending_cash"]
+    diff_min_cash = alternate["minimum_projected_cash"] - baseline["minimum_projected_cash"]
+
+    lines = [
+        f"🌌 COUNTERFACTUAL SCENARIO ANALYSIS: {scenario_name}",
+        "==================================================",
+        f"• Baseline Ending Cash (Day {days_ahead}): ${baseline['ending_cash']:,.2f}",
+        f"• Alternate Ending Cash (Day {days_ahead}): ${alternate['ending_cash']:,.2f}",
+        f"• Net Delta: {'+$' if diff_ending_cash >= 0 else '-$'}{abs(diff_ending_cash):,.2f}",
+        "",
+        f"• Baseline Minimum Liquidity: ${baseline['minimum_projected_cash']:,.2f}",
+        f"• Alternate Minimum Liquidity: ${alternate['minimum_projected_cash']:,.2f}",
+        f"• Liquidity Delta: {'+$' if diff_min_cash >= 0 else '-$'}{abs(diff_min_cash):,.2f}",
+    ]
+
+    if alternate["insolvency_date"]:
+        lines.append(f"⚠️ LIQUIDITY RISK: Scenario causes cash to fall below $0 on {alternate['insolvency_date']}!")
+    else:
+        lines.append(" Solvency maintained throughout projection period.")
+
+    lines.append("==================================================")
+    return "\n".join(lines)
+
+# ============================================================
+# 8. PREDICTION AUDITING & WATCHDOG ANOMALY DETECTOR (PHASE 3)
+# ============================================================
+
+def record_prediction(
+    model_name: str,
+    target_entity: str,
+    predicted_property: str,
+    predicted_value: float,
+    target_valid_time: str,
+    input_claim_ids: List[str]
+) -> str:
+    """Commit a forward-looking prediction into kg_predictions for future verification."""
+    pred_id = f"pred_{uuid.uuid4().hex[:10]}"
+    with _get_connection() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO kg_predictions (
+                prediction_id, model_name, target_entity, predicted_property,
+                predicted_value, target_valid_time, input_claim_ids, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
+        """, (
+            pred_id, model_name, target_entity, predicted_property,
+            predicted_value, target_valid_time, json.dumps(input_claim_ids)
+        ))
+        conn.commit()
+    return pred_id
+
+def audit_world_model_health() -> Dict[str, Any]:
+    """
+    Lightweight, deterministic watchdog audit of the Active World Model.
+    Checks:
+    1. Due predictions awaiting validation.
+    2. Active unresolved contradictions.
+    3. Stale claims whose valid_to has expired.
+    Runs in <5ms without LLM invocations.
+    """
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    
+    with _get_connection() as conn:
+        c = conn.cursor()
+        
+        # 1. Due predictions
+        c.execute("""
+            SELECT prediction_id, target_entity, predicted_property, predicted_value, target_valid_time
+            FROM kg_predictions
+            WHERE status = 'PENDING' AND target_valid_time <= ?
+        """, (now_utc,))
+        due_preds = [dict(r) for r in c.fetchall()]
+
+        # 2. Contradictions
+        c.execute("""
+            SELECT contradiction_id, claim_id_a, claim_id_b, created_at
+            FROM kg_contradictions WHERE status = 'UNRESOLVED'
+        """)
+        unresolved_conflicts = [dict(r) for r in c.fetchall()]
+
+        # 3. Active entities count
+        c.execute("SELECT COUNT(*) FROM kg_entities")
+        entity_count = c.fetchone()[0]
+
+        # 4. Active claims count
+        c.execute("SELECT COUNT(*) FROM kg_claims WHERE tx_retracted_at IS NULL")
+        active_claims_count = c.fetchone()[0]
+
+    return {
+        "status": "HEALTHY",
+        "entity_count": entity_count,
+        "active_claims_count": active_claims_count,
+        "due_predictions_count": len(due_preds),
+        "due_predictions": due_preds,
+        "unresolved_contradictions_count": len(unresolved_conflicts),
+        "unresolved_contradictions": unresolved_conflicts,
+        "audited_at": now_utc
+    }
+

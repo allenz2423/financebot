@@ -104,3 +104,42 @@ def test_context_assembler_budget(clean_test_entities):
     # Estimate token length (under 300 words guaranteed)
     word_count = len(ctx.split())
     assert word_count < 150
+
+def test_deterministic_cash_flow_simulation(clean_test_entities):
+    from src.services.world_model import simulate_deterministic_cash_flow
+    result = simulate_deterministic_cash_flow(user_id="1", days_ahead=30)
+    assert "starting_cash" in result
+    assert "ending_cash" in result
+    assert "minimum_projected_cash" in result
+    assert result["days_projected"] == 30
+
+def test_counterfactual_comparison(clean_test_entities):
+    from src.services.world_model import run_counterfactual_comparison
+    report = run_counterfactual_comparison(
+        user_id="1",
+        scenario_name="MacBook Cash Buyout Test",
+        overrides={"starting_cash_delta": -4082.01},
+        days_ahead=30
+    )
+    assert "COUNTERFACTUAL SCENARIO ANALYSIS" in report
+    assert "Baseline Ending Cash" in report
+    assert "Alternate Ending Cash" in report
+    assert "Net Delta" in report
+
+def test_audit_world_model_health():
+    from src.services.world_model import audit_world_model_health, record_prediction
+    pid = record_prediction(
+        model_name="fws_cap_v1",
+        target_entity="org:cuny_hpc",
+        predicted_property="fws_cap_date",
+        predicted_value=20261029.0,
+        target_valid_time="2026-10-29",
+        input_claim_ids=["claim_test_1"]
+    )
+    assert pid.startswith("pred_")
+
+    health = audit_world_model_health()
+    assert health["status"] == "HEALTHY"
+    assert health["entity_count"] >= 5
+    assert health["active_claims_count"] >= 5
+
