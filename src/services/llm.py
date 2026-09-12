@@ -22,6 +22,7 @@ from src.services.intelligence import calculate_lifestyle_creep, allocate_next_b
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.services.advisor_tools import NEW_50_TOOLS_SCHEMA, ADVISOR_TOOLS_DISPATCH
+from src.services.world_model import build_world_model_context, explain_claim, upsert_entity, assert_claim
 
 import os
 import re
@@ -166,44 +167,70 @@ async def send_push_alert(message: str, title: str = "Delilah CFO", priority: st
 # Time-Based Reminder Watchdog
 # ============================================================
 async def reminder_watchdog_loop():
+    """
+    Background watchdog that fires due scheduled reminders.
+
+    Uses its own dedicated SQLite connection (not the shared module-level `c`)
+    to avoid cursor contention with the main advisor event loop.
+    """
+    import sqlite3 as _sqlite3
+    from src.core.state import DB_PATH as _DB_PATH
+
+    # Own connection — never shares a cursor with the main advisor path.
+    _wconn = _sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=10.0)
+    _wconn.execute("PRAGMA journal_mode=WAL")
+    _wconn.execute("PRAGMA busy_timeout=10000")
+    _wc = _wconn.cursor()
+
+    print(" [WATCHDOG] Reminder watchdog starting in 5s...")
     await asyncio.sleep(5)
+    print(" [WATCHDOG] Reminder watchdog loop active.")
+
+    # When a reminder can't fire because the advisor for this user is busy,
+    # re-arm it for this many seconds later instead of dropping it.
+    _REARM_DELAY_SECONDS = int(os.getenv("REMINDER_REARM_DELAY_SECONDS", "300"))
+
     while True:
         try:
-            c.execute("CREATE TABLE IF NOT EXISTS scheduled_reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, trigger_at TEXT, instruction TEXT, status TEXT DEFAULT 'pending', channel_id INTEGER)")
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            
-            try:
-                c.execute("SELECT id, instruction, channel_id, user_id FROM scheduled_reminders WHERE status = 'pending' AND trigger_at <= ?", (now_str,))
-            except Exception:
-                c.execute("SELECT id, instruction, NULL, user_id FROM scheduled_reminders WHERE status = 'pending' AND trigger_at <= ?", (now_str,))
-            due = c.fetchall()
+            _wc.execute(
+                "CREATE TABLE IF NOT EXISTS scheduled_reminders "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
+                "trigger_at TEXT, instruction TEXT, status TEXT DEFAULT 'pending', "
+                "channel_id INTEGER, recurring INTEGER DEFAULT 0, repeat_offset TEXT)"
+            )
+            _wconn.commit()
 
-            # Force the read transaction to close so the next loop gets a fresh DB snapshot
-            conn.commit()
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            _wc.execute(
+                "SELECT id, instruction, channel_id, user_id, recurring, repeat_offset, trigger_at "
+                "FROM scheduled_reminders "
+                "WHERE status = 'pending' AND trigger_at <= ?",
+                (now_str,),
+            )
+            due = _wc.fetchall()
 
             for row_data in due:
-                r_id, instruction = row_data[0], row_data[1]
-                channel_id = row_data[2] if len(row_data) > 2 else None
-                uid = str(row_data[3]) if len(row_data) > 3 and row_data[3] else "0"
+                r_id = row_data[0]
+                instruction = row_data[1]
+                channel_id = row_data[2]
+                uid = str(row_data[3]) if row_data[3] else "0"
+                is_recurring = bool(row_data[4])
+                repeat_offset = row_data[5]
+                trigger_at_str = str(row_data[6]) if row_data[6] else None
 
-                # Atomically claim the reminder so the same job cannot execute twice.
-                c.execute(
-                    """
-                    UPDATE scheduled_reminders
-                    SET status = 'running'
-                    WHERE id = ?
-                      AND status = 'pending'
-                    """,
+                # Atomically claim this reminder.
+                _wc.execute(
+                    "UPDATE scheduled_reminders SET status = 'running' "
+                    "WHERE id = ? AND status = 'pending'",
                     (r_id,),
                 )
-                if c.rowcount != 1:
+                if _wc.rowcount != 1:
                     continue
-                conn.commit()
+                _wconn.commit()
 
-                # Resolve the intended reminder destination only.
-                # Never fall back to the global DISCORD_CHANNEL_ID.
+                # Resolve destination channel.
                 channel = None
-
                 if channel_id:
                     channel = bot.get_channel(channel_id)
                     if not channel:
@@ -222,23 +249,38 @@ async def reminder_watchdog_loop():
 
                 if not channel:
                     print(
-                        f" Watchdog could not resolve destination for reminder {r_id} "
-                        f"(user={uid}, channel={channel_id})"
+                        f" [WATCHDOG] Could not resolve destination for reminder {r_id} "
+                        f"(user={uid}, channel={channel_id}) — marking failed."
                     )
-                    c.execute(
+                    _wc.execute(
                         "UPDATE scheduled_reminders SET status = 'failed' WHERE id = ?",
                         (r_id,),
                     )
-                    conn.commit()
+                    _wconn.commit()
                     continue
 
                 class _PseudoHandle:
                     def __init__(self, ch): self.channel = ch
                     async def delete(self): pass
 
-                prompt = f"[SYSTEM: AUTONOMOUS WAKEUP]\nA scheduled reminder has triggered:\n\n{instruction}\n\nExecute any necessary tools to fulfill this reminder now. If you need to run an audit, do it. If you need to send a push notification, do it."
+                prompt = (
+                    f"[SYSTEM: AUTONOMOUS WAKEUP]\n"
+                    f"A scheduled reminder has triggered:\n\n{instruction}\n\n"
+                    f"Execute any necessary tools to fulfill this reminder now."
+                )
 
-                async def autonomous_run(prompt_text, user_id, ch, rem_id):
+                async def autonomous_run(
+                    prompt_text, user_id, ch, rem_id,
+                    _is_recurring=is_recurring, _repeat_offset=repeat_offset,
+                    _instruction=instruction, _channel_id=channel_id,
+                    _trigger_at_str=trigger_at_str,
+                ):
+                    import sqlite3 as _sq3
+                    # Each autonomous task gets its own connection to avoid cursor contention.
+                    _ac = _sq3.connect(_DB_PATH, check_same_thread=False, timeout=10.0)
+                    _ac.execute("PRAGMA journal_mode=WAL")
+                    _ac.execute("PRAGMA busy_timeout=10000")
+                    _acur = _ac.cursor()
                     try:
                         print(
                             f" [WATCHDOG] Firing reminder {rem_id} "
@@ -250,49 +292,121 @@ async def reminder_watchdog_loop():
                         )
                         await chat_with_delilah(prompt_text, user_id, handle)
 
-                        c.execute(
-                            "UPDATE scheduled_reminders "
-                            "SET status = 'completed' WHERE id = ? "
-                            "AND status = 'running'",
+                        _acur.execute(
+                            "UPDATE scheduled_reminders SET status = 'completed' "
+                            "WHERE id = ? AND status = 'running'",
                             (rem_id,),
                         )
-                        conn.commit()
+                        _ac.commit()
                         print(f" [WATCHDOG] Reminder {rem_id} completed.")
 
+                        # Re-schedule recurring reminders on the dot.
+                        if _is_recurring and _repeat_offset:
+                            repeat_match = re.fullmatch(
+                                r"\+(\d+)([smhd])", str(_repeat_offset).strip()
+                            )
+                            if repeat_match:
+                                val = int(repeat_match.group(1))
+                                unit = repeat_match.group(2)
+                                kw = (
+                                    {"seconds": val} if unit == "s"
+                                    else {"minutes": val} if unit == "m"
+                                    else {"hours": val} if unit == "h"
+                                    else {"days": val}
+                                )
+                                delta = timedelta(**kw)
+                                now_utc = datetime.now(timezone.utc)
+
+                                # If original trigger_at was provided, advance from that scheduled time
+                                # to prevent wall-clock execution drift (keeping it 'on the dot').
+                                base_dt = None
+                                if _trigger_at_str:
+                                    try:
+                                        base_dt = datetime.strptime(_trigger_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                                    except Exception:
+                                        base_dt = None
+
+                                if base_dt:
+                                    next_dt = base_dt + delta
+                                    # If it was significantly overdue, advance in whole multiples until in the future
+                                    while next_dt <= now_utc:
+                                        next_dt += delta
+                                else:
+                                    next_dt = now_utc + delta
+
+                                next_trigger = next_dt.strftime("%Y-%m-%d %H:%M:%S")
+                                _acur.execute(
+                                    "INSERT INTO scheduled_reminders "
+                                    "(user_id, trigger_at, instruction, channel_id, "
+                                    "recurring, repeat_offset) "
+                                    "VALUES (?, ?, ?, ?, 1, ?)",
+                                    (user_id, next_trigger, _instruction, _channel_id, _repeat_offset),
+                                )
+                                _ac.commit()
+                                print(
+                                    f" [WATCHDOG] Reminder {rem_id} re-scheduled "
+                                    f"→ next trigger at {next_trigger}"
+                                )
+
                     except asyncio.CancelledError:
-                        c.execute(
-                            "UPDATE scheduled_reminders "
-                            "SET status = 'failed' WHERE id = ? "
-                            "AND status = 'running'",
+                        _acur.execute(
+                            "UPDATE scheduled_reminders SET status = 'failed' "
+                            "WHERE id = ? AND status = 'running'",
                             (rem_id,),
                         )
-                        conn.commit()
+                        _ac.commit()
                         print(f" [WATCHDOG] Reminder {rem_id} cancelled.")
                         raise
 
                     except Exception as e:
-                        c.execute(
-                            "UPDATE scheduled_reminders "
-                            "SET status = 'failed' WHERE id = ? "
-                            "AND status = 'running'",
+                        _acur.execute(
+                            "UPDATE scheduled_reminders SET status = 'failed' "
+                            "WHERE id = ? AND status = 'running'",
                             (rem_id,),
                         )
-                        conn.commit()
+                        _ac.commit()
                         print(f" [WATCHDOG] Reminder {rem_id} failed: {e}")
 
-                existing = ACTIVE_ADVISOR_TASKS.get(uid)
-                if existing and not existing.done():
-                    try: await existing
-                    except Exception: pass
+                    finally:
+                        _ac.close()
 
-                task = asyncio.create_task(autonomous_run(prompt, uid, channel, r_id), name=f"autonomous:{r_id}")
+                # Fire the reminder as an independent task — do NOT await it here.
+                # Awaiting the existing advisor task would block the entire watchdog.
+                #
+                # Guard against concurrent fires for the same user: the advisor
+                # is single-threaded per uid, so if one is already running we
+                # re-arm this reminder for later instead of dropping it.
+                existing = ACTIVE_ADVISOR_TASKS.get(uid)
+                if existing is not None and not existing.done():
+                    delay = _REARM_DELAY_SECONDS
+                    next_trigger = (
+                        datetime.now(timezone.utc) + timedelta(seconds=delay)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    _wc.execute(
+                        "UPDATE scheduled_reminders SET trigger_at = ?, status = 'pending' "
+                        "WHERE id = ? AND status = 'running'",
+                        (next_trigger, r_id),
+                    )
+                    _wconn.commit()
+                    print(
+                        f" [WATCHDOG] Reminder {r_id} deferred to {next_trigger} "
+                        f"(advisor for {uid} already running)."
+                    )
+                    continue
+
+                task = asyncio.create_task(
+                    autonomous_run(prompt, uid, channel, r_id),
+                    name=f"autonomous:{r_id}",
+                )
                 ADVISOR_STATUS.setdefault(uid, {})["cancel_requested"] = False
                 ADVISOR_STATUS.setdefault(uid, {})["cancelled"] = False
                 ACTIVE_ADVISOR_TASKS[uid] = task
 
         except Exception as e:
-            print(f" Watchdog error: {e}")
+            print(f" [WATCHDOG] Loop error: {type(e).__name__}: {e}")
+
         await asyncio.sleep(10)
+
 
 # ============================================================
 async def maybe_flag_windfall(merchant, amount, *, user_id: str):
@@ -1886,6 +2000,11 @@ BOT_TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of queries to search concurrently in a single tool call.",
+                    },
                     "transaction_row_id": {
                         "type": "integer",
                         "description": "When researching a transaction merchant during an audit, include the numeric transaction row id (#1234) so the runtime can bind the research result to the exact transaction.",
@@ -2213,6 +2332,23 @@ BOT_TOOLS_SCHEMA = [
                     },
                 },
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explain_world_model_claim",
+            "description": "Explain why Delilah believes a specific claim in the Active World Model, tracing its provenance, evidence, and parent derivation chain.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim_id": {
+                        "type": "string",
+                        "description": "The ID of the claim to audit/explain (e.g. claim_1234abcd)."
+                    }
+                },
+                "required": ["claim_id"]
+            }
         },
     },
     {
@@ -2870,6 +3006,7 @@ EXPECTED_TOOL_NAMES = {
     "save_memory",
     "get_memories",
     "delete_memory",
+    "explain_world_model_claim",
     "crawl_deeper",
     "send_push_alert",
     "schedule_reminder",
@@ -3675,11 +3812,20 @@ RUNTIME CONTRACT:
 
     # Static system_prompt (instructions only) is kept byte-identical across
     # turns so its KV-cache prefix can be reused. Volatile data (timestamp,
-    # live financial context, memories) is injected as a SEPARATE system
+    # live financial context, memories, world model) is injected as a SEPARATE system
     # message placed right before the user turn, so only that small trailing
     # block needs reprocessing each turn instead of invalidating everything
     # after the first changed byte in one giant system string.
+    awm_context = ""
+    if context_policy["include_session_history"]:
+        try:
+            awm_context = build_world_model_context(prompt_text, max_tokens=180)
+        except Exception as e:
+            awm_context = ""
+
     volatile_context = f"""
+{awm_context}
+
 EXISTING MEMORIES — DO NOT RE-SAVE THESE
 ========================================
 {_memory_context}
@@ -4850,6 +4996,17 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Each entry: (keywords_tuple, tools_set)
     # First matching entry wins; fallback stays empty (pure discovery mode).
     _INTENT_TOOL_MAP: list[tuple[tuple[str, ...], set[str]]] = [
+        # Web search / news / research / internships / jobs / trackers (evaluated first)
+        (
+            ("search", "internship", "internships", "swe", "job", "career", "tracker", "news", "scrape", "briefing", "article"),
+            _CORE_READ_TOOLS | {
+                "search_web",
+                "fetch_webpage",
+                "crawl_deeper",
+                "send_push_alert",
+                "run_python_sandbox",
+            },
+        ),
         # Reconcile / ledger sync
         (
             ("reconcile", "ledger", "sync"),
@@ -6665,6 +6822,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         # one `query` string. Never let that malformed shape kill the
                         # research loop. Execute each query independently and aggregate
                         # the model-facing results.
+                        # Trailing location/noise suffixes to strip from batched
+                        # queries before they reach the search engine. Mirrors the
+                        # locationish set in src/services/search.py.
+                        _JUNK_SUFFIXES = {
+                            "avenel", "hudson", "brooklyn", "manhattan", "ny", "nyc",
+                            "usa", "us", "gb", "uk", "ca", "ch", "herald", "square",
+                            "7th", "ave", "st", "rd", "dr", "ct", "ln", "way",
+                            "suite", "ste", "fl", "bldg", "bld", "plaza", "center",
+                            "centre", "mall", "market", "station", "airport",
+                        }
                         batched_queries = args.get("queries")
                         if not args.get("query") and isinstance(batched_queries, list):
                             clean_queries = []
@@ -6693,6 +6860,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             pending_set = set(audit_state.get("research_pending") or []) if audit_state else set()
                             inflight_set = set(audit_state.get("research_inflight") or []) if audit_state else set()
                             active_batch = list(audit_state.get("active_research_batch") or []) if audit_state else []
+                            # Filter and prepare queries
+                            queries_to_search = []
+                            query_meta = []
                             for q in batch_queries:
                                 clean_query = q
                                 lower_q = clean_query.lower()
@@ -6710,15 +6880,30 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     print(f" [AUDIT SEARCH QUEUE] skipping non-pending query={clean_query!r}")
                                     batch_parts.append(f"[QUERY: {clean_query}]\n Skipped: Merchant is not in the pending unknown list.")
                                     continue
-                                search_payload = await search_searxng(clean_query, time_range=time_range_arg, prior_queries=[])
-                                text = str(search_payload.get("text", "") or "").strip()
-                                compact = text[:650] + ("\n[search result compacted by controller]" if len(text) > 650 else "")
-                                batch_parts.append(f"[QUERY: {clean_query}]\n{compact}")
-                                _research_set().add(query_key)
-                                if audit_state:
-                                    for matched in matched_pending:
-                                        inflight_set.add(matched)
-                                        _research_set().add(matched)
+                                queries_to_search.append(clean_query)
+                                query_meta.append((clean_query, query_key, matched_pending))
+
+                            # Execute all eligible queries concurrently
+                            if queries_to_search:
+                                search_results = await asyncio.gather(
+                                    *[
+                                        search_searxng(cq, time_range=time_range_arg, prior_queries=[])
+                                        for cq in queries_to_search
+                                    ],
+                                    return_exceptions=True,
+                                )
+                                for (clean_query, query_key, matched_pending), search_payload in zip(query_meta, search_results):
+                                    if isinstance(search_payload, Exception):
+                                        batch_parts.append(f"[QUERY: {clean_query}]\n Search failed: {search_payload}")
+                                        continue
+                                    text = str(search_payload.get("text", "") or "").strip()
+                                    compact = text[:650] + ("\n[search result compacted by controller]" if len(text) > 650 else "")
+                                    batch_parts.append(f"[QUERY: {clean_query}]\n{compact}")
+                                    _research_set().add(query_key)
+                                    if audit_state:
+                                        for matched in matched_pending:
+                                            inflight_set.add(matched)
+                                            _research_set().add(matched)
                             if audit_state:
                                 audit_state["research_inflight"] = sorted(inflight_set)
                                 audit_state["researched_merchants"] = []
@@ -7048,6 +7233,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             content_match=args.get("content_match"),
                             category=args.get("category"),
                          user_id=uid)
+                    elif func_name == "explain_world_model_claim":
+                        claim_id = str(args.get("claim_id", "")).strip()
+                        if not claim_id:
+                            db_result = "ERROR: claim_id is required."
+                        else:
+                            exp = explain_claim(claim_id)
+                            db_result = json.dumps(exp, indent=2)
                     elif func_name == "schedule_reminder":
                         c.execute(
                             "CREATE TABLE IF NOT EXISTS scheduled_reminders "

@@ -1059,6 +1059,78 @@ if c.fetchone()[0] == 0:
     )
     conn.commit()
 
+# ============================================================
+# ACTIVE WORLD MODEL (AWM) — Minimal Viable Cognitive Substrate
+# ============================================================
+c.execute("""
+CREATE TABLE IF NOT EXISTS kg_entities (
+    entity_id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    canonical_name TEXT NOT NULL,
+    aliases TEXT,
+    attributes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS kg_claims (
+    claim_id TEXT PRIMARY KEY,
+    subject_id TEXT NOT NULL REFERENCES kg_entities(entity_id),
+    predicate TEXT NOT NULL,
+    object_id TEXT REFERENCES kg_entities(entity_id),
+    scalar_value TEXT,
+    provenance_type TEXT NOT NULL,
+    source_authority INTEGER NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_to TEXT,
+    tx_asserted_at TEXT DEFAULT (datetime('now')),
+    tx_retracted_at TEXT,
+    parent_claim_ids TEXT,
+    evidence_refs TEXT,
+    is_scenario INTEGER DEFAULT 0
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS kg_contradictions (
+    contradiction_id TEXT PRIMARY KEY,
+    claim_id_a TEXT NOT NULL REFERENCES kg_claims(claim_id),
+    claim_id_b TEXT NOT NULL REFERENCES kg_claims(claim_id),
+    status TEXT DEFAULT 'UNRESOLVED',
+    created_at TEXT DEFAULT (datetime('now'))
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS kg_dossiers (
+    doc_id TEXT PRIMARY KEY,
+    primary_entity_id TEXT REFERENCES kg_entities(entity_id),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tags TEXT,
+    updated_at TEXT DEFAULT (datetime('now'))
+)
+""")
+
+c.execute("""
+CREATE VIRTUAL TABLE IF NOT EXISTS kg_search_fts USING fts5(
+    target_id UNINDEXED,
+    target_type UNINDEXED,
+    title,
+    content,
+    tags,
+    tokenize='porter unicode61'
+)
+""")
+
+c.execute("CREATE INDEX IF NOT EXISTS idx_claims_subj ON kg_claims(subject_id, predicate)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_claims_obj ON kg_claims(object_id, predicate)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_claims_temporal ON kg_claims(subject_id, valid_from, valid_to, tx_retracted_at)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_claims_active ON kg_claims(subject_id, tx_retracted_at) WHERE tx_retracted_at IS NULL")
+conn.commit()
+
+
 
 __all__ = ['get_db', 'DB_PATH', 'SEARCH_CONCURRENCY', 'SEARCH_SCRAPE_MAX_CHARS', 'ACTIVE_ADVISOR_TASKS', 'MAX_SEARCH_ENGINES_PER_QUERY', 'STATUS_UPDATE_TASKS', 'SESSION_HISTORY_MAX_TURNS', 'DISCORD_TOKEN', 'DISCORD_CHANNEL_ID', '_ensure_column', 'MAX_SEARCH_RESULTS_PER_ENGINE', 'USER_INTERRUPTS', 'ADVISOR_FINAL_NUM_PREDICT', 'tx_queue', 'health_check', 'conn', 'SEARXNG_URL', 'app', 'PLAYWRIGHT_WAIT_MS', 'AUDIT_SESSION_STATE', '_decode_b64_arg', '_resolve_known_merchant', 'PDF_RENDER_SCALE', 'MAX_RESEARCH_LINKS_PER_PAGE', '_advisor_status_snapshot', 'load_history_on_boot', 'MAX_RESEARCH_FETCHES_PER_SEARCH', 'SUPPORTED_PDF_CONTENT_TYPES', 'ADVISOR_TASK_REGISTRATION_LOCK', 'CHAT_HISTORY_TURNS', 'MAX_TOTAL_TOOL_CALLS', 'ADVISOR_STATUS_LOCK', '_RESEARCHED_MERCHANTS', 'MAX_SEARCH_ATTEMPTS_PER_ITEM', 'ADVISOR_TOOL_NUM_PREDICT', 'ADVISOR_STATUS', 'MAX_TOOL_ROUNDS', 'ADVISOR_NUM_PREDICT', 'SEARCH_CACHE_TTL_SECONDS', 'ADVISOR_MODEL', 'OLLAMA_URL', '_merchant_key', 'DELILAH_BUILD', 'PLAYWRIGHT_ENABLED', 'JINA_API_KEY', 'MAX_TOOL_CALLS_PER_ROUND', 'bot', 'PLAID_SYNC_STATE', 'SESSION_HISTORY', 'MODEL_KEEP_ALIVE', 'PLAYWRIGHT_CONCURRENCY', 'c', 'MAX_RESEARCH_LEDGER_ITEMS', '_research_set', 'SEARCH_HTTP_TIMEOUT', 'PDF_MAX_PAGES', 'ADVISOR_NUM_CTX', 'RESEARCH_PAGE_CACHE_TTL_SECONDS', 'MAX_RESEARCH_CRAWL_PAGES_PER_ITEM', 'MAX_SEARCH_UNIQUE_RESULTS', 'SEARCH_SCRAPE_TOP_N', 'intents', '_set_advisor_status', 'MAX_RESEARCH_QUEUE_SIZE', 'PLAYWRIGHT_TIMEOUT_MS', 'STATUS_MESSAGES', 'MAX_RESEARCH_CRAWL_DEPTH', '_audit_remaining_from_result', '_original_count', 'PLAYWRIGHT_HEADLESS', 'SEARCH_TIME_RANGE']
 
