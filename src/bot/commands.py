@@ -3249,6 +3249,21 @@ async def utilization_cmd(ctx: commands.Context):
         await ctx.send(f"❌ Credit utilization check failed: `{type(exc).__name__}: {exc}`")
 
 
+@bot.command(name="cashdrag", aliases=["idlecash", "hysa", "yield"])
+async def cashdrag_cmd(ctx: commands.Context, apy: Optional[float] = None):
+    """Audit uninvested idle checking cash, safe operating buffer, and lost high-yield interest."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.cash_drag import analyze_cash_drag, format_cash_drag_report
+        bench = (apy / 100.0) if apy is not None and apy > 0 else 0.045
+        with _open_verification_db(user_id=user_id) as vconn:
+            data = analyze_cash_drag(user_id=user_id, conn=vconn, benchmark_apy=bench)
+        report = format_cash_drag_report(data)
+        await ctx.send(report)
+    except Exception as exc:
+        await ctx.send(f"❌ Cash drag analysis failed: `{type(exc).__name__}: {exc}`")
+
+
 @bot.command(name="networth", aliases=["nw", "balancesheet"])
 async def networth_cmd(ctx: commands.Context):
     """View authoritative unified balance sheet, asset/debt breakdown, solvency rating, and net worth."""
