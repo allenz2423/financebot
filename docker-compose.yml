@@ -90,6 +90,7 @@ services:
       - OLLAMA_NUM_THREAD=16
     networks:
       - financebot-internal
+      - egress
     ports:
       - "11434:11434"
     deploy:

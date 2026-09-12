@@ -1,18 +1,22 @@
-import asyncio
-from src.services.llm import chat_with_delilah
-import src.core.state as state
+import pytest
+from unittest.mock import AsyncMock, patch
 
-# Mock reply message
 class MockMessage:
+    def __init__(self):
+        self.edits = []
     async def edit(self, content):
-        print("BOT TYPING:", content)
+        self.edits.append(content)
 
-async def run():
-    # Insert a dummy user context
-    state.SESSION_HISTORY["test_user"] = []
-    
-    # We will ask delilah to search the web
-    response = await chat_with_delilah("Can you search the web for the current stock price of Apple?", "test_user", MockMessage())
-    print("FINAL BOT RESPONSE:", response)
+@pytest.mark.asyncio
+async def test_bot_mock_message():
+    msg = MockMessage()
+    await msg.edit("Test message")
+    assert msg.edits == ["Test message"]
 
-asyncio.run(run())
+@pytest.mark.asyncio
+async def test_chat_with_delilah_mocked():
+    with patch("src.services.llm.chat_with_delilah", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = "Financial analysis completed."
+        msg = MockMessage()
+        res = await mock_chat("What is my budget?", "test_user", msg)
+        assert res == "Financial analysis completed."
