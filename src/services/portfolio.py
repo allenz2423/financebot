@@ -58,7 +58,7 @@ def calculate_rebalancing_drift(*, user_id: str, current_allocation: dict, targe
     }
 
 
-def set_holding(*, user_id: str, symbol: str, shares: float, cost_basis: float = 0.0, current_price: float = 0.0, asset_class: str = "Equities") -> dict:
+def set_holding(*, user_id: str, symbol: str, shares: float, cost_basis: float = 0.0, current_price: float = 0.0, asset_class: str = "Equities", conn: Optional[sqlite3.Connection] = None) -> dict:
     """Save or update an investment holding."""
     if not user_id or not isinstance(user_id, str):
         raise ValueError("set_holding: forced isolation violation")
@@ -69,12 +69,15 @@ def set_holding(*, user_id: str, symbol: str, shares: float, cost_basis: float =
     if shares < 0:
         raise ValueError("Shares cannot be negative.")
 
-    with sqlite3.connect(DB_PATH) as conn:
-        _ensure_tables(conn)
-        c = conn.cursor()
+    def _execute(db_conn: sqlite3.Connection) -> dict:
+        _ensure_tables(db_conn)
+        c = db_conn.cursor()
+        c.execute("SELECT id FROM investment_holdings WHERE user_id = ? AND symbol = ?", (user_id, sym))
+        existed = c.fetchone() is not None
+
         if shares == 0:
             c.execute("DELETE FROM investment_holdings WHERE user_id = ? AND symbol = ?", (user_id, sym))
-            conn.commit()
+            db_conn.commit()
             return {"status": "success", "action": "deleted", "symbol": sym}
 
         c.execute("""
@@ -87,20 +90,26 @@ def set_holding(*, user_id: str, symbol: str, shares: float, cost_basis: float =
                 asset_class = excluded.asset_class,
                 updated_at = datetime('now')
         """, (user_id, sym, shares, cost_basis, current_price, asset_class))
-        conn.commit()
+        db_conn.commit()
 
-    return {
-        "status": "success",
-        "action": "saved",
-        "symbol": sym,
-        "shares": shares,
-        "current_price": current_price,
-        "cost_basis": cost_basis,
-        "asset_class": asset_class
-    }
+        action = "updated" if existed else "created"
+        return {
+            "status": "success",
+            "action": action,
+            "symbol": sym,
+            "shares": shares,
+            "current_price": current_price,
+            "cost_basis": cost_basis,
+            "asset_class": asset_class
+        }
+
+    if conn is not None:
+        return _execute(conn)
+    with sqlite3.connect(DB_PATH) as db:
+        return _execute(db)
 
 
-def set_target_allocation(*, user_id: str, targets: Dict[str, float]) -> dict:
+def set_target_allocation(*, user_id: str, targets: Dict[str, float], conn: Optional[sqlite3.Connection] = None) -> dict:
     """Set target allocation percentages (e.g. {'VOO': 0.60, 'VXUS': 0.20, 'BND': 0.20})."""
     if not user_id or not isinstance(user_id, str):
         raise ValueError("set_target_allocation: forced isolation violation")
@@ -114,28 +123,32 @@ def set_target_allocation(*, user_id: str, targets: Dict[str, float]) -> dict:
         pct = val if total_pct <= 1.05 else val / 100.0
         normalized[sym.strip().upper()] = round(pct, 4)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        _ensure_tables(conn)
-        c = conn.cursor()
+    def _execute(db_conn: sqlite3.Connection) -> dict:
+        _ensure_tables(db_conn)
+        c = db_conn.cursor()
         c.execute("DELETE FROM portfolio_targets WHERE user_id = ?", (user_id,))
         for sym, pct in normalized.items():
             c.execute("""
                 INSERT INTO portfolio_targets (user_id, symbol, target_pct, updated_at)
                 VALUES (?, ?, ?, datetime('now'))
             """, (user_id, sym, pct))
-        conn.commit()
+        db_conn.commit()
+        return {"status": "success", "targets": normalized}
 
-    return {"status": "success", "targets": normalized}
+    if conn is not None:
+        return _execute(conn)
+    with sqlite3.connect(DB_PATH) as db:
+        return _execute(db)
 
 
-def get_portfolio_summary(*, user_id: str) -> dict:
+def get_portfolio_summary(*, user_id: str, conn: Optional[sqlite3.Connection] = None) -> dict:
     """Retrieve full portfolio status, asset allocation, and rebalancing recommendations."""
     if not user_id or not isinstance(user_id, str):
         raise ValueError("get_portfolio_summary: forced isolation violation")
 
-    with sqlite3.connect(DB_PATH) as conn:
-        _ensure_tables(conn)
-        c = conn.cursor()
+    def _execute(db_conn: sqlite3.Connection) -> dict:
+        _ensure_tables(db_conn)
+        c = db_conn.cursor()
         c.execute("""
             SELECT symbol, shares, cost_basis, current_price, asset_class
             FROM investment_holdings
@@ -147,63 +160,91 @@ def get_portfolio_summary(*, user_id: str) -> dict:
         c.execute("SELECT symbol, target_pct FROM portfolio_targets WHERE user_id = ?", (user_id,))
         targets_rows = c.fetchall()
 
-    targets = {sym: float(pct) for sym, pct in targets_rows}
+        targets = {sym: float(pct) for sym, pct in targets_rows}
 
-    holdings = []
-    total_val = 0.0
-    total_cost = 0.0
-    current_alloc = {}
-    asset_classes = {}
+        holdings = []
+        total_val = 0.0
+        total_cost = 0.0
+        current_alloc = {}
+        asset_classes = {}
 
-    for sym, shares, cost, price, a_class in holdings_rows:
-        shares = float(shares)
-        cost = float(cost or 0.0)
-        price = float(price or cost or 0.0)
-        val = shares * price
-        invested = shares * cost
-        pnl = val - invested
-        pnl_pct = (pnl / invested * 100.0) if invested > 0 else 0.0
+        for sym, shares, cost, price, a_class in holdings_rows:
+            shares = float(shares)
+            cost = float(cost or 0.0)
+            price = float(price or cost or 0.0)
+            val = shares * price
+            invested = shares * cost
+            pnl = val - invested
+            pnl_pct = (pnl / invested * 100.0) if invested > 0 else 0.0
 
-        total_val += val
-        total_cost += invested
-        current_alloc[sym] = val
-        asset_classes[a_class] = asset_classes.get(a_class, 0.0) + val
+            total_val += val
+            total_cost += invested
+            current_alloc[sym] = val
+            asset_classes[a_class] = asset_classes.get(a_class, 0.0) + val
 
-        holdings.append({
-            "symbol": sym,
-            "shares": shares,
-            "current_price": price,
-            "cost_basis": cost,
-            "value": round(val, 2),
-            "unrealized_pnl": round(pnl, 2),
-            "unrealized_pnl_pct": round(pnl_pct, 2),
-            "asset_class": a_class
-        })
+            holdings.append({
+                "symbol": sym,
+                "shares": shares,
+                "current_price": price,
+                "cost_basis": cost,
+                "value": round(val, 2),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+                "asset_class": a_class
+            })
 
-    total_pnl = total_val - total_cost
-    total_pnl_pct = (total_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
+        total_pnl = total_val - total_cost
+        total_pnl_pct = (total_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
 
-    rebalance_data = None
-    if targets and total_val > 0:
-        rebalance_data = calculate_rebalancing_drift(
-            user_id=user_id,
-            current_allocation=current_alloc,
-            target_allocation=targets,
-            total_portfolio_value=total_val
-        )
+        rebalance_data = None
+        if targets and total_val > 0:
+            rebalance_data = calculate_rebalancing_drift(
+                user_id=user_id,
+                current_allocation=current_alloc,
+                target_allocation=targets,
+                total_portfolio_value=total_val
+            )
 
-    return {
-        "status": "success",
-        "total_value": round(total_val, 2),
-        "total_cost": round(total_cost, 2),
-        "total_unrealized_pnl": round(total_pnl, 2),
-        "total_unrealized_pnl_pct": round(total_pnl_pct, 2),
-        "holdings_count": len(holdings),
-        "holdings": holdings,
-        "asset_classes": {k: round(v, 2) for k, v in asset_classes.items()},
-        "targets": targets,
-        "rebalance": rebalance_data
-    }
+        return {
+            "status": "success",
+            "total_value": round(total_val, 2),
+            "total_portfolio_value": round(total_val, 2),
+            "total_cost": round(total_cost, 2),
+            "total_unrealized_pnl": round(total_pnl, 2),
+            "total_unrealized_pnl_pct": round(total_pnl_pct, 2),
+            "holdings_count": len(holdings),
+            "total_holdings_count": len(holdings),
+            "holdings": holdings,
+            "asset_classes": {k: round(v, 2) for k, v in asset_classes.items()},
+            "targets": targets,
+            "rebalance": rebalance_data
+        }
+
+    if conn is not None:
+        return _execute(conn)
+    with sqlite3.connect(DB_PATH) as db:
+        return _execute(db)
+
+
+get_portfolio = get_portfolio_summary
+
+
+def calculate_portfolio_drift(*, user_id: str, targets: Optional[Dict[str, float]] = None, conn: Optional[sqlite3.Connection] = None) -> dict:
+    """Convenience helper to compute portfolio drift and rebalance orders."""
+    summary = get_portfolio_summary(user_id=user_id, conn=conn)
+    current_alloc = {h["symbol"]: h["value"] for h in summary.get("holdings", [])}
+    total_val = summary.get("total_value", 0.0)
+    target_alloc = targets or summary.get("targets", {})
+    if not target_alloc:
+        return {"status": "no_targets", "rebalance_orders": [], "asset_drift": {}, "total_drift_pct": 0.0}
+    res = calculate_rebalancing_drift(
+        user_id=user_id,
+        current_allocation=current_alloc,
+        target_allocation=target_alloc,
+        total_portfolio_value=total_val
+    )
+    res["rebalance_orders"] = res.get("recommended_trades", [])
+    return res
 
 
 def format_portfolio_report(*, user_id: str) -> str:

@@ -21,7 +21,7 @@ from src.services.reconciler import auto_reconcile_ledger
 from src.services.intelligence import calculate_lifestyle_creep, allocate_next_best_dollar
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
-from src.db.prefs import get_user_timezone, set_user_timezone
+from src.services.advisor_tools import NEW_50_TOOLS_SCHEMA, ADVISOR_TOOLS_DISPATCH
 
 import os
 import re
@@ -2711,7 +2711,7 @@ BOT_TOOLS_SCHEMA = [
             }
         }
     }
-]
+] + NEW_50_TOOLS_SCHEMA
 
 SCHEMA_TOOL_NAMES = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
 EXPECTED_TOOL_NAMES = {
@@ -2836,7 +2836,7 @@ EXPECTED_TOOL_NAMES = {
     "set_user_timezone",
     "get_user_timezone",
     "monitor_clear_all_rules"
-}
+} | set(ADVISOR_TOOLS_DISPATCH.keys())
 
 if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
     raise RuntimeError(
@@ -2846,6 +2846,13 @@ if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
 
 # Set of all mutation tools that should always commit to the database
 MUTATION_TOOLS = {
+    "set_portfolio_holding",
+    "delete_category_budget",
+    "add_recurring_bill",
+    "remove_recurring_bill",
+    "fund_savings_goal",
+    "delete_savings_goal",
+    "add_merchant_alias_mapping",
     "apply_transaction_roundups",
     "monitor_create_natural_rule",
     "tag_transaction_tax",
@@ -6930,6 +6937,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 state["resolved_url"] = resolved_url
                                 state["evidence"] = crawl_text
                                 db_result = crawl_text
+                    elif func_name in ADVISOR_TOOLS_DISPATCH:
+                        try:
+                            tool_fn = ADVISOR_TOOLS_DISPATCH[func_name]
+                            res = tool_fn(uid, args, conn)
+                            if isinstance(res, (dict, list)):
+                                db_result = json.dumps(res, indent=2)
+                            else:
+                                db_result = str(res)
+                        except Exception as e:
+                            db_result = f"Error executing {func_name}: {type(e).__name__}: {e}"
                     else:
                         db_result = f"Unknown tool '{func_name}'."
 
