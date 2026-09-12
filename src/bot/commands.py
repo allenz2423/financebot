@@ -1111,6 +1111,82 @@ async def dbstatus_command(ctx: commands.Context):
         await _send_error_embed(ctx, " DB Status Check Failed", exc, user_id=user_id)
 
 
+# ============================================================
+# Merchant Normalization & Canonicalization Commands
+# ============================================================
+
+@bot.group(name="merchants", aliases=["merchant"], invoke_without_command=True)
+async def merchants_group(ctx: commands.Context):
+    """View merchant normalization overview, suggested aliases, and uncanonicalized transactions."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.merchants import (
+            canonicalize_user_transactions,
+            suggest_merchant_aliases,
+            format_merchants_overview_embed,
+        )
+        stats = canonicalize_user_transactions(user_id=user_id, dry_run=True)
+        suggestions = suggest_merchant_aliases(user_id=user_id, limit=8)
+        embed = format_merchants_overview_embed(stats, suggestions)
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Merchants Overview Failed", exc, user_id=user_id)
+
+
+@merchants_group.command(name="clean")
+async def merchants_clean_subcmd(ctx: commands.Context, mode: str = "apply"):
+    """Normalize and canonicalize clean_merchant across user transactions (mode: apply or preview)."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.merchants import (
+            canonicalize_user_transactions,
+            format_merchants_overview_embed,
+        )
+        dry_run = mode.lower() in ("preview", "dry", "dryrun")
+        stats = canonicalize_user_transactions(user_id=user_id, dry_run=dry_run)
+        embed = format_merchants_overview_embed(stats, suggestions=[])
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        await _send_error_embed(ctx, "Merchant Canonicalization Failed", exc, user_id=user_id)
+
+
+@merchants_group.command(name="alias")
+async def merchants_alias_subcmd(ctx: commands.Context, *, mapping: str):
+    """Map a raw statement descriptor to a canonical merchant name (format: raw -> canonical [category])."""
+    user_id = str(ctx.author.id)
+    try:
+        from src.services.merchants import add_merchant_alias
+        if "->" not in mapping:
+            await ctx.send("ℹ️ Usage: `!merchants alias <raw_descriptor> -> <canonical_name> [category]`")
+            return
+        parts = mapping.split("->")
+        raw_alias = parts[0].strip()
+        canon_and_cat = parts[1].strip()
+        cat_match = re.search(r'\[(.*?)\]', canon_and_cat)
+        category = None
+        if cat_match:
+            category = cat_match.group(1).strip()
+            canon_and_cat = re.sub(r'\[.*?\]', '', canon_and_cat).strip()
+
+        res = add_merchant_alias(alias=raw_alias, canonical_name=canon_and_cat, category=category)
+        cat_text = f" [{res['category']}]" if res.get('category') else ""
+        await ctx.send(f"✅ Alias mapped: `{res['alias']}` ➔ **{res['canonical_name']}**{cat_text}")
+    except Exception as exc:
+        await _send_error_embed(ctx, "Add Merchant Alias Failed", exc, user_id=user_id)
+
+
+@bot.command(name="cleanmerchants", aliases=["canonicalize"])
+async def cleanmerchants_cmd(ctx: commands.Context, mode: str = "apply"):
+    """Quickly standardize all raw merchant names across your transaction ledger."""
+    await merchants_clean_subcmd(ctx, mode=mode)
+
+
+@bot.command(name="addalias")
+async def addalias_cmd(ctx: commands.Context, *, mapping: str):
+    """Map a raw merchant string to a clean name (e.g. !addalias TST* SWEETGREEN -> Sweetgreen)."""
+    await merchants_alias_subcmd(ctx, mapping=mapping)
+
+
 TRANSACTION_BROWSER_VIEWS: dict[int, set["_TransactionPageView"]] = {}
 
 

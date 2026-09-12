@@ -2594,6 +2594,47 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["name", "target_amount"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "canonicalize_transactions",
+            "description": "Normalizes and cleans messy raw statement descriptors in the user ledger, updating clean_merchant via canonical registry and intelligent POS heuristics.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, previews updates without committing changes."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_merchant_alias",
+            "description": "Registers an alias mapping from a raw statement descriptor to a canonical clean merchant name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alias": {
+                        "type": "string",
+                        "description": "Raw statement descriptor (e.g. 'TST* SWEETGREEN - SOHO')."
+                    },
+                    "canonical_name": {
+                        "type": "string",
+                        "description": "Clean canonical brand name (e.g. 'Sweetgreen')."
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Optional category (e.g. 'Dining Out', 'Groceries')."
+                    }
+                },
+                "required": ["alias", "canonical_name"]
+            }
+        }
     }
 ]
 
@@ -2692,6 +2733,8 @@ EXPECTED_TOOL_NAMES = {
     "get_unified_net_worth",
     "get_savings_goals_and_deficits",
     "set_savings_goal",
+    "canonicalize_transactions",
+    "add_merchant_alias",
     "explore_domain",
 
     "load_tool_schemas",
@@ -6026,6 +6069,19 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             target_amount=args.get("target_amount", 0.0),
                             target_date=args.get("target_date"),
                             category=args.get("category", "General"),
+                        )
+                    elif func_name == "canonicalize_transactions":
+                        from src.services.merchants import canonicalize_user_transactions
+                        db_result = canonicalize_user_transactions(
+                            user_id=uid,
+                            dry_run=args.get("dry_run", False),
+                        )
+                    elif func_name == "add_merchant_alias":
+                        from src.services.merchants import add_merchant_alias
+                        db_result = add_merchant_alias(
+                            alias=args.get("alias", ""),
+                            canonical_name=args.get("canonical_name", ""),
+                            category=args.get("category"),
                         )
 
 
