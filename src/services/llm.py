@@ -3,6 +3,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.db.prefs import get_user_timezone, set_user_timezone
 import src.core.state
@@ -12,6 +13,7 @@ from src.core.verification import verify_claim
 from src.db.memory import semantic_search_memory, save_epistemic_memory
 from src.core.temporal import get_temporal_projection
 from src.core.stochastic import calculate_stochastic_projection
+from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.db.prefs import get_user_timezone, set_user_timezone
 
@@ -674,6 +676,36 @@ async def process_transaction_batch(
 # Tool Schema — ALL TOOLS IN ONE PROPERLY FORMED LIST
 # ============================================================
 BOT_TOOLS_SCHEMA = [
+
+    {
+        "type": "function",
+        "function": {
+            "name": "simulate_what_if_scenario",
+            "description": "Parallel Universe Simulation Engine. Runs a full stochastic Monte Carlo cash flow projection and Zero-Based Budgeting analysis on an alternate reality where specific financial events occur, comparing it against the baseline reality.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scenario_name": {"type": "string", "description": "Name of the scenario (e.g. 'Buy a $30,000 Car')"},
+                    "days_ahead": {"type": "integer", "description": "Simulation horizon in days (default 30)"},
+                    "mutations": {
+                        "type": "array",
+                        "description": "List of financial mutations to apply to the alternate reality.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["add_cash", "add_subscription", "add_expense", "change_income"]},
+                                "amount": {"type": "number"},
+                                "name": {"type": "string", "description": "Description of the event"},
+                                "date": {"type": "string", "description": "YYYY-MM-DD (optional, for add_expense)"}
+                            }
+                        }
+                    }
+                },
+                "required": ["scenario_name", "mutations"]
+            }
+        }
+    },
+
 
     {
         "type": "function",
@@ -2440,6 +2472,7 @@ EXPECTED_TOOL_NAMES = {
     "semantic_search_memory",
     "save_epistemic_memory",
     "get_temporal_projection",
+    "simulate_what_if_scenario",
     "simulate_stochastic_cash_flow",
     "predict_next_paydays",
     "calculate_locked_liabilities",
@@ -5075,6 +5108,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = calculate_credit_float_velocity(uid)
                     elif func_name == "get_safe_to_spend_metrics":
                         db_result = get_safe_to_spend_metrics(uid)
+                    elif func_name == "simulate_what_if_scenario":
+                        db_result = run_what_if_scenario(
+                            user_id=uid,
+                            scenario_name=args.get("scenario_name", "Custom Scenario"),
+                            mutations=args.get("mutations", []),
+                            days_ahead=args.get("days_ahead", 30)
+                        )
                     elif func_name == "simulate_stochastic_cash_flow":
                         db_result = calculate_stochastic_projection(
                             user_id=uid,
