@@ -999,7 +999,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "explore_domain",
-            "description": "Hierarchical Tool Discovery: explore a domain to find relevant capabilities and tools. Pass 'all' to return the entire registry at once.",
+            "description": "Hierarchical Tool Discovery: explore a domain to find relevant capabilities and tools. ALWAYS pass 'all' to return the entire registry in one call — never call this per-domain, that wastes round-trips.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1013,7 +1013,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "load_tool_schemas",
-            "description": "Hierarchical Tool Discovery: load the full JSON schemas for one or more tools.",
+            "description": "Hierarchical Tool Discovery: load the full JSON schemas for one or more tools. ALWAYS batch ALL needed tool names into a single call — never call this multiple times for different tools.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3232,6 +3232,14 @@ You are HIGHLY ENCOURAGED to execute multiple disjoint tool calls concurrently i
 If you need to evaluate an inquiry across multiple dimensions (e.g. check cash balance + evaluate budget pacing + inspect upcoming bills + check credit utilization), DO NOT execute them sequentially across multiple turns.
 Emit ALL independent tool calls simultaneously in your immediate turn response to minimize latency and synthesize a multi-dimensional perspective.
 
+TOOL DISCOVERY BATCHING (CRITICAL — NEVER VIOLATE):
+- If you need to discover tools, ALWAYS call explore_domain("all") in a SINGLE call to get the full registry at once.
+  NEVER call explore_domain one domain at a time — that wastes N sequential round-trips unnecessarily.
+- After receiving the full registry, identify ALL tools you need for the request, then call load_tool_schemas ONCE with ALL needed tool names in a single batch array.
+  NEVER call load_tool_schemas multiple times for different tools — batch everything into one call.
+- Discovery sequence MUST be: 1x explore_domain("all") → 1x load_tool_schemas([all_needed_tools]) → then all real work calls in parallel.
+- If the tools you need are already in your available tool list, skip discovery entirely and call them directly.
+
 ==================================================
 THE DELILAH WEALTH OPERATING SYSTEM (ORDER OF OPERATIONS)
 ==================================================
@@ -4809,6 +4817,78 @@ CURRENT DATABASE FINANCIAL CONTEXT
     mutation_result_trace: list[dict[str, object]] = []
     research_ledger: dict[str, dict] = {}
     _RESEARCHED_MERCHANTS.set(set())
+
+    # ================================================================
+    # INTENT-BASED TOOL PRE-SEEDING
+    # ================================================================
+    # For broad financial queries the model would otherwise need 3-5
+    # sequential explore_domain + load_tool_schemas round-trips before
+    # being able to call any real tools. Pre-populate dynamically_loaded_tools
+    # here so the model starts turn 1 with the full tool set already
+    # unlocked, eliminating the discovery overhead entirely.
+    #
+    # The audit-mode gate in _tool_schema_for_mode() takes precedence —
+    # this only affects the non-audit path where core_tools union
+    # dynamically_loaded_tools is the effective allowlist.
+    # ================================================================
+    from src.core.discovery import CAPABILITY_REGISTRY as _REGISTRY  # local import to avoid circular at module level
+
+    # Flatten all tool names from the registry into one set.
+    _ALL_REGISTRY_TOOLS: set[str] = {
+        tool
+        for caps in _REGISTRY.values()
+        for tool_list in caps.values()
+        for tool in tool_list
+    }
+
+    # Terms that indicate a broad financial intent — pre-seed everything.
+    _broad_financial_terms = (
+        "reconcile",
+        "dashboard",
+        "position",
+        "cash flow",
+        "cashflow",
+        "net worth",
+        "digest",
+        "overview",
+        "summary",
+        "status",
+        "report",
+        "analyze",
+        "analysis",
+        "spending",
+        "budget",
+        "income",
+        "transaction",
+        "transactions",
+        "balance",
+        "balances",
+        "savings",
+        "debt",
+        "subscription",
+        "upcoming",
+        "planned",
+        "projection",
+        "audit",
+        "ledger",
+        "peek",
+        "check",
+        "how am i doing",
+        "financial health",
+    )
+
+    _prompt_lower = str(prompt_text or "").lower()
+    _is_broad_financial = any(term in _prompt_lower for term in _broad_financial_terms)
+
+    if _is_broad_financial and not gmail_only_turn:
+        # Expose ALL registry tools immediately — no discovery round-trips needed.
+        dynamically_loaded_tools: set[str] = set(_ALL_REGISTRY_TOOLS)
+        print(
+            f" [TOOL PRE-SEED] Broad financial intent detected. "
+            f"Pre-loaded {len(dynamically_loaded_tools)} tools — skipping discovery."
+        )
+    else:
+        dynamically_loaded_tools: set[str] = set()
 
     # Audit mode is a runtime contract, not merely a prompt suggestion.
 
