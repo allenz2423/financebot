@@ -105,3 +105,8 @@ Thumbs.db
 # ------------------------------------------------------------
 
 *_BACKUP_*
+
+# Subagent run artifacts
+.agents/
+ORIGINAL_REQUEST.md
+tests/stress_test_report.json

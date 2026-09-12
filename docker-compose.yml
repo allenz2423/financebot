@@ -4,6 +4,7 @@
 #   delilah           — Discord bot + advisor loop + financial monitor
 #   ollama            — LLM backend (GPU optional)
 #   searxng          — web search engine
+#   stirling-pdf     — PDF manipulation & form processing
 #   sandbox          — isolated Python/shell execution
 #   sandbox-installer — one-shot pip installs for the sandbox
 #   pypi-proxy       — Squid cache for sandbox pip installs
@@ -14,7 +15,7 @@
 #   3. docker logs delilah_bot -f
 #
 # All services run on an internal bridge network. Only delilah (port 8000),
-# searxng (8080), and ollama (11434) are exposed to the host.
+# searxng (8080), stirling-pdf (8085), and ollama (11434) are exposed to the host.
 
 name: financebot
 
@@ -52,9 +53,11 @@ services:
       - SANDBOX_SHELL_URL=http://sandbox:8100/shell
       - SANDBOX_INSTALL_URL=http://sandbox-installer:8100/install
       - SANDBOX_WORKSPACE_READ_URL=http://sandbox:8100/workspace/read
+      - STIRLING_PDF_URL=http://stirling-pdf:8080
       - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data
+      - sandbox-workspace:/workspace
     networks:
       - financebot-internal
       - egress
@@ -64,6 +67,7 @@ services:
       - ollama
       - searxng
       - sandbox
+      - stirling-pdf
     deploy:
       resources:
         reservations:
@@ -117,6 +121,29 @@ services:
       - egress
     ports:
       - "8080:8080"
+
+  # ============================================================
+  # Stirling PDF — PDF manipulation & form processing
+  # ============================================================
+  stirling-pdf:
+    image: frooodle/s-pdf:latest
+    container_name: financebot-stirling-pdf
+    restart: unless-stopped
+    networks:
+      - financebot-internal
+    ports:
+      - "8085:8080"
+    environment:
+      - DOCKER_ENABLE_SECURITY=false
+      - SECURITY_ENABLELOGIN=false
+      - INSTALL_BOOK_AND_ADVANCED_HTML_OPS=false
+      - SYSTEM_DEFAULTLOCALE=en-US
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/v1/info/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   # ============================================================
   # Sandbox — isolated Python/shell execution

@@ -2765,11 +2765,51 @@ BOT_TOOLS_SCHEMA = [
                 }
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_government_forms",
+            "description": "Searches for official government, tax, rebate, or credit PDF forms matching a plain-English description (e.g. 'Georgia homestead exemption', 'IRS Form 4506', 'HVAC utility rebate'). Returns the direct official PDF download URL, form title, and a concise summary of eligibility criteria and purpose.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Plain-English description or name of the government form, rebate, or tax credit (e.g., 'Georgia homestead exemption', 'IRS Form 4506', 'HVAC utility rebate')."
+                    }
+                },
+                "required": ["description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fill_pdf_form",
+            "description": "Downloads an official fillable PDF form from a URL, extracts its interactive fields, matches them with known user financial and profile data (e.g. name, address, SSN last 4, income, bank accounts), fills the form fields via Stirling PDF, and saves the completed PDF to the user's workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pdf_url": {
+                        "type": "string",
+                        "description": "Direct URL to the fillable PDF form."
+                    },
+                    "field_overrides": {
+                        "type": "object",
+                        "description": "Optional dictionary of field name to value overrides to apply."
+                    }
+                },
+                "required": ["pdf_url"]
+            }
+        }
     }
 ] + NEW_50_TOOLS_SCHEMA
 
 SCHEMA_TOOL_NAMES = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
 EXPECTED_TOOL_NAMES = {
+    "find_government_forms",
+    "fill_pdf_form",
     "search_gmail",
     "read_gmail_message",
     "read_gmail_thread",
@@ -7107,6 +7147,21 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 state["resolved_url"] = resolved_url
                                 state["evidence"] = crawl_text
                                 db_result = crawl_text
+                    elif func_name == "find_government_forms":
+                        desc = str(args.get("description") or args.get("query") or "").strip()
+                        if not desc:
+                            raise ValueError("description is required for find_government_forms")
+                        from src.services.forms import find_government_forms
+                        res = await find_government_forms(desc)
+                        db_result = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
+                    elif func_name == "fill_pdf_form":
+                        pdf_url = str(args.get("pdf_url") or "").strip()
+                        if not pdf_url:
+                            raise ValueError("pdf_url is required for fill_pdf_form")
+                        field_overrides = args.get("field_overrides") or {}
+                        from src.services.forms import fill_pdf_form
+                        res = await fill_pdf_form(pdf_url, field_overrides=field_overrides, user_id=uid)
+                        db_result = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
                     elif func_name in ADVISOR_TOOLS_DISPATCH:
                         try:
                             tool_fn = ADVISOR_TOOLS_DISPATCH[func_name]
