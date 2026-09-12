@@ -5280,48 +5280,67 @@ async def export_csv(ctx: commands.Context):
         await ctx.send(f" Export failed: {e}")
 
 
-@bot.command(name="chart")
-async def chart_spending(ctx: commands.Context, days: int = 30):
+@bot.command(name="chart", aliases=["graph", "plot"])
+async def chart_spending(ctx: commands.Context, *args):
+    """Visual dark-mode financial chart generator.
+
+    Usage:
+      !chart [days]            - Category spending breakdown (default: 30 days)
+      !chart category [days]   - Category spending breakdown
+      !chart cashflow [days]   - Daily cash inflow vs outflow trend
+      !chart networth [days]   - Net worth historical trajectory
+    """
     user_id = str(ctx.author.id)
-    import matplotlib.pyplot as plt
-    from io import BytesIO
-    import discord
+    chart_type = "category"
+    days = 30
+
+    if args:
+        first = str(args[0]).strip().lower()
+        if first.isdigit():
+            days = max(1, min(365, int(first)))
+        elif first in ("category", "categories", "cat", "spending", "spend"):
+            chart_type = "category"
+            if len(args) > 1 and str(args[1]).isdigit():
+                days = max(1, min(365, int(args[1])))
+        elif first in ("cashflow", "flow", "cash", "inflow", "outflow"):
+            chart_type = "cashflow"
+            if len(args) > 1 and str(args[1]).isdigit():
+                days = max(1, min(365, int(args[1])))
+        elif first in ("networth", "nw", "wealth", "trajectory"):
+            chart_type = "networth"
+            if len(args) > 1 and str(args[1]).isdigit():
+                days = max(7, min(730, int(args[1])))
+
     try:
-        user_id = str(ctx.author.id)
+        from io import BytesIO
+        import discord
+        from src.services.charts import (
+            generate_spending_chart_for_user,
+            generate_cash_flow_chart_for_user,
+            generate_net_worth_chart_for_user,
+        )
+
         with _open_verification_db(user_id=user_id) as vconn:
-            cur = vconn.cursor()
-            cur.execute('''
-                SELECT COALESCE(category, 'Uncategorized'), SUM(amount) 
-                FROM transactions 
-                WHERE user_id = ? AND status='Evaluated' AND amount > 0 AND merchant NOT LIKE '%System Balance Sync%' 
-                AND date >= date('now', ?)
-                GROUP BY COALESCE(category, 'Uncategorized')
-                ORDER BY SUM(amount) DESC LIMIT 10
-            ''', (f'-{days} days',))
-            rows = cur.fetchall()
-            
-        if not rows:
-            await ctx.send(f" No evaluated spending found in the last {days} days to chart.")
-            return
-            
-        labels = [r[0] for r in rows]
-        sizes = [r[1] for r in rows]
-        
-        plt.style.use('dark_background')
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, 
-               colors=plt.cm.tab20.colors, textprops={'fontsize': 10, 'color': 'white'})
-        ax.set_title(f"Spending Breakdown (Last {days} Days)", fontsize=16, pad=20, color='white')
-        
-        buf = BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', transparent=True)
-        buf.seek(0)
-        plt.close(fig)
-        
-        file = discord.File(fp=buf, filename="spending_chart.png")
-        await ctx.send(f" **Here is your spending breakdown for the last {days} days:**", file=file)
+            if chart_type == "cashflow":
+                png_bytes = generate_cash_flow_chart_for_user(user_id=user_id, days=days, conn=vconn)
+                filename = "cash_flow_chart.png"
+                title = f"Daily Cash Flow Trend (Last {days} Days)"
+            elif chart_type == "networth":
+                png_bytes = generate_net_worth_chart_for_user(user_id=user_id, days=days, conn=vconn)
+                filename = "net_worth_chart.png"
+                title = f"Net Worth Trajectory ({days} Days)"
+            else:
+                png_bytes = generate_spending_chart_for_user(user_id=user_id, days=days, conn=vconn)
+                filename = "spending_chart.png"
+                title = f"Spending Breakdown (Last {days} Days)"
+
+        file = discord.File(fp=BytesIO(png_bytes), filename=filename)
+        embed = discord.Embed(title=f"📊 {title}", color=0x3498DB)
+        embed.set_image(url=f"attachment://{filename}")
+        embed.set_footer(text="Delilah Financial OS · Autonomous Visual Analytics")
+        await ctx.send(embed=embed, file=file)
     except Exception as e:
-        await ctx.send(f" Chart generation failed: {e}")
+        await ctx.send(f"❌ Chart generation failed: {e}")
 
 class PlaidSetupModal(discord.ui.Modal, title="Plaid Credentials"):
     client_id = discord.ui.TextInput(label="PLAID_CLIENT_ID", required=False)
