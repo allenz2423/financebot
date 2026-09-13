@@ -272,22 +272,37 @@ def build_world_model_context(query: str, max_tokens: int = 180) -> str:
         "[ACTIVE ENTITIES]"
     ]
 
+    target_max_words = int(max_tokens * 0.75) if max_tokens else 135
+    current_words = 15
+
     for eid, e in list(entities.items())[:3]:
         attrs = [f"{k}: {v}" for k, v in list(e["attributes"].items())[:2]]
         attr_summary = ", ".join(attrs)
-        lines.append(f"• {eid} ({e['name']})" + (f" [{attr_summary}]" if attr_summary else ""))
+        line = f"• {eid} ({e['name']})" + (f" [{attr_summary}]" if attr_summary else "")
+        lines.append(line)
+        current_words += len(line.split())
 
     if claims:
         lines.append("")
         lines.append("[VERIFIED CLAIMS]")
         # Prioritize higher source authority
         sorted_claims = sorted(claims, key=lambda x: x.get("source_authority", 1), reverse=True)
-        for c in sorted_claims[:5]:
+        for c in sorted_claims:
             subj = c["subject_id"]
             pred = c["predicate"]
             obj = c.get("object_id") or c.get("scalar_value")
             auth = c.get("source_authority", 3)
-            lines.append(f"• {subj} -> {pred}: {obj} (Auth: {auth}/5)")
+            obj_str = str(obj)
+            max_obj_words = max(8, target_max_words - current_words - 8)
+            words = obj_str.split()
+            if len(words) > max_obj_words:
+                obj_str = " ".join(words[:max_obj_words]) + " ..."
+            claim_line = f"• {subj} -> {pred}: {obj_str} (Auth: {auth}/5)"
+            claim_word_count = len(claim_line.split())
+            if current_words + claim_word_count > target_max_words and len(lines) > 6:
+                break
+            lines.append(claim_line)
+            current_words += claim_word_count
 
     lines.append("==================================================")
     

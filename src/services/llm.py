@@ -6102,12 +6102,19 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                     elif func_name in ("semantic_search_memory", "get_memories"):
                         # Legacy fallback: transparently redirect to Active World Model
-                        q_arg = str(args.get("query") or "").strip()
-                        if q_arg:
+                        q_arg = str(args.get("query") or args.get("category") or "").strip()
+                        if q_arg and q_arg.lower() not in ("general", "all"):
                             res = search_world_model(q_arg, limit=args.get("top_k", 5))
                             db_result = json.dumps(res, indent=2)
                         else:
-                            db_result = json.dumps({"notice": "Direct memory tools sunset. Use search_world_model or get_world_model_entity."}, indent=2)
+                            # If called generically (e.g. get_memories() or get_memories(category='general')),
+                            # return the verified Active World Model ground truth context so the model has the exact data
+                            awm_block = build_world_model_context("schedule classes debts cuny", max_tokens=600)
+                            db_result = json.dumps({
+                                "status": "ACTIVE_WORLD_MODEL_VERIFIED_STATE",
+                                "context": awm_block,
+                                "notice": "Direct memory tools sunset in favor of Active World Model Knowledge Graph."
+                            }, indent=2)
                     elif func_name in ("save_epistemic_memory", "save_memory"):
                         # Legacy fallback: redirect to assert_claim
                         content_str = str(args.get("content") or "").strip()
