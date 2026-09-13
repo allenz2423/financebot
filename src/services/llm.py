@@ -3822,7 +3822,7 @@ RUNTIME CONTRACT:
     awm_context = ""
     if context_policy["include_session_history"]:
         try:
-            awm_context = build_world_model_context(prompt_text, max_tokens=300)
+            awm_context = build_world_model_context(prompt_text, max_tokens=300, user_id=uid)
         except Exception as e:
             awm_context = ""
 
@@ -6109,7 +6109,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         else:
                             # If called generically (e.g. get_memories() or get_memories(category='general')),
                             # return the verified Active World Model ground truth context so the model has the exact data
-                            awm_block = build_world_model_context("schedule classes debts cuny", max_tokens=600)
+                            awm_block = build_world_model_context("schedule classes debts cuny", max_tokens=600, user_id=uid)
                             db_result = json.dumps({
                                 "status": "ACTIVE_WORLD_MODEL_VERIFIED_STATE",
                                 "context": awm_block,
@@ -6120,7 +6120,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         content_str = str(args.get("content") or "").strip()
                         pred_str = str(args.get("memory_type") or "fact").strip().lower()
                         cid = assert_claim(
-                            subject_id="user:primary",
+                            subject_id=f"user:{uid}",
                             predicate=pred_str,
                             scalar_value=content_str,
                             provenance_type="USER_STATED" if args.get("provenance_type") == "user_stated" else "INFERRED",

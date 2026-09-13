@@ -18,6 +18,19 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from src.core.state import DB_PATH
 
+def get_primary_user_id() -> str:
+    """Retrieve canonical primary user_id from user_info, falling back to active user."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM user_info LIMIT 1")
+            row = c.fetchone()
+            if row and row[0]:
+                return str(row[0]).strip()
+    except Exception:
+        pass
+    return "342385739952160769"
+
 def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -247,16 +260,19 @@ def get_entity_subgraph(
 # 4. COMPACT CONTEXT ASSEMBLER (<150 TOKENS)
 # ============================================================
 
-def build_world_model_context(query: str, max_tokens: int = 180) -> str:
+def build_world_model_context(query: str, max_tokens: int = 180, user_id: Optional[str] = None) -> str:
     """
     Generates a structured, high-density context block for Delilah's LLM prompt.
     Replaces the brute-force 58-bullet raw memory dump with verified relational facts.
+    Scoped to user:<user_id>.
     """
     matched_eids = resolve_entities(query)
+    target_user_id = str(user_id or get_primary_user_id()).strip()
+    user_anchor = f"user:{target_user_id}"
     
-    # If no specific entities matched, always default to primary user profile anchor
-    if "person:allen" not in matched_eids:
-        matched_eids.append("person:allen")
+    # If no specific user entity matched, default to primary user profile anchor
+    if user_anchor not in matched_eids:
+        matched_eids.append(user_anchor)
 
     subgraph = get_entity_subgraph(matched_eids[:3], depth=1)
     entities = subgraph["entities"]
