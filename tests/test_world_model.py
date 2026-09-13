@@ -143,3 +143,48 @@ def test_audit_world_model_health():
     assert health["entity_count"] >= 5
     assert health["active_claims_count"] >= 5
 
+def test_get_world_model_entity_and_dossier(clean_test_entities):
+    from src.services.world_model import get_world_model_entity, get_world_model_dossier
+    res = get_world_model_entity("Acme Corporation")
+    assert "entity" in res
+    assert res["entity"]["id"] == "test_org:acme_corp"
+    assert "claims" in res
+
+    # Check non-existent
+    missing = get_world_model_entity("non_existent_entity_xyz")
+    assert "error" in missing
+
+    # Check dossier query
+    dossier = get_world_model_dossier("cuny_aid_disbursement_2026")
+    assert "doc_id" in dossier
+    assert "CSI Fall 2026" in dossier["title"]
+
+def test_search_world_model():
+    from src.services.world_model import search_world_model
+    results = search_world_model("CUNY aid tuition")
+    assert len(results) > 0
+    found_targets = [r["target_id"] for r in results]
+    assert any("cuny" in t for t in found_targets)
+
+def test_retract_world_model_claim(clean_test_entities):
+    from src.services.world_model import assert_claim, retract_world_model_claim, get_entity_subgraph
+    cid = assert_claim(
+        subject_id="test_person:bob",
+        predicate="security_clearance",
+        scalar_value="Level 3",
+        provenance_type="DIRECT_OBSERVATION",
+        source_authority=5
+    )
+    # Verify active
+    sub1 = get_entity_subgraph(["test_person:bob"])
+    assert any(c["claim_id"] == cid for c in sub1["claims"])
+
+    # Retract
+    ret_res = retract_world_model_claim(cid)
+    assert ret_res["status"] == "RETRACTED"
+
+    # Verify no longer active in subgraph
+    sub2 = get_entity_subgraph(["test_person:bob"])
+    assert not any(c["claim_id"] == cid for c in sub2["claims"])
+
+

@@ -28,7 +28,11 @@ from src.services.world_model import (
     upsert_entity,
     assert_claim,
     run_counterfactual_comparison,
-    audit_world_model_health
+    audit_world_model_health,
+    get_world_model_entity,
+    search_world_model,
+    get_world_model_dossier,
+    retract_world_model_claim
 )
 
 import os
@@ -2405,6 +2409,116 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "get_world_model_entity",
+            "description": "Look up an entity in the Active World Model Knowledge Graph (e.g. 'cuny_hpc', 'discover_it', 'apple_upgrade', 'person:allen'). Returns full profile, attributes, verified active claims, and attached dossiers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_id_or_name": {
+                        "type": "string",
+                        "description": "Entity ID (e.g. 'org:cuny_hpc') or plain name/alias (e.g. 'CUNY HPC', 'Discover', 'Apple Upgrade')."
+                    }
+                },
+                "required": ["entity_id_or_name"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_world_model",
+            "description": "Full-text search across all entities, claims, and dossiers in the Active World Model Knowledge Graph using BM25 index.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search phrase (e.g. 'fws cap', 'seek stipend', 'fragrance freeze', 'tuition rate')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 5)."
+                    }
+                },
+                "required": ["query"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_world_model_dossier",
+            "description": "Retrieve a detailed markdown dossier/document from the Active World Model (e.g. 'cuny_aid_disbursement_2026', 'delilah_system_protocols', 'apple_macbook_upgrade_evaluation').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doc_id_or_title": {
+                        "type": "string",
+                        "description": "Dossier ID or title snippet."
+                    }
+                },
+                "required": ["doc_id_or_title"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assert_world_model_claim",
+            "description": "Assert a verified fact or relationship into the Active World Model Knowledge Graph. Automatically manages bi-temporal validity and history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject_id": {
+                        "type": "string",
+                        "description": "Subject entity ID (e.g. 'person:allen', 'org:cuny_hpc', 'liability:discover_it')."
+                    },
+                    "predicate": {
+                        "type": "string",
+                        "description": "Relationship or property name (e.g. 'hourly_wage', 'employed_by', 'owes_debt_to', 'target_graduation')."
+                    },
+                    "object_id": {
+                        "type": "string",
+                        "description": "Target entity ID if pointing to another entity (e.g. 'org:cuny_hpc')."
+                    },
+                    "scalar_value": {
+                        "type": "string",
+                        "description": "Scalar value if property is a number, string, or boolean (e.g. '17.00', '2026-10-29', 'true')."
+                    },
+                    "provenance_type": {
+                        "type": "string",
+                        "enum": ["USER_STATED", "DIRECT_OBSERVATION", "DOCUMENT", "CALCULATION"],
+                        "description": "Evidence source category."
+                    },
+                    "source_authority": {
+                        "type": "integer",
+                        "description": "Authority confidence score from 1 (low) to 5 (highest, official document / user direct instruction)."
+                    }
+                },
+                "required": ["subject_id", "predicate"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retract_world_model_claim",
+            "description": "Retract an existing claim in the Active World Model by claim ID when it is no longer valid or has been superseded.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim_id": {
+                        "type": "string",
+                        "description": "Claim ID to retract."
+                    }
+                },
+                "required": ["claim_id"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "schedule_reminder",
             "description": "Schedule a time-based reminder. You can pass an exact time like 'YYYY-MM-DD HH:MM:SS' OR use relative math like '+30s', '+5m', '+2h', '+1d'. ALWAYS prefer relative math when the user asks for 'in X minutes/seconds' so Python handles the math for you.",
             "parameters": {
@@ -3060,6 +3174,11 @@ EXPECTED_TOOL_NAMES = {
     "explain_world_model_claim",
     "simulate_counterfactual_scenario",
     "audit_cognitive_health",
+    "get_world_model_entity",
+    "search_world_model",
+    "get_world_model_dossier",
+    "assert_world_model_claim",
+    "retract_world_model_claim",
     "crawl_deeper",
     "send_push_alert",
     "schedule_reminder",
@@ -3592,8 +3711,8 @@ NO HALLUCINATED EXITS: Never invent user instructions such as "sum it up", "wrap
 WEB: search_web (external facts), fetch_webpage (returned-page verification)
 CODE / MATH: run_python_sandbox (Python, calculations, statistics, simulations, charts)
 SHELL / TESTING: run_shell
-PACKAGES: install_python_package for a missing module, then retry the failed operation
 MEMORY: get_memories, save_memory, delete_memory
+ACTIVE WORLD MODEL: get_world_model_entity (query entity & verified claims), search_world_model (BM25 search across knowledge graph), get_world_model_dossier (pull full markdown dossier), assert_world_model_claim (record new facts/relationships), retract_world_model_claim (revoke stale claims), explain_world_model_claim (audit claim provenance), simulate_counterfactual_scenario (What-If scenario simulation), audit_cognitive_health (verify graph consistency). ALWAYS use get_world_model_entity or search_world_model to verify facts about institutions, debts, employers, aid, or user terms before inventing SQL tables or guessing.
 TRANSACTION CONTEXT: tag_transaction_context (purchase context), log_lifestyle_context (lifestyle context)
 
 ==================================================
@@ -7307,6 +7426,54 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     elif func_name == "audit_cognitive_health":
                         health = audit_world_model_health()
                         db_result = json.dumps(health, indent=2)
+                    elif func_name == "get_world_model_entity":
+                        target = str(args.get("entity_id_or_name", "")).strip()
+                        if not target:
+                            db_result = "ERROR: entity_id_or_name is required."
+                        else:
+                            res = get_world_model_entity(target)
+                            db_result = json.dumps(res, indent=2)
+                    elif func_name == "search_world_model":
+                        query_str = str(args.get("query", "")).strip()
+                        limit_val = int(args.get("limit", 5))
+                        if not query_str:
+                            db_result = "ERROR: query is required."
+                        else:
+                            res = search_world_model(query_str, limit=limit_val)
+                            db_result = json.dumps(res, indent=2)
+                    elif func_name == "get_world_model_dossier":
+                        doc_target = str(args.get("doc_id_or_title", "")).strip()
+                        if not doc_target:
+                            db_result = "ERROR: doc_id_or_title is required."
+                        else:
+                            res = get_world_model_dossier(doc_target)
+                            db_result = json.dumps(res, indent=2)
+                    elif func_name == "assert_world_model_claim":
+                        s_id = str(args.get("subject_id", "")).strip()
+                        pred = str(args.get("predicate", "")).strip()
+                        o_id = args.get("object_id")
+                        s_val = args.get("scalar_value")
+                        p_type = str(args.get("provenance_type", "USER_STATED"))
+                        s_auth = int(args.get("source_authority", 4))
+                        if not s_id or not pred:
+                            db_result = "ERROR: subject_id and predicate are required."
+                        else:
+                            cid = assert_claim(
+                                subject_id=s_id,
+                                predicate=pred,
+                                object_id=str(o_id).strip() if o_id else None,
+                                scalar_value=s_val,
+                                provenance_type=p_type,
+                                source_authority=s_auth
+                            )
+                            db_result = json.dumps({"status": "ASSERTED", "claim_id": cid, "subject_id": s_id, "predicate": pred}, indent=2)
+                    elif func_name == "retract_world_model_claim":
+                        cid = str(args.get("claim_id", "")).strip()
+                        if not cid:
+                            db_result = "ERROR: claim_id is required."
+                        else:
+                            res = retract_world_model_claim(cid)
+                            db_result = json.dumps(res, indent=2)
                     elif func_name == "schedule_reminder":
                         c.execute(
                             "CREATE TABLE IF NOT EXISTS scheduled_reminders "

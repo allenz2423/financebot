@@ -9,6 +9,7 @@ Provides:
 - Explainability engine tracing claims to parent sources and raw documents.
 """
 
+import re
 import sqlite3
 import json
 import uuid
@@ -76,14 +77,15 @@ def resolve_entities(query: str) -> List[str]:
         for row in c.fetchall():
             eid = row["entity_id"]
             name = row["canonical_name"].lower()
-            if name in normalized_q or eid.lower() in normalized_q:
+            # Word boundary matching to avoid partial substrings (e.g. 'me' matching 'Acme')
+            if re.search(r"\b" + re.escape(name) + r"\b", normalized_q) or eid.lower() in normalized_q:
                 matched_ids.add(eid)
                 continue
             
             try:
                 aliases = json.loads(row["aliases"]) if row["aliases"] else []
                 for alias in aliases:
-                    if alias.lower() in normalized_q:
+                    if re.search(r"\b" + re.escape(alias.lower()) + r"\b", normalized_q):
                         matched_ids.add(eid)
                         break
             except Exception:
@@ -324,6 +326,128 @@ def explain_claim(claim_id: str) -> Dict[str, Any]:
         data["parents"] = parents
 
         return data
+
+# ============================================================
+# 5b. COMPREHENSIVE QUERY & MANAGEMENT FUNCTIONS
+# ============================================================
+
+def get_world_model_entity(entity_id_or_name: str) -> Dict[str, Any]:
+    """
+    Retrieve full profile and active claims for an entity by ID or name/alias.
+    """
+    resolved = resolve_entities(entity_id_or_name)
+    target_id = resolved[0] if resolved else entity_id_or_name.strip().lower()
+
+    with _get_connection() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT entity_id, entity_type, canonical_name, aliases, attributes, created_at
+            FROM kg_entities WHERE entity_id = ?
+        """, (target_id,))
+        ent_row = c.fetchone()
+        if not ent_row:
+            # Fallback exact canonical_name search
+            c.execute("""
+                SELECT entity_id, entity_type, canonical_name, aliases, attributes, created_at
+                FROM kg_entities WHERE lower(canonical_name) = ?
+            """, (entity_id_or_name.strip().lower(),))
+            ent_row = c.fetchone()
+            if not ent_row:
+                return {"error": f"Entity '{entity_id_or_name}' not found in Active World Model."}
+            target_id = ent_row["entity_id"]
+
+        subgraph = get_entity_subgraph([target_id], depth=1)
+        entity_info = dict(ent_row)
+        entity_info["id"] = entity_info["entity_id"]
+        entity_info["aliases"] = json.loads(entity_info["aliases"]) if entity_info["aliases"] else []
+        entity_info["attributes"] = json.loads(entity_info["attributes"]) if entity_info["attributes"] else {}
+
+        # Also check for attached dossier
+        c.execute("SELECT doc_id, title, content, tags, updated_at FROM kg_dossiers WHERE primary_entity_id = ?", (target_id,))
+        dossier_rows = [dict(r) for r in c.fetchall()]
+
+        return {
+            "entity": entity_info,
+            "claims": subgraph["claims"],
+            "dossiers": dossier_rows
+        }
+
+def search_world_model(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Full-text BM25 search across all entities and dossiers in the Active World Model.
+    """
+    words = [w for w in re_words(query) if len(w) > 1]
+    if not words:
+        return []
+
+    fts_query = " OR ".join(f'"{w}"' for w in words[:6])
+    results = []
+
+    with _get_connection() as conn:
+        c = conn.cursor()
+        try:
+            c.execute("""
+                SELECT target_id, target_type, title, content, tags, rank
+                FROM kg_search_fts
+                WHERE kg_search_fts MATCH ?
+                ORDER BY rank LIMIT ?
+            """, (fts_query, limit))
+            for row in c.fetchall():
+                res = dict(row)
+                if res["target_type"] == "entity":
+                    # Fetch basic entity info
+                    c.execute("SELECT entity_type, canonical_name, attributes FROM kg_entities WHERE entity_id = ?", (res["target_id"],))
+                    e = c.fetchone()
+                    if e:
+                        res["entity_type"] = e["entity_type"]
+                        res["canonical_name"] = e["canonical_name"]
+                        res["attributes"] = json.loads(e["attributes"]) if e["attributes"] else {}
+                results.append(res)
+        except Exception as err:
+            return [{"error": f"FTS search error: {err}"}]
+
+    return results
+
+def get_world_model_dossier(doc_id_or_title: str) -> Dict[str, Any]:
+    """
+    Retrieve a specific knowledge dossier document from the Active World Model.
+    """
+    with _get_connection() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT doc_id, primary_entity_id, title, content, tags, updated_at
+            FROM kg_dossiers WHERE doc_id = ? OR lower(title) LIKE ?
+        """, (doc_id_or_title, f"%{doc_id_or_title.strip().lower()}%"))
+        row = c.fetchone()
+        if not row:
+            return {"error": f"Dossier '{doc_id_or_title}' not found."}
+        return dict(row)
+
+def retract_world_model_claim(claim_id: str) -> Dict[str, Any]:
+    """
+    Retract an active claim by setting tx_retracted_at = now (preserving auditability).
+    """
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with _get_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT claim_id, subject_id, predicate, tx_retracted_at FROM kg_claims WHERE claim_id = ?", (claim_id,))
+        row = c.fetchone()
+        if not row:
+            return {"error": f"Claim '{claim_id}' not found."}
+        if row["tx_retracted_at"]:
+            return {"status": "ALREADY_RETRACTED", "claim_id": claim_id, "retracted_at": row["tx_retracted_at"]}
+
+        c.execute("UPDATE kg_claims SET tx_retracted_at = ? WHERE claim_id = ?", (now_utc, claim_id))
+        conn.commit()
+
+    return {
+        "status": "RETRACTED",
+        "claim_id": claim_id,
+        "subject_id": row["subject_id"],
+        "predicate": row["predicate"],
+        "retracted_at": now_utc
+    }
+
 
 # ============================================================
 # 6. DETERMINISTIC SIMULATION & CASH-FLOW PROJECTION (PHASE 2)
