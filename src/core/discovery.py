@@ -31,10 +31,10 @@ CAPABILITY_REGISTRY = {
         "Search & Extract": ["search_web", "fetch_webpage", "crawl_deeper"],
         "Merchants": ["get_known_merchant", "save_known_merchant", "get_unique_unregistered_merchants"],
     },
-    "Epistemic Memory": {
-        "Query": ["semantic_search_memory"],
-        "Save": ["save_epistemic_memory"],
-        "Delete": ["delete_memory"],
+    "Active World Model": {
+        "Entities": ["get_world_model_entity", "search_world_model", "get_world_model_dossier"],
+        "Claims": ["assert_world_model_claim", "retract_world_model_claim", "explain_world_model_claim"],
+        "Health & Simulation": ["audit_cognitive_health", "simulate_counterfactual_scenario"],
         "Context": ["tag_transaction_context", "get_transactions_by_context", "log_lifestyle_context", "get_lifestyle_context"],
     },
     "Analysis & Sandbox": {

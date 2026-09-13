@@ -1084,40 +1084,7 @@ BOT_TOOLS_SCHEMA = [
     },
 
 
-    {
-        "type": "function",
-        "function": {
-            "name": "semantic_search_memory",
-            "description": "Query the structured Epistemic Memory system using semantic meaning. Retrieves facts, preferences, hypotheses, and goals.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer", "description": "Number of results to retrieve (default 5)."},
-                    "min_confidence": {"type": "number", "description": "Minimum confidence threshold (0.0 to 1.0). Use higher for hard facts, lower for hypotheses."}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_epistemic_memory",
-            "description": "Save a structured memory with strict provenance and confidence. Do not save speculations as hard facts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                    "memory_type": {"type": "string", "enum": ["fact", "preference", "event", "goal", "decision", "pattern", "hypothesis"]},
-                    "provenance_type": {"type": "string", "enum": ["user_stated", "llm_inferred", "deterministic_calculation"]},
-                    "confidence": {"type": "number", "description": "Confidence from 0.0 to 1.0"},
-                    "evidence_refs": {"type": "array", "items": {"type": "string"}, "description": "JSON array of evidence strings (e.g. 'Transaction ID 123', 'User chat on 2026-09-11')"}
-                },
-                "required": ["content", "memory_type", "provenance_type", "confidence"]
-            }
-        }
-    },
+
 
 
     {
@@ -3141,8 +3108,6 @@ EXPECTED_TOOL_NAMES = {
 
     "load_tool_schemas",
     "verify_claim",
-    "semantic_search_memory",
-    "save_epistemic_memory",
     "get_temporal_projection",
     "save_to_knowledge_base",
     "query_knowledge_base",
@@ -6188,22 +6153,27 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             user_id=uid,
                             days_ahead=args.get("days_ahead", 90)
                         )
-                    elif func_name == "semantic_search_memory":
-                        db_result = await semantic_search_memory(
-                            user_id=uid,
-                            query=args.get("query", ""),
-                            top_k=args.get("top_k", 5),
-                            min_confidence=args.get("min_confidence", 0.0)
+                    elif func_name in ("semantic_search_memory", "get_memories"):
+                        # Legacy fallback: transparently redirect to Active World Model
+                        q_arg = str(args.get("query") or "").strip()
+                        if q_arg:
+                            res = search_world_model(q_arg, limit=args.get("top_k", 5))
+                            db_result = json.dumps(res, indent=2)
+                        else:
+                            db_result = json.dumps({"notice": "Direct memory tools sunset. Use search_world_model or get_world_model_entity."}, indent=2)
+                    elif func_name in ("save_epistemic_memory", "save_memory"):
+                        # Legacy fallback: redirect to assert_claim
+                        content_str = str(args.get("content") or "").strip()
+                        pred_str = str(args.get("memory_type") or "fact").strip().lower()
+                        cid = assert_claim(
+                            subject_id="user:primary",
+                            predicate=pred_str,
+                            scalar_value=content_str,
+                            provenance_type="USER_STATED" if args.get("provenance_type") == "user_stated" else "INFERRED",
+                            source_authority=4 if args.get("provenance_type") == "user_stated" else 3,
+                            valid_from=datetime.date.today().isoformat(),
                         )
-                    elif func_name == "save_epistemic_memory":
-                        db_result = await save_epistemic_memory(
-                            user_id=uid,
-                            content=args.get("content", ""),
-                            memory_type=args.get("memory_type", "fact"),
-                            provenance_type=args.get("provenance_type", "llm_inferred"),
-                            confidence=args.get("confidence", 0.5),
-                            evidence_refs=args.get("evidence_refs", [])
-                        )
+                        db_result = json.dumps({"status": "SUCCESS", "claim_id": cid, "migrated_to": "Active World Model"}, indent=2)
                     elif func_name == "explore_domain":
                         db_result = explore_domain(args.get("domain", ""))
                     elif func_name == "load_tool_schemas":

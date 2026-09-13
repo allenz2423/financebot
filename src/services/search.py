@@ -976,6 +976,11 @@ async def search_searxng(
             ),
         }
 
+    # Strip outer and inner restrictive quotes/brackets that break SearXNG/Bing matching
+    # (e.g. '"Summer 2027" software engineering' -> 'Summer 2027 software engineering')
+    clean_q = re.sub(r'[\"\'\`\[\]\(\)]', ' ', q)
+    clean_q = re.sub(r'\s+', ' ', clean_q).strip()
+
     now = time.time()
     fingerprint = _query_fingerprint(q)
 
@@ -989,33 +994,42 @@ async def search_searxng(
     if effective_time_range not in {None, "day", "week", "month", "year"}:
         effective_time_range = None
 
-    engines = [
-        "bing",
-        "yahoo",
-        "qwant",
-        "google",
-    ][:max(1, MAX_SEARCH_ENGINES_PER_QUERY)]
+    # Use reliable, active SearXNG engines
+    # 'duckduckgo web' and 'bing' are confirmed working; include 'github' for repo/code searches.
+    base_engines = ["duckduckgo web", "bing"]
+    if any(term in q.lower() for term in ("github", "repo", "tracker", "list", "internship", "project")):
+        base_engines.append("github")
+    engines = base_engines[:max(2, MAX_SEARCH_ENGINES_PER_QUERY)]
 
     candidates: list[dict] = []
 
-    async with _search_semaphore:
-        async with httpx.AsyncClient(timeout=SEARCH_HTTP_TIMEOUT) as client:
-            responses = await asyncio.gather(
-                *[
-                    _searxng_engine_query(
-                        client,
-                        q,
-                        engine,
-                        effective_time_range,
-                    )
-                    for engine in engines
-                ],
-                return_exceptions=True,
-            )
+    # Try clean unquoted query first, but if clean_q != q and returns 0 candidates, fallback
+    search_queries = [clean_q] if clean_q else [q]
+    if clean_q and clean_q != q:
+        search_queries.append(q)
 
-    for response in responses:
-        if isinstance(response, list):
-            candidates.extend(response)
+    for query_variant in search_queries:
+        async with _search_semaphore:
+            async with httpx.AsyncClient(timeout=SEARCH_HTTP_TIMEOUT) as client:
+                responses = await asyncio.gather(
+                    *[
+                        _searxng_engine_query(
+                            client,
+                            query_variant,
+                            engine,
+                            effective_time_range,
+                        )
+                        for engine in engines
+                    ],
+                    return_exceptions=True,
+                )
+
+        for response in responses:
+            if isinstance(response, list):
+                candidates.extend(response)
+
+        if candidates:
+            break
 
     excluded = {
         _canonical_url(str(u))
