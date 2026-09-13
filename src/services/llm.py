@@ -3817,71 +3817,18 @@ RUNTIME CONTRACT:
         else "(financial context intentionally withheld for this Gmail-only turn)"
     )
 
-    # Pull existing memories so the model knows what it already has.
-    # Gmail-only turns are a hard isolation boundary: persisted memories may
-    # contain financial or other unrelated user data and must not be exposed.
-    if context_policy["include_session_history"]:
-        # Pinned memories are ALWAYS included in full, on top of the rolling
-        # 40-most-recent list, so durable facts never silently age out.
-        c.execute(
-            """SELECT category, content FROM delilah_memories
-            WHERE user_id = ? AND is_active = 1 AND is_pinned = 1
-            ORDER BY datetime(created_at) DESC LIMIT 50""", (uid,)
-        )
-        _pinned_rows = c.fetchall()
-
-        c.execute(
-            """SELECT category, content FROM delilah_memories
-            WHERE user_id = ? AND is_active = 1 AND is_pinned = 0
-            ORDER BY datetime(created_at) DESC LIMIT 40""", (uid,)
-        )
-        _memory_rows = c.fetchall()
-
-        _memory_parts = []
-        if _pinned_rows:
-            _memory_parts.append(" PINNED (always shown):")
-            _memory_parts.extend(
-                f"- [{cat}] {cont}" for cat, cont in _pinned_rows
-            )
-        if _memory_rows:
-            if _pinned_rows:
-                _memory_parts.append("")
-            _memory_parts.append("Recent:")
-            _memory_parts.extend(
-                f"- [{cat}] {cont}" for cat, cont in _memory_rows
-            )
-        _memory_context = (
-            "\n".join(_memory_parts)
-            if _memory_parts
-            else "(no memories stored yet)"
-        )
-    else:
-        _pinned_rows = []
-        _memory_rows = []
-        _memory_parts = []
-        _memory_context = (
-            "(user memories intentionally withheld for this Gmail-only turn)"
-        )
-
-    # Static system_prompt (instructions only) is kept byte-identical across
-    # turns so its KV-cache prefix can be reused. Volatile data (timestamp,
-    # live financial context, memories, world model) is injected as a SEPARATE system
-    # message placed right before the user turn, so only that small trailing
-    # block needs reprocessing each turn instead of invalidating everything
-    # after the first changed byte in one giant system string.
+    # All facts, identities, debts, schedules, and policies are managed
+    # exclusively via the Active World Model (kg_entities, kg_claims, kg_dossiers).
     awm_context = ""
     if context_policy["include_session_history"]:
         try:
-            awm_context = build_world_model_context(prompt_text, max_tokens=180)
+            awm_context = build_world_model_context(prompt_text, max_tokens=300)
         except Exception as e:
             awm_context = ""
 
     volatile_context = f"""
 {awm_context}
 
-EXISTING MEMORIES — DO NOT RE-SAVE THESE
-========================================
-{_memory_context}
 CURERENT SYSTEM DATE & TIME: {current_time}
 
 CURRENT DATABASE FINANCIAL CONTEXT
@@ -7270,20 +7217,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = get_lifestyle_context(
                             days=args.get("days", 90), limit=args.get("limit", 20)
                         , user_id=uid)
-                    elif func_name == "save_memory":
-                        db_result = save_memory(
-                            content=args.get("content"),
-                            category=args.get("category", "general"),
-                            importance=args.get("importance", "normal"),
-                            pinned=bool(args.get("pinned", False)),
-                         user_id=uid)
-                    elif func_name == "get_memories":
-                        db_result = get_memories(
-                            category=args.get("category"),
-                            days=args.get("days", 90),
-                            limit=args.get("limit", 20),
-                            offset=args.get("offset", 0),
-                         user_id=uid)
+
                     elif func_name == "monitor_list_rules":
                         include_disabled = bool(args.get("include_disabled", False))
                         rules = list_monitor_rules(
