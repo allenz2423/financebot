@@ -4833,6 +4833,77 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 }
             )
 
+        # 2. Parse XML-style tool calls (e.g. <tool_call><function=foo><parameter=bar>val</parameter></function></tool_call>)
+        # Commonly emitted by Qwen, DeepSeek, Nemotron, or dot-format prompts
+        xml_pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
+        for match in re.finditer(xml_pattern, text, re.DOTALL):
+            body = match.group(1).strip()
+            span = match.span()
+            func_name = None
+            args = {}
+
+            # Check <function=foo>...</function>
+            fn_match = re.search(r"<function=([a-zA-Z0-9_]+)>(.*?)(?:</function>|$)", body, re.DOTALL)
+            if fn_match:
+                candidate = fn_match.group(1).strip()
+                if candidate in KNOWN_TOOLS:
+                    func_name = candidate
+                    fn_body = fn_match.group(2).strip()
+                    for p in re.finditer(r"<parameter=([a-zA-Z0-9_]+)>(.*?)(?:</parameter>|$)", fn_body, re.DOTALL):
+                        pname = p.group(1).strip()
+                        pval = p.group(2).strip()
+                        try:
+                            pval = json.loads(pval)
+                        except Exception:
+                            pass
+                        args[pname] = pval
+            else:
+                # Check if body inside <tool_call> is raw JSON
+                for obj, _, _ in _iter_json_objects(body):
+                    if isinstance(obj, dict):
+                        for k in ("name", "tool", "function"):
+                            v = obj.get(k)
+                            if isinstance(v, str) and v in KNOWN_TOOLS:
+                                func_name = v
+                                args = obj.get("arguments", obj.get("parameters", {}))
+                                break
+                            elif isinstance(v, dict) and v.get("name") in KNOWN_TOOLS:
+                                func_name = v["name"]
+                                args = v.get("arguments", v.get("parameters", {}))
+                                break
+
+            # Check Python function call syntax inside <tool_call>: func_name(arg=val)
+            if not func_name:
+                py_fn_match = re.match(r"^([a-zA-Z0-9_]+)\s*\((.*?)\)$", body, re.DOTALL)
+                if py_fn_match and py_fn_match.group(1) in KNOWN_TOOLS:
+                    func_name = py_fn_match.group(1)
+                    # Extract keyword args
+                    kwargs_str = py_fn_match.group(2)
+                    for kw in re.finditer(r"([a-zA-Z0-9_]+)\s*=\s*(['\"](.*?)['\"]|[^,]+)", kwargs_str):
+                        k = kw.group(1)
+                        v = kw.group(3) if kw.group(3) is not None else kw.group(2).strip()
+                        try:
+                            v = json.loads(v)
+                        except Exception:
+                            pass
+                        args[k] = v
+
+            if func_name:
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                parsed_calls.append(
+                    {
+                        "function": {
+                            "name": func_name,
+                            "arguments": args if isinstance(args, dict) else {},
+                        },
+                        "_span": span,
+                    }
+                )
+
         return parsed_calls
 
     def _strip_fallback_tool_json(text: str, calls: list[dict] | None = None) -> str:

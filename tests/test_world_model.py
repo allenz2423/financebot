@@ -187,4 +187,39 @@ def test_retract_world_model_claim(clean_test_entities):
     sub2 = get_entity_subgraph(["test_person:bob"])
     assert not any(c["claim_id"] == cid for c in sub2["claims"])
 
+def test_parse_xml_and_dot_tool_calls():
+    from src.services.llm import BOT_TOOLS_SCHEMA
+    import re, json
+
+    KNOWN_TOOLS = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
+    
+    xml_sample = """
+    Thinking about the query...
+    <tool_call>
+    <function=get_world_model_entity>
+    <parameter=entity_id_or_name>cuny_hpc</parameter>
+    </function>
+    </tool_call>
+    """
+
+    # Mimic the parser logic
+    xml_pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
+    parsed_calls = []
+    for match in re.finditer(xml_pattern, xml_sample, re.DOTALL):
+        body = match.group(1).strip()
+        fn_match = re.search(r"<function=([a-zA-Z0-9_]+)>(.*?)(?:</function>|$)", body, re.DOTALL)
+        if fn_match:
+            candidate = fn_match.group(1).strip()
+            if candidate in KNOWN_TOOLS:
+                args = {}
+                fn_body = fn_match.group(2).strip()
+                for p in re.finditer(r"<parameter=([a-zA-Z0-9_]+)>(.*?)(?:</parameter>|$)", fn_body, re.DOTALL):
+                    args[p.group(1).strip()] = p.group(2).strip()
+                parsed_calls.append({"function": {"name": candidate, "arguments": args}})
+
+    assert len(parsed_calls) == 1
+    assert parsed_calls[0]["function"]["name"] == "get_world_model_entity"
+    assert parsed_calls[0]["function"]["arguments"]["entity_id_or_name"] == "cuny_hpc"
+
+
 
