@@ -77,21 +77,22 @@ async def get_embedding(text: str) -> List[float]:
     if not text or not text.strip():
         return [0.0] * VECTOR_SIZE
 
-    # 1. Try local Ollama nomic-embed-text first (completely free & local)
+    # 1. Try local Ollama nomic-embed-text-cpu first (100% CPU, 0 MB VRAM, completely free)
     ollama_url = _get_ollama_embed_url()
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                ollama_url,
-                json={"model": "nomic-embed-text", "input": text.strip()[:8000]},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                embs = data.get("embeddings", [])
-                if embs:
-                    return embs[0]
-    except Exception as e:
-        logger.warning(f"Local Ollama embedding failed ({e}); attempting cloud fallback")
+    for local_m in ("nomic-embed-text-cpu", "nomic-embed-text"):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    ollama_url,
+                    json={"model": local_m, "input": text.strip()[:8000], "keep_alive": -1},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    embs = data.get("embeddings", [])
+                    if embs:
+                        return embs[0]
+        except Exception as e:
+            logger.debug(f"Ollama local model {local_m} attempt failed: {e}")
 
     # 2. Cloud Fallback (OpenRouter / OpenAI)
     api_key = _get_openai_api_key()
