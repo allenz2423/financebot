@@ -2506,6 +2506,38 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "index_financial_snapshot_to_qdrant",
+            "description": "Extract all active financial snapshots, savings goals, active world model claims, and dossiers for the current user and embed them into the Qdrant vector database for semantic retrieval.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_vector_memory",
+            "description": "Perform a dense semantic vector search in Qdrant across indexed financial snapshots, goals, life context, and active world model claims.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language semantic query to search in vector memory (e.g. 'kidney health medication' or 'debt repayment goals')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of semantic neighbors to return (default: 5)."
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_scheduled_reminders",
             "description": "Search or list scheduled/pending reminders. Can filter by keyword or time window.",
             "parameters": {
@@ -3132,6 +3164,8 @@ EXPECTED_TOOL_NAMES = {
     "assert_world_model_claim",
     "retract_world_model_claim",
     "crawl_deeper",
+    "index_financial_snapshot_to_qdrant",
+    "search_vector_memory",
     "send_push_alert",
     "schedule_reminder",
     "delete_scheduled_reminder",
@@ -7866,6 +7900,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         selector = args.get("wait_for_selector")
                         from src.services.browserless import scrape_rendered_page
                         res = await scrape_rendered_page(target_url, wait_for_selector=selector)
+                        db_result = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
+                    elif func_name == "index_financial_snapshot_to_qdrant":
+                        from src.services.qdrant_client import index_user_financial_profile
+                        res = await index_user_financial_profile(uid)
+                        db_result = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
+                    elif func_name == "search_vector_memory":
+                        query_str = str(args.get("query") or "").strip()
+                        if not query_str:
+                            raise ValueError("query is required for search_vector_memory")
+                        limit_val = int(args.get("limit", 5))
+                        from src.services.qdrant_client import search_vectors
+                        res = await search_vectors(query_str, limit=limit_val, user_id=uid)
                         db_result = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
                     elif func_name in ADVISOR_TOOLS_DISPATCH:
                         try:
