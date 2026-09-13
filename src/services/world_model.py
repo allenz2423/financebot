@@ -309,8 +309,18 @@ def build_world_model_context(query: str, max_tokens: int = 180, user_id: Option
     if claims:
         lines.append("")
         lines.append("[VERIFIED CLAIMS]")
-        # Prioritize higher source authority
-        sorted_claims = sorted(claims, key=lambda x: x.get("source_authority", 1), reverse=True)
+        # Prioritize claims relevant to query keywords, then source authority
+        query_words = set(re.findall(r"\w+", query.lower())) - {"what", "is", "my", "the", "a", "an", "in", "on", "for", "to", "do", "i", "how", "much"}
+        
+        def claim_relevance_score(c):
+            pred = str(c.get("predicate", "")).lower()
+            val = str(c.get("scalar_value", "") or c.get("object_id", "")).lower()
+            auth = c.get("source_authority", 3)
+            match_score = sum(3 for w in query_words if len(w) > 2 and w in pred)
+            match_score += sum(1 for w in query_words if len(w) > 2 and w in val)
+            return (match_score, auth)
+
+        sorted_claims = sorted(claims, key=claim_relevance_score, reverse=True)
         for c in sorted_claims:
             subj = c["subject_id"]
             pred = c["predicate"]
