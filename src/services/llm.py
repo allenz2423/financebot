@@ -2239,54 +2239,6 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "save_memory",
-            "description": "Save a durable memory/note for future reference. Use this LIBERALLY — memories are cheap, forgetting is expensive. Save anything worth remembering: user preferences, recurring patterns, important context, lessons learned, etc. Set pinned=true for facts that rarely change and should ALWAYS be visible (e.g. credit card APRs, the user's identity/name for internal-transfer detection, core standing preferences) so they never age out of the rolling memory window.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "The memory content to save.",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Category for retrieval (e.g. 'preference', 'pattern', 'goal', 'warning'). Default: 'general'.",
-                    },
-                    "importance": {
-                        "type": "string",
-                        "description": "Importance level: 'low', 'normal', 'high'. Default: 'normal'.",
-                    },
-                    "pinned": {
-                        "type": "boolean",
-                        "description": "CRITICAL: Set true ONLY for unchanging core identity facts (APRs, rules). If updating a dynamic value or preference, use delete_memory on the old one first. NEVER pin dynamic numbers (balances, net worth). Default: false.",
-                    },
-                },
-                "required": ["content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_memories",
-            "description": "Retrieve saved memories, optionally filtered by category. Use limit and offset to page through large amounts of memories.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "description": "Filter by category. Omit to get all.",
-                    },
-                    "days": {"type": "integer"},
-                    "limit": {"type": "integer"},
-                    "offset": {"type": "integer", "description": "Number of memories to skip (for pagination)."},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "mark_audit_unresolved",
             "description": (
                 "AUDIT STATUS TOOL. Mark one or more CURRENT audit transactions as unresolved after "
@@ -2314,35 +2266,6 @@ BOT_TOOLS_SCHEMA = [
             "name": "end_turn",
             "description": "Explicitly signal that you are 100% finished with the user's request and have no more tool calls to make. You MUST call this to end a long-running task. Do not call this if you still need to verify, search, or clean data.",
             "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_memory",
-            "description": (
-                "Delete one or more saved memories. Use memory_id for a single "
-                "precise deletion (get the ID from get_memories first). Use "
-                "content_match to delete all memories containing that text. "
-                "Use this to remove stale, incorrect, or duplicate memories."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "memory_id": {
-                        "type": "integer",
-                        "description": "Exact memory ID to delete (from get_memories output).",
-                    },
-                    "content_match": {
-                        "type": "string",
-                        "description": "Delete all memories whose content contains this text.",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Optional: only delete memories in this category when using content_match.",
-                    },
-                },
-            },
         },
     },
     {
@@ -3168,9 +3091,6 @@ EXPECTED_TOOL_NAMES = {
     "get_transactions_by_context",
     "log_lifestyle_context",
     "get_lifestyle_context",
-    "save_memory",
-    "get_memories",
-    "delete_memory",
     "explain_world_model_claim",
     "simulate_counterfactual_scenario",
     "audit_cognitive_health",
@@ -3307,7 +3227,6 @@ def refresh_knowledge_base(*,user_id: str) -> dict:
         "expected_income": get_expected_income(status="Pending", days=60, user_id=user_id),
         "planned_transactions": get_planned_transactions(status="Expected", days=30, user_id=user_id),
         "upcoming_cash_flow": get_upcoming_cash_flow(days=30, user_id=user_id),
-        "recent_memories": get_memories(days=90, limit=10, user_id=user_id),
     }
 
 async def sync_plaid_accounting(
@@ -3673,11 +3592,11 @@ CORE OPERATING LOOP
 
 For any task involving the user's finances:
 
-RECALL — Check memory (get_memories) before transaction review, corrections, audits, merchant research, projections, preferences, recurring patterns, goals, warnings, or "what should I do" questions. Memory is context, not a substitute for current database verification.
+RECALL — Check the Active World Model (get_world_model_entity, search_world_model) before transaction review, corrections, audits, merchant research, projections, preferences, recurring patterns, goals, warnings, or "what should I do" questions. The world model contains verified epistemic state and active subgraphs.
 VERIFY — Use the appropriate database/read tool before stating any specific financial fact. Never infer a balance, transaction state, category, spending total, debt amount, budget status, or other fact from memory alone. Tool output controls the answer. If the tool returns no data, say the data is unavailable. Never fabricate missing values.
 RESEARCH — Use search_web whenever an external fact is needed (merchant identity/type, prices, products, businesses, current status/policies, current events). If results are insufficient, use fetch_webpage on a URL returned by search_web. Prefer first-party sources. If reliable evidence cannot establish the fact, say it is unresolved.
 ACT — Mutate financial data only after the relevant data has been verified. Use native mutation tools. Never pretend an action occurred without a successful tool result. For large jobs use batch_correct_transactions and batch_lock_transactions rather than hundreds of individual calls. Keep batches reasonably sized: up to 50 corrections, up to 100 locks.
-REMEMBER — Save durable facts immediately when learned (confirmed merchant identities, recurring income/bills, goals, preferences, spending patterns, warnings, correction rules, audit lessons). Use tag_transaction_context for purchase context and log_lifestyle_context for durable lifestyle state.
+REMEMBER — Save durable facts immediately into the Active World Model using assert_world_model_claim (confirmed merchant identities, recurring income/bills, goals, preferences, spending patterns, warnings, correction rules, audit lessons). Use tag_transaction_context for purchase context and log_lifestyle_context for durable lifestyle state.
 FINISH — An active audit is not complete until every transaction has been processed. COMPLETE means final verification reports exactly 0 remaining items. PARTIALLY COMPLETE means every remaining item was explicitly marked unresolved after reasonable research. Only after reaching one of those terminal states may you call the native end_turn tool. Never end an active task merely because you have explained what you plan to do.
 
 ==================================================
@@ -3711,7 +3630,6 @@ NO HALLUCINATED EXITS: Never invent user instructions such as "sum it up", "wrap
 WEB: search_web (external facts), fetch_webpage (returned-page verification)
 CODE / MATH: run_python_sandbox (Python, calculations, statistics, simulations, charts)
 SHELL / TESTING: run_shell
-MEMORY: get_memories, save_memory, delete_memory
 ACTIVE WORLD MODEL: get_world_model_entity (query entity & verified claims), search_world_model (BM25 search across knowledge graph), get_world_model_dossier (pull full markdown dossier), assert_world_model_claim (record new facts/relationships), retract_world_model_claim (revoke stale claims), explain_world_model_claim (audit claim provenance), simulate_counterfactual_scenario (What-If scenario simulation), audit_cognitive_health (verify graph consistency). ALWAYS use get_world_model_entity or search_world_model to verify facts about institutions, debts, employers, aid, or user terms before inventing SQL tables or guessing.
 TRANSACTION CONTEXT: tag_transaction_context (purchase context), log_lifestyle_context (lifestyle context)
 
@@ -3775,7 +3693,7 @@ UNRESOLVED: If reliable research cannot establish the merchant or transaction ty
 MERCHANT RESEARCH RULES
 ==================================================
 
-Before merchant research: (1) check get_memories(category='merchant', user_id=uid), (2) check relevant transaction context, (3) check the known merchant registry when available, (4) search only when required.
+Before merchant research: (1) check known merchant registry when available or search_world_model, (2) check relevant transaction context, (3) search only when required.
 Search behavior: Search the exact raw merchant name. Do not pad queries with "merchant type", "business type", "what is", or "category". Do not manufacture unnecessary query terms. If results are weak, retry using genuinely different evidence sources (official site, parent company, spelling variants, city/location, menu, product page, registry, LinkedIn, receipts). Only fetch URLs returned by search_web or directly supplied by the user.
 
 RELEVANCE CHECK: The search result must actually describe the requested entity. If results are clearly unrelated, do not use them as evidence, do not guess the merchant category, classify as unresolved / Uncategorized Purchase when appropriate, and explain that reliable search evidence did not identify the entity.
@@ -3784,7 +3702,7 @@ RELEVANCE CHECK: The search result must actually describe the requested entity. 
 TRANSACTION CORRECTIONS
 ==================================================
 
-Before correcting: (1) retrieve memory, (2) retrieve the actual transaction, (3) verify the transaction_row_id, (4) determine whether it is unlocked, (5) research the merchant when required, (6) determine the category using evidence, (7) call the appropriate correction tool, (8) verify the mutation succeeded, (9) lock the transaction when it is fully audited and finalized.
+Before correcting: (1) verify transaction context and Active World Model state, (2) retrieve the actual transaction, (3) verify the transaction_row_id, (4) determine whether it is unlocked, (5) research the merchant when required, (6) determine the category using evidence, (7) call the appropriate correction tool, (8) verify the mutation succeeded, (9) lock the transaction when it is fully audited and finalized.
 
 correct_transaction: Requires the exact numeric transaction_row_id, a reason, and judgment when changing category. Cannot modify immutable identity fields.
 
@@ -3801,22 +3719,20 @@ SEARCH RULES
 search_web is the authority for external facts. Use it for merchant identity/type, current prices, current product information, businesses, current status, current policies, and uncertain external facts. Search immediately when external verification is required. Do not rely on model memory for current external information. If the first search is weak, retry with a genuinely different search strategy; do not repeatedly issue near-identical searches. When reporting web-derived facts, use the citation mechanism supplied by search_web, only state what the evidence supports, and clearly distinguish verified facts from uncertainty.
 
 ==================================================
-MEMORY RULES
+ACTIVE WORLD MODEL RULES
 ==================================================
 
-MEMORY-FIRST HABIT: Before ANY transaction review, correction, merchant research, projection, financial recommendation, or "what should I do" question, check memory first when relevant. Useful categories include merchant, preference, pattern, goal, warning, correction, income, budget, lifestyle. Do not ask permission to check memory.
-MEMORY RECALL GATE: Before the FIRST search_web, correct_transaction, or batch_correct_transactions in a task involving transaction review or merchant research, call get_memories(category='merchant', user_id=uid) at least once this turn, unless it was already called earlier in this same conversation and no new merchant has appeared.
+WORLD-MODEL-FIRST HABIT: Before ANY transaction review, correction, merchant research, projection, financial recommendation, or "what should I do" question, check the Active World Model (get_world_model_entity or search_world_model) first when relevant. The Active World Model contains verified epistemic state across institutions, employers, liabilities, rules, and user goals. Do not ask permission to check the world model.
+VERIFICATION: When answering questions about terms, rates, caps, obligations, or user constraints, always use get_world_model_entity (e.g. 'cuny_hpc', 'discover_it', 'person:allen') or get_world_model_dossier. Never invent SQL table names.
 
-DEFAULT TO PERMANENCE: Save durable information when learned (confirmed merchant identities, user preferences, recurring income, recurring bills, spending triggers, correction rules, audit definitions, important mistakes or lessons, durable financial goals).
+DEFAULT TO PERMANENCE: Save durable information when learned (confirmed merchant identities, user preferences, recurring income, recurring bills, spending triggers, correction rules, audit definitions, important mistakes or lessons, durable financial goals) by asserting claims using assert_world_model_claim.
 
-MERCHANT MEMORY FORMAT: "Merchant: X is Y. Evidence: Z. Confidence: high/medium."
-
-MEMORY QUALITY: Save one durable fact per memory when practical. Never claim a memory was saved without a successful save_memory result. Do not save a memory that already exists; check existing memories first. If save_memory reports "Duplicate memory blocked", accept that result and continue; do not rephrase and retry. Delete stale, incorrect, or duplicate memories using delete_memory after finding the appropriate memory ID. At the end of a task, if memories were actually saved, briefly state what was saved. Never claim a save that did not occur.
+CLAIM QUALITY: Assert precise predicates and scalar values. Set source_authority (1 to 5) and appropriate provenance_type ('USER_STATED', 'DIRECT_OBSERVATION', 'DOCUMENT', 'CALCULATION'). Stale claims can be revoked via retract_world_model_claim.
 
 ==================================================
 DATABASE EAGERNESS
 ==================================================
-Financial facts must be persisted rather than held only in model context. If the user provides durable financial information (a job, paycheck, bill, manual cash purchase, recurring income, recurring expense, financial goal, durable preference), use the appropriate database mutation tool in the same turn. Do not merely say you will remember it. Use add_expected_income, add_planned_transaction, save_memory, add_transaction, log_lifestyle_context, or the appropriate specialized tool. Do not wait for permission when the user has clearly provided durable information that belongs in the database.
+Financial facts must be persisted rather than held only in model context. If the user provides durable financial information (a job, paycheck, bill, manual cash purchase, recurring income, recurring expense, financial goal, durable preference), use the appropriate database mutation tool in the same turn. Do not merely say you will remember it. Use add_expected_income, add_planned_transaction, assert_world_model_claim, add_transaction, log_lifestyle_context, or the appropriate specialized tool. Do not wait for permission when the user has clearly provided durable information that belongs in the database.
 
 WORKSPACE PATTERN FOR LONG SCRIPTS:
 Write long scripts to /tmp/ (persists during the session).
