@@ -19,19 +19,44 @@ def verify_claim(claim: str, sql_query: str = None, user_id: str = None) -> str:
     try:
         from src.core.state import DB_PATH
         with sqlite3.connect(DB_PATH) as conn:
-            # We strictly scope the query execution.
-            # In a real secure sandbox, this would be highly parameterized, 
-            # but for this deterministic check, we run the query safely.
-            # Since LLMs can generate arbitrary SQL here, we must intercept user_id.
-            
-            # Simple check: replace ? with user_id or enforce user_id in the query text.
             c = conn.cursor()
-            c.execute(sql_query)
+            # Rewrite common hallucinated table aliases for world model
+            sanitized_query = sql_query
+            for hallucinated, actual in [
+                ("world_model_claims", "kg_claims"),
+                ("world_model_entities", "kg_entities"),
+                ("knowledge_graph_claims", "kg_claims"),
+                ("knowledge_graph_entities", "kg_entities"),
+                ("world_model", "kg_claims"),
+            ]:
+                if hallucinated in sanitized_query:
+                    sanitized_query = sanitized_query.replace(hallucinated, actual)
+
+            # In kg_claims, user is subject_id (e.g. user:<user_id>)
+            if "kg_claims" in sanitized_query:
+                sanitized_query = sanitized_query.replace(
+                    f"user_id = '{user_id}'", f"(subject_id = 'user:{user_id}' OR subject_id = '{user_id}')"
+                )
+                sanitized_query = sanitized_query.replace(
+                    "user_id = ?", f"(subject_id = 'user:{user_id}' OR subject_id = '{user_id}')"
+                )
+
+            c.execute(sanitized_query)
             rows = c.fetchall()
             
             # Format results
-            result_str = "\n".join([str(row) for row in rows])
+            result_str = "\n".join([str(row) for row in rows]) if rows else "(0 rows returned)"
             
             return f"CLAIM: {claim}\n\nDETERMINISTIC RESULT:\n{result_str}\n\nAssess this result. If your claim was incorrect, use this true data going forward."
+    except sqlite3.OperationalError as e:
+        err_msg = str(e)
+        if "no such table" in err_msg:
+            return (
+                f"ERROR executing verification query: {err_msg}. "
+                "HINT: For relational knowledge graph facts/claims (institutions, caps, rules, schedule, employers), "
+                "do not guess SQL tables. Use `get_world_model_entity(entity_id_or_name)` or `search_world_model(query)`. "
+                "For ledger verification, available tables are: transactions, plaid_accounts, subscriptions, savings_buckets, planned_transactions, balance_snapshots."
+            )
+        return f"ERROR executing verification query: {err_msg}"
     except Exception as e:
         return f"ERROR executing verification query: {str(e)}"

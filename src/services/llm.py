@@ -1122,12 +1122,12 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "verify_claim",
-            "description": "The Verification Layer: Verify a factual/numerical claim against the deterministic database using a SQL SELECT query.",
+            "description": "The Verification Layer: Verify a factual or numerical claim against the deterministic ledger/financial tables using a SQL SELECT query. For ledger verification only: tables include transactions, plaid_accounts, subscriptions, savings_buckets, planned_transactions, balance_snapshots. Note: Do NOT use this for knowledge graph facts (employers, caps, rules, classes)—use get_world_model_entity or search_world_model instead. Always scope with 'user_id = ?'.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "claim": {"type": "string"},
-                    "sql_query": {"type": "string", "description": "Deterministic SQLite SELECT query to verify the claim. The schema includes tables like transactions, balance_snapshots, savings_buckets, etc. IMPORTANT: You MUST use 'user_id = ?' and the system will auto-inject the correct user."}
+                    "sql_query": {"type": "string", "description": "Deterministic SQLite SELECT query to verify the claim. Available ledger tables: transactions, plaid_accounts, subscriptions, savings_buckets, planned_transactions, balance_snapshots. IMPORTANT: You MUST use 'user_id = ?' and the system will auto-inject the correct user."}
                 },
                 "required": ["claim", "sql_query"]
             }
@@ -7337,12 +7337,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         health = audit_world_model_health()
                         db_result = json.dumps(health, indent=2)
                     elif func_name == "get_world_model_entity":
-                        target = str(args.get("entity_id_or_name", "")).strip()
+                        target = str(args.get("entity_id_or_name", "") or args.get("entity_id", "") or args.get("name", "")).strip()
                         if not target:
-                            db_result = "ERROR: entity_id_or_name is required."
-                        else:
-                            res = get_world_model_entity(target)
-                            db_result = json.dumps(res, indent=2)
+                            target = f"user:{uid}"
+                        res = get_world_model_entity(target)
+                        db_result = json.dumps(res, indent=2)
                     elif func_name == "search_world_model":
                         query_str = str(args.get("query", "")).strip()
                         limit_val = int(args.get("limit", 5))
