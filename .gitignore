@@ -106,7 +106,12 @@ Thumbs.db
 
 *_BACKUP_*
 
-# Subagent run artifacts
+# Subagent run artifacts & temporary scratch
 .agents/
 ORIGINAL_REQUEST.md
 tests/stress_test_report.json
+*.bak
+*.bak.*
+.qwen/
+test_*.py
+!tests/test_*.py
