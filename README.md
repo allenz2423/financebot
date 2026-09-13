@@ -105,7 +105,21 @@ OPENAI_MODEL=openrouter/auto-beta
 OPENAI_URL=https://openrouter.ai/api/v1/chat/completions
 ```
 
-### 4. Run the Stack
+### 4. Vector Embeddings Configuration (Qdrant)
+Delilah supports both **100% free local CPU embeddings** and **cloud embeddings**:
+
+```env
+# Choose: "local" (Ollama 100% CPU, 0 MB VRAM) or "cloud" (OpenRouter/OpenAI) or "auto"
+EMBEDDING_BACKEND=local
+
+# When local:
+EMBEDDING_LOCAL_MODEL=nomic-embed-text-cpu
+
+# When cloud:
+EMBEDDING_CLOUD_MODEL=text-embedding-3-small
+```
+
+### 5. Run the Stack
 ```bash
 docker compose up -d --build
 docker logs delilah_bot -f

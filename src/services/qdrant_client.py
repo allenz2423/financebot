@@ -11,8 +11,23 @@ import logging
 from typing import List, Dict, Any, Optional
 import httpx
 
+def _get_embedding_backend() -> str:
+    from dotenv import load_dotenv
+    load_dotenv()
+    return os.getenv("EMBEDDING_BACKEND", "local").strip().lower()
+
+def _get_embedding_vector_size() -> int:
+    from dotenv import load_dotenv
+    load_dotenv()
+    env_size = os.getenv("EMBEDDING_VECTOR_SIZE")
+    if env_size:
+        return int(env_size)
+    # Default to 768 for local nomic-embed-text, 1536 for cloud text-embedding-3-small
+    backend = _get_embedding_backend()
+    return 1536 if backend in ("cloud", "openai", "openrouter") else 768
+
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "delilah_financial_memory")
-VECTOR_SIZE = int(os.getenv("EMBEDDING_VECTOR_SIZE", "768"))  # 768 for nomic-embed-text, 1536 for text-embedding-3-small
+VECTOR_SIZE = _get_embedding_vector_size()
 
 def _get_qdrant_url() -> str:
     candidates = [
@@ -71,20 +86,50 @@ def _get_embeddings_endpoint() -> str:
 async def get_embedding(text: str) -> List[float]:
     """
     Generate dense embedding for text.
-    Prefers 100% free, local Ollama (nomic-embed-text) with zero cloud spend or rate limits.
-    Falls back to OpenRouter/OpenAI if local Ollama is offline.
+    Controlled by EMBEDDING_BACKEND in .env:
+      - 'local': Uses Ollama (EMBEDDING_LOCAL_MODEL, default: nomic-embed-text-cpu)
+      - 'cloud': Uses OpenRouter/OpenAI (EMBEDDING_CLOUD_MODEL, default: text-embedding-3-small)
+      - 'auto': Attempts local first; falls back to cloud if local is unreachable
     """
+    vector_size = _get_embedding_vector_size()
     if not text or not text.strip():
-        return [0.0] * VECTOR_SIZE
+        return [0.0] * vector_size
 
-    # 1. Try local Ollama nomic-embed-text-cpu first (100% CPU, 0 MB VRAM, completely free)
+    backend = _get_embedding_backend()
+    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", "nomic-embed-text-cpu").strip()
+    cloud_model = os.getenv("EMBEDDING_CLOUD_MODEL", "text-embedding-3-small").strip()
+
+    # Cloud explicitly requested
+    if backend in ("cloud", "openai", "openrouter"):
+        api_key = _get_openai_api_key()
+        endpoint = _get_embeddings_endpoint()
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": cloud_model,
+            "input": text.strip()[:8000],
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(endpoint, json=payload, headers=headers)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Cloud Embedding API failed ({resp.status_code}): {resp.text}")
+            data = resp.json()
+            return data["data"][0]["embedding"]
+
+    # Local Ollama requested (or auto fallback)
     ollama_url = _get_ollama_embed_url()
-    for local_m in ("nomic-embed-text-cpu", "nomic-embed-text"):
+    candidate_models = [local_model]
+    if local_model == "nomic-embed-text-cpu":
+        candidate_models.append("nomic-embed-text")
+
+    for model_name in candidate_models:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     ollama_url,
-                    json={"model": local_m, "input": text.strip()[:8000], "keep_alive": -1},
+                    json={"model": model_name, "input": text.strip()[:8000], "keep_alive": -1},
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -92,26 +137,29 @@ async def get_embedding(text: str) -> List[float]:
                     if embs:
                         return embs[0]
         except Exception as e:
-            logger.debug(f"Ollama local model {local_m} attempt failed: {e}")
+            logger.debug(f"Local embedding via {model_name} failed: {e}")
 
-    # 2. Cloud Fallback (OpenRouter / OpenAI)
-    api_key = _get_openai_api_key()
-    endpoint = _get_embeddings_endpoint()
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "text-embedding-3-small",
-        "input": text.strip()[:8000],
-    }
+    # If backend was 'local' and failed, attempt cloud fallback with warning
+    if backend == "auto" or backend == "local":
+        logger.warning("Local Ollama embedding failed; falling back to cloud endpoint")
+        api_key = _get_openai_api_key()
+        endpoint = _get_embeddings_endpoint()
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": cloud_model,
+            "input": text.strip()[:8000],
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(endpoint, json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["data"][0]["embedding"]
+            raise RuntimeError(f"Both local and cloud embedding generation failed: {resp.text}")
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(endpoint, json=payload, headers=headers)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Embedding API failed ({resp.status_code}): {resp.text}")
-        data = resp.json()
-        return data["data"][0]["embedding"]
+    return [0.0] * vector_size
 
 
 async def ensure_collection(collection_name: str = COLLECTION_NAME) -> bool:

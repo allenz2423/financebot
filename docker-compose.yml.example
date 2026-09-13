@@ -27,6 +27,7 @@ networks:
 volumes:
   ollama_data:
   sandbox-packages:
+  qdrant_data:
 
 services:
   delilah:
@@ -211,7 +212,7 @@ services:
     #   - "11434:11434"
 
     environment:
-      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_MAX_LOADED_MODELS=2
       - OLLAMA_KEEP_ALIVE=-1
       - OLLAMA_NUM_PARALLEL=1
       - OLLAMA_CONTEXT_LENGTH=32768
@@ -229,3 +230,19 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # Qdrant vector database for semantic memory and financial snapshots
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: financebot-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - financebot-internal
+    ports:
+      - "6333:6333"
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__TELEMETRY_DISABLED=true
+
