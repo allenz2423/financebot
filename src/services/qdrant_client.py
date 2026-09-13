@@ -12,7 +12,7 @@ from typing import List, Dict, Any, Optional
 import httpx
 
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "delilah_financial_memory")
-VECTOR_SIZE = 1536  # Standard text-embedding-3-small dimension
+VECTOR_SIZE = int(os.getenv("EMBEDDING_VECTOR_SIZE", "768"))  # 768 for nomic-embed-text, 1536 for text-embedding-3-small
 
 def _get_qdrant_url() -> str:
     candidates = [
@@ -34,6 +34,26 @@ def _get_qdrant_url() -> str:
             continue
     return os.getenv("QDRANT_URL", "http://qdrant:6333").rstrip("/")
 
+def _get_ollama_embed_url() -> str:
+    candidates = [
+        os.getenv("OLLAMA_EMBED_URL", "").rstrip("/"),
+        "http://ollama:11434/api/embed",
+        "http://localhost:11434/api/embed",
+        "http://127.0.0.1:11434/api/embed",
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            with httpx.Client(timeout=0.5) as client:
+                base = c.replace("/api/embed", "/api/tags")
+                r = client.get(base)
+                if r.status_code == 200:
+                    return c
+        except Exception:
+            continue
+    return "http://ollama:11434/api/embed"
+
 def _get_openai_api_key() -> str:
     from dotenv import load_dotenv
     load_dotenv()
@@ -49,10 +69,31 @@ def _get_embeddings_endpoint() -> str:
 
 
 async def get_embedding(text: str) -> List[float]:
-    """Generate dense embedding for text using OpenAI/OpenRouter embeddings API."""
+    """
+    Generate dense embedding for text.
+    Prefers 100% free, local Ollama (nomic-embed-text) with zero cloud spend or rate limits.
+    Falls back to OpenRouter/OpenAI if local Ollama is offline.
+    """
     if not text or not text.strip():
         return [0.0] * VECTOR_SIZE
 
+    # 1. Try local Ollama nomic-embed-text first (completely free & local)
+    ollama_url = _get_ollama_embed_url()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                ollama_url,
+                json={"model": "nomic-embed-text", "input": text.strip()[:8000]},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                embs = data.get("embeddings", [])
+                if embs:
+                    return embs[0]
+    except Exception as e:
+        logger.warning(f"Local Ollama embedding failed ({e}); attempting cloud fallback")
+
+    # 2. Cloud Fallback (OpenRouter / OpenAI)
     api_key = _get_openai_api_key()
     endpoint = _get_embeddings_endpoint()
     headers = {
