@@ -80,15 +80,18 @@ def upsert_entity(
         conn.commit()
     return entity_id
 
-def resolve_entities(query: str) -> List[str]:
+def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
     """
     Given a user query or text snippet, identify matching entity_ids.
     Uses:
     1. Exact alias/name matching.
     2. SQLite FTS5 BM25 search.
+    Multi-tenant safe: user:<id> entities belonging to other users are never matched.
     """
     matched_ids = set()
     normalized_q = query.lower()
+    target_user_id = str(user_id or get_primary_user_id()).strip() if user_id is not None else None
+    user_prefix = f"user:{target_user_id}" if target_user_id else None
 
     with _get_connection() as conn:
         c = conn.cursor()
@@ -97,6 +100,9 @@ def resolve_entities(query: str) -> List[str]:
         c.execute("SELECT entity_id, canonical_name, aliases FROM kg_entities")
         for row in c.fetchall():
             eid = row["entity_id"]
+            if eid.startswith("user:") and user_prefix and eid != user_prefix:
+                continue
+
             name = row["canonical_name"].lower()
             # Word boundary matching to avoid partial substrings (e.g. 'me' matching 'Acme')
             if re.search(r"\b" + re.escape(name) + r"\b", normalized_q) or eid.lower() in normalized_q:
@@ -120,10 +126,13 @@ def resolve_entities(query: str) -> List[str]:
                 c.execute("""
                     SELECT target_id FROM kg_search_fts
                     WHERE target_type = 'entity' AND kg_search_fts MATCH ?
-                    ORDER BY rank LIMIT 5
+                    ORDER BY rank LIMIT 10
                 """, (fts_query,))
                 for row in c.fetchall():
-                    matched_ids.add(row["target_id"])
+                    tid = row["target_id"]
+                    if tid.startswith("user:") and user_prefix and tid != user_prefix:
+                        continue
+                    matched_ids.add(tid)
             except Exception:
                 pass
 
@@ -167,12 +176,21 @@ def assert_claim(
     with _get_connection() as conn:
         c = conn.cursor()
         
-        # Retract previous active claim on same subject and predicate (if non-multi-value)
-        c.execute("""
-            UPDATE kg_claims
-            SET tx_retracted_at = ?
-            WHERE subject_id = ? AND predicate = ? AND tx_retracted_at IS NULL
-        """, (now_utc, subject_id, predicate))
+        # Retract previous active claim on same subject and predicate.
+        # Multi-value predicates (like 'allergic_to') allow multiple distinct claims unless the scalar_value matches.
+        multi_value_predicates = {"allergic_to", "allergy", "medical_conditions", "medication", "goal", "liability"}
+        if predicate in multi_value_predicates:
+            c.execute("""
+                UPDATE kg_claims
+                SET tx_retracted_at = ?
+                WHERE subject_id = ? AND predicate = ? AND scalar_value = ? AND tx_retracted_at IS NULL
+            """, (now_utc, subject_id, predicate, scalar_str))
+        else:
+            c.execute("""
+                UPDATE kg_claims
+                SET tx_retracted_at = ?
+                WHERE subject_id = ? AND predicate = ? AND tx_retracted_at IS NULL
+            """, (now_utc, subject_id, predicate))
 
         # Insert new claim
         c.execute("""
@@ -186,6 +204,14 @@ def assert_claim(
             provenance_type, source_authority, v_from, valid_to,
             now_utc, parents_json, ev_json
         ))
+
+        # Index into full-text search index (FTS5) for instant retrieval
+        claim_content = f"{predicate}: {scalar_str or object_id or ''}"
+        c.execute("DELETE FROM kg_search_fts WHERE target_id = ?", (cid,))
+        c.execute("""
+            INSERT INTO kg_search_fts (target_id, target_type, title, content, tags)
+            VALUES (?, 'claim', ?, ?, ?)
+        """, (cid, f"{subject_id} -> {predicate}", claim_content, f"claim {predicate}"))
         conn.commit()
 
     return cid
@@ -274,9 +300,9 @@ def build_world_model_context(query: str, max_tokens: int = 180, user_id: Option
     Replaces the brute-force 58-bullet raw memory dump with verified relational facts.
     Scoped to user:<user_id>.
     """
-    matched_eids = resolve_entities(query)
     target_user_id = str(user_id or get_primary_user_id()).strip()
     user_anchor = f"user:{target_user_id}"
+    matched_eids = resolve_entities(query, user_id=target_user_id)
     
     # If no specific user entity matched, default to primary user profile anchor
     if user_anchor not in matched_eids:
@@ -296,7 +322,7 @@ def build_world_model_context(query: str, max_tokens: int = 180, user_id: Option
         "[ACTIVE ENTITIES]"
     ]
 
-    target_max_words = int(max_tokens * 0.75) if max_tokens else 135
+    target_max_words = int(max_tokens * 0.75) if max_tokens else 350
     current_words = 15
 
     for eid, e in list(entities.items())[:3]:
@@ -310,14 +336,25 @@ def build_world_model_context(query: str, max_tokens: int = 180, user_id: Option
         lines.append("")
         lines.append("[VERIFIED CLAIMS]")
         # Prioritize claims relevant to query keywords, then source authority
-        query_words = set(re.findall(r"\w+", query.lower())) - {"what", "is", "my", "the", "a", "an", "in", "on", "for", "to", "do", "i", "how", "much"}
+        raw_words = set(re.findall(r"\w+", query.lower())) - {"what", "is", "my", "the", "a", "an", "in", "on", "for", "to", "do", "i", "how", "much", "about", "you", "know"}
+        query_words = set(raw_words)
+        # Expand semantic schedule / calendar aliases so both class schedule & academic calendar surface together
+        if any(w in query_words for w in ("schedule", "classes", "class", "calendar", "conversion", "term", "semester", "routine")):
+            query_words.update({"schedule", "calendar", "classes", "term", "semester", "academic"})
+        # Expand food / allergy / health aliases so medical conditions & allergies surface on food/health queries
+        if any(w in query_words for w in ("food", "eat", "lunch", "dinner", "breakfast", "cook", "make", "meal", "recipe", "shrimp", "seafood", "shellfish", "peanut", "allergic", "allergy", "allergies", "health", "medical", "medication", "kidney", "igan")):
+            query_words.update({"food", "lunch", "dinner", "meal", "allergic", "allergy", "allergies", "medical", "health", "diet", "shellfish", "pollen", "kidney", "igan"})
         
         def claim_relevance_score(c):
             pred = str(c.get("predicate", "")).lower()
             val = str(c.get("scalar_value", "") or c.get("object_id", "")).lower()
             auth = c.get("source_authority", 3)
             match_score = sum(3 for w in query_words if len(w) > 2 and w in pred)
-            match_score += sum(1 for w in query_words if len(w) > 2 and w in val)
+            match_score += sum(2 for w in query_words if len(w) > 2 and w in val)
+            # High safety priority: always prioritize active health/allergy constraints when food or health is relevant
+            if any(w in query_words for w in ("food", "eat", "lunch", "dinner", "meal", "allergic", "allergy", "allergies", "health", "diet")):
+                if "allergic" in pred or "medical" in pred or "allergy" in pred:
+                    match_score += 15
             return (match_score, auth)
 
         sorted_claims = sorted(claims, key=claim_relevance_score, reverse=True)
@@ -421,13 +458,17 @@ def get_world_model_entity(entity_id_or_name: str) -> Dict[str, Any]:
             "dossiers": dossier_rows
         }
 
-def search_world_model(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+def search_world_model(query: str, limit: int = 5, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Full-text BM25 search across all entities and dossiers in the Active World Model.
+    Scoped so user entities belonging to other users are excluded, and the current user is prioritized.
     """
     words = [w for w in re_words(query) if len(w) > 1]
     if not words:
         return []
+
+    target_user_id = str(user_id or get_primary_user_id()).strip() if user_id is not None else None
+    user_prefix = f"user:{target_user_id}" if target_user_id else None
 
     fts_query = " OR ".join(f'"{w}"' for w in words[:6])
     results = []
@@ -440,27 +481,43 @@ def search_world_model(query: str, limit: int = 5) -> List[Dict[str, Any]]:
                 FROM kg_search_fts
                 WHERE kg_search_fts MATCH ?
                 ORDER BY rank LIMIT ?
-            """, (fts_query, limit))
+            """, (fts_query, limit * 3))
+            
             for row in c.fetchall():
                 res = dict(row)
+                tid = res.get("target_id", "")
+                # Multi-tenant isolation: do not leak another user's entity, dossier, or claims
+                if tid.startswith("user:") and user_prefix and tid != user_prefix:
+                    continue
+                title_str = str(res.get("title", ""))
+                if title_str.startswith("user:") and user_prefix and not title_str.startswith(user_prefix):
+                    continue
+
                 if res["target_type"] == "entity":
                     # Fetch basic entity info
-                    c.execute("SELECT entity_type, canonical_name, attributes FROM kg_entities WHERE entity_id = ?", (res["target_id"],))
+                    c.execute("SELECT entity_type, canonical_name, attributes FROM kg_entities WHERE entity_id = ?", (tid,))
                     e = c.fetchone()
                     if e:
                         res["entity_type"] = e["entity_type"]
                         res["canonical_name"] = e["canonical_name"]
                         res["attributes"] = json.loads(e["attributes"]) if e["attributes"] else {}
+                
                 results.append(res)
+                if len(results) >= limit:
+                    break
         except Exception as err:
             return [{"error": f"FTS search error: {err}"}]
 
     return results
 
-def get_world_model_dossier(doc_id_or_title: str) -> Dict[str, Any]:
+def get_world_model_dossier(doc_id_or_title: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Retrieve a specific knowledge dossier document from the Active World Model.
+    Ensures dossiers belonging to other users are not accessed.
     """
+    target_user_id = str(user_id or get_primary_user_id()).strip() if user_id is not None else None
+    user_prefix = f"user:{target_user_id}" if target_user_id else None
+
     with _get_connection() as conn:
         c = conn.cursor()
         c.execute("""
@@ -470,23 +527,38 @@ def get_world_model_dossier(doc_id_or_title: str) -> Dict[str, Any]:
         row = c.fetchone()
         if not row:
             return {"error": f"Dossier '{doc_id_or_title}' not found."}
-        return dict(row)
+        
+        doc = dict(row)
+        peid = doc.get("primary_entity_id", "")
+        if peid.startswith("user:") and user_prefix and peid != user_prefix:
+            return {"error": f"Dossier '{doc_id_or_title}' not found."}
+        return doc
 
-def retract_world_model_claim(claim_id: str) -> Dict[str, Any]:
+def retract_world_model_claim(claim_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Retract an active claim by setting tx_retracted_at = now (preserving auditability).
+    Ensures user-scoped claims belonging to another user cannot be retracted.
     """
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    target_user_id = str(user_id or get_primary_user_id()).strip() if user_id is not None else None
+    user_prefix = f"user:{target_user_id}" if target_user_id else None
+
     with _get_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT claim_id, subject_id, predicate, tx_retracted_at FROM kg_claims WHERE claim_id = ?", (claim_id,))
         row = c.fetchone()
         if not row:
             return {"error": f"Claim '{claim_id}' not found."}
+        
+        subj = row["subject_id"]
+        if subj.startswith("user:") and user_prefix and subj != user_prefix:
+            return {"error": f"Claim '{claim_id}' not found or unauthorized."}
+
         if row["tx_retracted_at"]:
             return {"status": "ALREADY_RETRACTED", "claim_id": claim_id, "retracted_at": row["tx_retracted_at"]}
 
         c.execute("UPDATE kg_claims SET tx_retracted_at = ? WHERE claim_id = ?", (now_utc, claim_id))
+        c.execute("DELETE FROM kg_search_fts WHERE target_id = ?", (claim_id,))
         conn.commit()
 
     return {
@@ -547,14 +619,28 @@ def simulate_deterministic_cash_flow(
         """, (user_id,))
         recurring_bills = [dict(r) for r in c.fetchall()]
 
-        # 4. Active FWS cap status from world model
+        # 4. Active employment / work-study cap status from world model
         c.execute("""
-            SELECT scalar_value FROM kg_claims 
-            WHERE subject_id = 'org:cuny_hpc' AND predicate = 'semester_cap' 
+            SELECT object_id FROM kg_claims
+            WHERE subject_id = ? AND predicate = 'employed_by'
               AND tx_retracted_at IS NULL LIMIT 1
-        """)
-        fws_cap_row = c.fetchone()
-        fws_cap = float(fws_cap_row[0]) if fws_cap_row else 2500.0
+        """, (f"user:{user_id}",))
+        emp_row = c.fetchone()
+        employer_entity = emp_row[0] if emp_row else None
+
+        fws_cap = 0.0
+        if employer_entity:
+            c.execute("""
+                SELECT scalar_value FROM kg_claims 
+                WHERE subject_id = ? AND predicate = 'semester_cap' 
+                  AND tx_retracted_at IS NULL LIMIT 1
+            """, (employer_entity,))
+            fws_cap_row = c.fetchone()
+            if fws_cap_row and fws_cap_row[0]:
+                try:
+                    fws_cap = float(fws_cap_row[0])
+                except (ValueError, TypeError):
+                    fws_cap = 0.0
         
         # Check hours worked to date
         c.execute("""

@@ -843,11 +843,26 @@ def gmail_status(user_id: str | None = None) -> str:
             "not the expected read-only Gmail scope."
         )
 
+    token_is_expired = False
+    if token_expiry:
+        parsed_exp = _parse_iso(token_expiry)
+        if parsed_exp and parsed_exp <= datetime.now(timezone.utc):
+            token_is_expired = True
+
+    status_line = " Gmail connected."
+    expiry_suffix = ""
+    if token_is_expired:
+        # Check if credentials can still be loaded/refreshed
+        creds = _load_credentials(user_id)
+        if creds is None:
+            status_line = " Gmail authorization expired / invalid."
+            expiry_suffix = " (EXPIRED - Run `!gmail connect` to re-authorize)"
+
     return (
-        " Gmail connected.\n"
+        f"{status_line}\n"
         f" Account: **{_truncate(email_address, 200)}**\n"
         f" Scope: `gmail.readonly`\n"
-        f" Token expiry: `{_truncate(token_expiry, 80)}`"
+        f" Token expiry: `{_truncate(token_expiry, 80)}`{expiry_suffix}"
     )
 
 

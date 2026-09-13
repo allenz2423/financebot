@@ -108,7 +108,7 @@ async def maybe_flag_spending_concern(*,user_id: str):
         last_sent = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
         if datetime.now() - last_sent < timedelta(hours=12):
             return
-    financial_context = build_advisor_context(user_id=user_id)
+    financial_context = build_advisor_context(user_id=user_id, detailed_dump=True)
     system_msg = (
         "You are Delilah reviewing recent account activity to decide whether to proactively flag a concern.\n"
         "Only speak up for a genuine, specific concern. Be direct, not preachy — one or two sentences.\n"
@@ -207,14 +207,22 @@ async def reminder_watchdog_loop():
                 "CREATE TABLE IF NOT EXISTS scheduled_reminders "
                 "(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
                 "trigger_at TEXT, instruction TEXT, status TEXT DEFAULT 'pending', "
-                "channel_id INTEGER, recurring INTEGER DEFAULT 0, repeat_offset TEXT)"
+                "channel_id INTEGER, recurring INTEGER DEFAULT 0, repeat_offset TEXT, "
+                "send_push_notification INTEGER DEFAULT 0)"
             )
+            # Ensure send_push_notification column exists
+            _cols = {row[1] for row in _wc.execute("PRAGMA table_info(scheduled_reminders)").fetchall()}
+            if "send_push_notification" not in _cols:
+                try:
+                    _wc.execute("ALTER TABLE scheduled_reminders ADD COLUMN send_push_notification INTEGER DEFAULT 0")
+                except Exception:
+                    pass
             _wconn.commit()
 
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
             _wc.execute(
-                "SELECT id, instruction, channel_id, user_id, recurring, repeat_offset, trigger_at "
+                "SELECT id, instruction, channel_id, user_id, recurring, repeat_offset, trigger_at, send_push_notification "
                 "FROM scheduled_reminders "
                 "WHERE status = 'pending' AND trigger_at <= ?",
                 (now_str,),
@@ -229,6 +237,7 @@ async def reminder_watchdog_loop():
                 is_recurring = bool(row_data[4])
                 repeat_offset = row_data[5]
                 trigger_at_str = str(row_data[6]) if row_data[6] else None
+                send_push = bool(row_data[7]) if len(row_data) > 7 and row_data[7] else False
 
                 # Atomically claim this reminder.
                 _wc.execute(
@@ -285,6 +294,7 @@ async def reminder_watchdog_loop():
                     _is_recurring=is_recurring, _repeat_offset=repeat_offset,
                     _instruction=instruction, _channel_id=channel_id,
                     _trigger_at_str=trigger_at_str,
+                    _send_push=send_push,
                 ):
                     import sqlite3 as _sq3
                     # Each autonomous task gets its own connection to avoid cursor contention.
@@ -295,13 +305,14 @@ async def reminder_watchdog_loop():
                     try:
                         print(
                             f" [WATCHDOG] Firing reminder {rem_id} "
-                            f"for user {user_id} in channel {ch.id}"
+                            f"for user {user_id} in channel {ch.id} (send_push={_send_push})"
                         )
                         handle = _PseudoHandle(ch)
                         await ch.send(
                             " **Autonomous Wakeup:** Processing scheduled task..."
                         )
-                        await chat_with_delilah(prompt_text, user_id, handle)
+                        req_tools = {"send_push_alert"} if _send_push else None
+                        await chat_with_delilah(prompt_text, user_id, handle, required_tools=req_tools)
 
                         _acur.execute(
                             "UPDATE scheduled_reminders SET status = 'completed' "
@@ -314,7 +325,7 @@ async def reminder_watchdog_loop():
                         # Re-schedule recurring reminders on the dot.
                         if _is_recurring and _repeat_offset:
                             repeat_match = re.fullmatch(
-                                r"\+(\d+)([smhd])", str(_repeat_offset).strip()
+                                r"\+(\d+)([smhdw])", str(_repeat_offset).strip()
                             )
                             if repeat_match:
                                 val = int(repeat_match.group(1))
@@ -323,6 +334,7 @@ async def reminder_watchdog_loop():
                                     {"seconds": val} if unit == "s"
                                     else {"minutes": val} if unit == "m"
                                     else {"hours": val} if unit == "h"
+                                    else {"days": val * 7} if unit == "w"
                                     else {"days": val}
                                 )
                                 delta = timedelta(**kw)
@@ -349,9 +361,9 @@ async def reminder_watchdog_loop():
                                 _acur.execute(
                                     "INSERT INTO scheduled_reminders "
                                     "(user_id, trigger_at, instruction, channel_id, "
-                                    "recurring, repeat_offset) "
-                                    "VALUES (?, ?, ?, ?, 1, ?)",
-                                    (user_id, next_trigger, _instruction, _channel_id, _repeat_offset),
+                                    "recurring, repeat_offset, send_push_notification) "
+                                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                                    (user_id, next_trigger, _instruction, _channel_id, _repeat_offset, 1 if _send_push else 0),
                                 )
                                 _ac.commit()
                                 print(
@@ -406,7 +418,7 @@ async def reminder_watchdog_loop():
                     continue
 
                 task = asyncio.create_task(
-                    autonomous_run(prompt, uid, channel, r_id),
+                    autonomous_run(prompt, uid, channel, r_id, _send_push=send_push),
                     name=f"autonomous:{r_id}",
                 )
                 ADVISOR_STATUS.setdefault(uid, {})["cancel_requested"] = False
@@ -433,7 +445,7 @@ async def maybe_flag_windfall(merchant, amount, *, user_id: str):
     c.execute("INSERT INTO nudge_log (user_id, trigger_signature, last_sent_at) VALUES (?, ?, ?)", (user_id, sig, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
 
-    financial_context = build_advisor_context(user_id=user_id)
+    financial_context = build_advisor_context(user_id=user_id, detailed_dump=True)
     system_msg = (
         "You are Delilah. A large deposit or windfall just cleared in the user's account.\n"
         "Review the user's pinned memories, goals, and recent plans. Draft a proactive, direct message telling them EXACTLY what they should do with this money right now based on their priorities (e.g., debt repayment).\n"
@@ -472,7 +484,17 @@ async def maybe_flag_windfall(merchant, amount, *, user_id: str):
 # ============================================================
 # Advisor Context
 # ============================================================
-def build_advisor_context(*,user_id: str) -> str:
+def build_advisor_context(*, user_id: str, detailed_dump: bool = False) -> str:
+    """
+    Builds the financial context for Delilah using Progressive Disclosure (Layer 1 Index).
+    
+    Instead of dumping hundreds of lines of transactions and account details on every turn,
+    it provides an indexed summary table showing what financial domains exist, their high-level
+    state, approximate retrieval costs, and the exact tools to fetch granular details.
+    
+    If detailed_dump=True (e.g. for standalone alert evaluations like windfall or spending nudges),
+    it outputs full transaction and position detail.
+    """
     weekly_spending = get_weekly_spending(user_id=user_id)
     weekly_limit, impulse_threshold = get_budget_settings(user_id=user_id)
     balance = get_current_financial_position(user_id=user_id)
@@ -481,123 +503,142 @@ def build_advisor_context(*,user_id: str) -> str:
     buckets = get_savings_buckets(user_id=user_id)
     subscriptions = get_subscriptions(user_id=user_id)
 
-    lines = ["CURRENT FINANCIAL POSITION:"]
-    if balance["available"]:
-        if balance["total_liquid"] is not None:
-            lines.append(
-                f"- Liquid checking/cash: ${float(balance['total_liquid']):,.2f}"
-            )
-        if balance["net_cash"] is not None:
-            lines.append(f"- Net cash: {balance['net_cash']}")
-        if balance["all_balances"] is not None:
-            lines.append(f"- Account balances: {balance['all_balances']}")
+    if detailed_dump:
+        lines = ["CURRENT FINANCIAL POSITION:"]
+        if balance["available"]:
+            if balance["total_liquid"] is not None:
+                lines.append(
+                    f"- Liquid checking/cash: ${float(balance['total_liquid']):,.2f}"
+                )
+            if balance["net_cash"] is not None:
+                lines.append(f"- Net cash: {balance['net_cash']}")
+            if balance["all_balances"] is not None:
+                lines.append(f"- Account balances: {balance['all_balances']}")
+        else:
+            lines.append("- No balance snapshot is currently available.")
+
+        lines.extend(
+            [
+                "",
+                "SPENDING:",
+                f"- Last 7 days: ${weekly_spending:,.2f}",
+                f"- Weekly limit: ${weekly_limit:,.2f}",
+                f"- Impulse threshold: ${impulse_threshold:,.2f}",
+            ]
+        )
+
+        lines.extend(["", "RECENT TRANSACTIONS: (negative amount = refund/credit)"])
+        if recent_transactions:
+            for tx in recent_transactions:
+                lines.append(
+                    f"- {tx['date']} | {tx['merchant']} | {tx['category']} | ${tx['amount']:.2f}"
+                )
+        else:
+            lines.append("- No recent evaluated transactions.")
+
+        lines.extend(["", "RECENT INCOME:"])
+        if recent_income:
+            for inc in recent_income:
+                lines.append(
+                    f"- {inc['date']} | {inc['merchant']} | {inc['category']} | "
+                    f"${float(inc['income_amount'] or 0):.2f} income | "
+                    f"{inc['account']} | {inc['status']}"
+                )
+        else:
+            lines.append("- No income records available.")
+
+        lines.extend(["", "SAVINGS BUCKETS:"])
+        if buckets:
+            for b in buckets:
+                lines.append(
+                    f"- {b['name']}: ${float(b['current'] or 0):,.2f} / ${float(b['target'] or 0):,.2f}"
+                )
+        else:
+            lines.append("- No savings buckets configured.")
+
+        lines.extend(["", "TRACKED SUBSCRIPTIONS:"])
+        if subscriptions:
+            for s in subscriptions:
+                lines.append(
+                    f"- {s['merchant']}: ${float(s['amount'] or 0):.2f} (last {s['last_date']}) [{s['status']}]"
+                )
+        else:
+            lines.append("- No tracked subscriptions.")
+
+        return "\n".join(lines)
+
+    # --- PROGRESSIVE DISCLOSURE LAYER 1 (INDEX & CONTEXT PRIMING) ---
+    liquid_str = f"${float(balance['total_liquid']):,.2f}" if (balance.get("available") and balance.get("total_liquid") is not None) else "N/A"
+    net_cash_val = balance.get("net_cash")
+    if net_cash_val is not None:
+        net_str = str(net_cash_val) if isinstance(net_cash_val, str) else f"${float(net_cash_val):,.2f}"
     else:
-        lines.append("- No balance snapshot is currently available.")
-
-    lines.extend(
-        [
-            "",
-            "SPENDING:",
-            f"- Last 7 days: ${weekly_spending:,.2f}",
-            f"- Weekly limit: ${weekly_limit:,.2f}",
-            f"- Impulse threshold: ${impulse_threshold:,.2f}",
-        ]
-    )
-
-    lines.extend(["", "RECENT TRANSACTIONS: (negative amount = refund/credit)"])
-    if recent_transactions:
-        for tx in recent_transactions:
-            lines.append(
-                f"- {tx['date']} | {tx['merchant']} | {tx['category']} | ${tx['amount']:.2f}"
-            )
-    else:
-        lines.append("- No recent evaluated transactions.")
-
-    lines.extend(["", "RECENT INCOME:"])
-    if recent_income:
-        for inc in recent_income:
-            lines.append(
-                f"- {inc['date']} | {inc['merchant']} | {inc['category']} | "
-                f"${float(inc['income_amount'] or 0):.2f} income | "
-                f"{inc['account']} | {inc['status']}"
-            )
-    else:
-        lines.append("- No income records available.")
-
-    lines.extend(["", "SAVINGS BUCKETS:"])
+        net_str = "N/A"
+    spend_status = f"${weekly_spending:,.2f} / ${weekly_limit:,.2f} weekly limit (Impulse: ${impulse_threshold:,.2f})"
+    tx_count = len(recent_transactions) if recent_transactions else 0
+    inc_count = len(recent_income) if recent_income else 0
+    bucket_count = len(buckets) if buckets else 0
+    bucket_summary = f"{bucket_count} bucket(s)"
     if buckets:
-        for b in buckets:
-            lines.append(
-                f"- {b['name']}: ${float(b['current'] or 0):,.2f} / ${float(b['target'] or 0):,.2f}"
-            )
-    else:
-        lines.append("- No savings buckets configured.")
+        bucket_summary += f" (e.g. {buckets[0]['name']}: ${float(buckets[0].get('current') or 0):,.0f}/${float(buckets[0].get('target') or 0):,.0f})"
+    sub_count = len(subscriptions) if subscriptions else 0
 
-    lines.extend(["", "TRACKED SUBSCRIPTIONS:"])
-    if subscriptions:
-        for s in subscriptions:
-            lines.append(
-                f"- {s['merchant']}: ${float(s['amount'] or 0):.2f} (last {s['last_date']}) [{s['status']}]"
-            )
-    else:
-        lines.append("- No tracked subscriptions.")
-
-    # Financial Health & Credit Executive Summary
+    # Quick score check
+    health_summary = "Available"
     try:
         from src.services.scorecard import calculate_financial_health_scorecard
         health = calculate_financial_health_scorecard(user_id=user_id)
         if health and "total_score" in health:
-            lines.extend([
-                "",
-                "FINANCIAL HEALTH & CREDIT SUMMARY:",
-                f"- Composite Health Score: {health['total_score']}/100 (Grade: {health.get('grade', 'N/A')})",
-                f"- Primary Action Recommendation: {health.get('highest_leverage_action', 'Maintain current savings trajectory')}"
-            ])
+            health_summary = f"{health['total_score']}/100 (Grade: {health.get('grade', 'N/A')})"
     except Exception:
         pass
 
+    credit_summary = "Available"
     try:
         from src.services.credit import calculate_credit_utilization
         credit = calculate_credit_utilization(user_id=user_id)
         if credit and credit.get("revolving_cards"):
-            lines.append(
-                f"- Revolving Credit Utilization: {credit['aggregate_utilization_pct']:.1f}% "
-                f"(${credit['total_revolving_balance']:,.2f} / ${credit['total_credit_limit']:,.2f})"
-            )
+            credit_summary = f"{credit['aggregate_utilization_pct']:.1f}% util (${credit['total_revolving_balance']:,.2f}/${credit['total_credit_limit']:,.2f})"
     except Exception:
         pass
 
-    # Portfolio Overview
+    port_summary = "0 holdings"
     try:
         from src.services.portfolio import get_portfolio_summary
         port = get_portfolio_summary(user_id=user_id)
         if port and port.get("holdings_count", 0) > 0:
             pnl_sign = "+" if port.get("total_unrealized_pnl", 0) >= 0 else ""
-            lines.extend([
-                "",
-                "INVESTMENT PORTFOLIO SNAPSHOT:",
-                f"- Market Value: ${port['total_value']:,.2f} across {port['holdings_count']} holding(s)",
-                f"- Unrealized P&L: {pnl_sign}${port['total_unrealized_pnl']:,.2f} ({port['total_unrealized_pnl_pct']:+.1f}%)"
-            ])
+            port_summary = f"${port['total_value']:,.2f} ({port['holdings_count']} holdings, PnL: {pnl_sign}${port['total_unrealized_pnl']:,.2f})"
     except Exception:
         pass
 
-    # Upcoming Bills Pressure (Next 14 Days)
+    bills_summary = "None pending"
     try:
         from src.services.subscriptions import get_billing_calendar
         bills_cal = get_billing_calendar(user_id=user_id, days_ahead=14)
         upcoming = bills_cal.get("upcoming_bills", [])
         if upcoming:
-            lines.extend([
-                "",
-                f"UPCOMING BILLS (Next 14 Days: {len(upcoming)} due):"
-            ])
-            for b in upcoming[:5]:
-                lines.append(f"- {b.get('next_due_date', 'Soon')} | {b.get('merchant', 'Bill')}: ${float(b.get('amount', 0)):,.2f}")
+            bills_summary = f"{len(upcoming)} due in next 14d (next: {upcoming[0].get('merchant', 'Bill')} ${float(upcoming[0].get('amount', 0)):,.2f})"
     except Exception:
         pass
 
-    return "\n".join(lines)
+    index_lines = [
+        "FINANCIAL GROUND TRUTH INDEX (Progressive Disclosure - Layer 1)",
+        "Use this index to identify relevant financial domains. To access granular records, invoke the corresponding Layer 2/3 tool on-demand.",
+        "",
+        "| Domain | Current Summary | Est. Cost | Retrieval Tool |",
+        "|---|---|---|---|",
+        f"| 💳 Liquid & Accounts | Liquid: {liquid_str} | Net Cash: {net_str} | ~50 tok | get_current_financial_position |",
+        f"| 📊 Weekly Spend | {spend_status} | ~40 tok | query_spending / check_budget_status |",
+        f"| 🧾 Transactions | {tx_count} recent evaluated records | ~120 tok | get_recent_transactions / get_transaction_ledger |",
+        f"| 💵 Income & Inflows | {inc_count} recent/pending inflow records | ~60 tok | get_expected_income / get_cash_flow_projections |",
+        f"| 🎯 Savings Buckets | {bucket_summary} | ~45 tok | get_savings_buckets |",
+        f"| 🔁 Subscriptions | {sub_count} active tracked services | ~50 tok | get_subscriptions / get_billing_calendar |",
+        f"| 📈 Health & Credit | Score: {health_summary} | Credit: {credit_summary} | ~60 tok | calculate_financial_health_scorecard / get_credit_utilization |",
+        f"| 💼 Portfolio | {port_summary} | ~35 tok | get_portfolio_overview / get_portfolio_summary |",
+        f"| 📅 Upcoming Bills | {bills_summary} | ~40 tok | get_billing_calendar |",
+    ]
+    return "\n".join(index_lines)
 
 # ============================================================
 # Transaction Classification
@@ -2300,13 +2341,13 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_world_model_entity",
-            "description": "Look up an entity in the Active World Model Knowledge Graph (e.g. 'cuny_hpc', 'discover_it', 'apple_upgrade', 'user:current'). Returns full profile, attributes, verified active claims, and attached dossiers.",
+            "description": "Look up an entity in the Active World Model Knowledge Graph (e.g. 'org:employer', 'liability:credit_card', 'contract:lease', 'user:current'). Returns full profile, attributes, verified active claims, and attached dossiers.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "entity_id_or_name": {
                         "type": "string",
-                        "description": "Entity ID (e.g. 'org:cuny_hpc') or plain name/alias (e.g. 'CUNY HPC', 'Discover', 'Apple Upgrade')."
+                        "description": "Entity ID (e.g. 'org:company_name') or plain name/alias (e.g. 'Company', 'Discover', 'Landlord')."
                     }
                 },
                 "required": ["entity_id_or_name"]
@@ -2323,7 +2364,7 @@ BOT_TOOLS_SCHEMA = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search phrase (e.g. 'fws cap', 'seek stipend', 'fragrance freeze', 'tuition rate')."
+                        "description": "Search phrase (e.g. 'earnings cap', 'stipend', 'budget limit', 'tuition rate')."
                     },
                     "limit": {
                         "type": "integer",
@@ -2338,7 +2379,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_world_model_dossier",
-            "description": "Retrieve a detailed markdown dossier/document from the Active World Model (e.g. 'cuny_aid_disbursement_2026', 'delilah_system_protocols', 'apple_macbook_upgrade_evaluation').",
+            "description": "Retrieve a detailed markdown dossier/document from the Active World Model (e.g. 'aid_disbursement_2026', 'system_protocols', 'contract_evaluation').",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2361,7 +2402,7 @@ BOT_TOOLS_SCHEMA = [
                 "properties": {
                     "subject_id": {
                         "type": "string",
-                        "description": "Subject entity ID (e.g. 'user:current', 'org:cuny_hpc', 'liability:discover_it')."
+                        "description": "Subject entity ID (e.g. 'user:current', 'org:employer', 'liability:credit_card')."
                     },
                     "predicate": {
                         "type": "string",
@@ -2369,7 +2410,7 @@ BOT_TOOLS_SCHEMA = [
                     },
                     "object_id": {
                         "type": "string",
-                        "description": "Target entity ID if pointing to another entity (e.g. 'org:cuny_hpc')."
+                        "description": "Target entity ID if pointing to another entity (e.g. 'org:employer')."
                     },
                     "scalar_value": {
                         "type": "string",
@@ -2410,16 +2451,17 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "schedule_reminder",
-            "description": "Schedule a time-based reminder. You can pass an exact time like 'YYYY-MM-DD HH:MM:SS' OR use relative math like '+30s', '+5m', '+2h', '+1d'. ALWAYS prefer relative math when the user asks for 'in X minutes/seconds' so Python handles the math for you.",
+            "description": "Schedule a time-based reminder. You can pass an exact time like 'YYYY-MM-DD HH:MM:SS' OR use relative math like '+30s', '+5m', '+2h', '+1d', '+1w'. ALWAYS prefer relative math when the user asks for 'in X minutes/seconds' so Python handles the math for you.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "trigger_time": {"type": "string", "description": "Exact YYYY-MM-DD HH:MM:SS or relative offset like '+30s' or '+5m'"},
+                    "trigger_time": {"type": "string", "description": "Exact YYYY-MM-DD HH:MM:SS or relative offset like '+30s', '+5m', or '+1d'"},
                     "instruction": {"type": "string", "description": "What you need to do or say when it triggers"},
                     "recurring": {"type": "boolean", "description": "Set true to automatically repeat this reminder after each execution."},
-                    "repeat_offset": {"type": "string", "description": "Interval between recurring executions, such as '+30s', '+5m', '+2h', or '+1d'. Required when recurring is true."}
+                    "repeat_offset": {"type": "string", "description": "Interval between recurring executions, such as '+30s', '+5m', '+2h', '+1d', or '+1w'. Required when recurring is true."},
+                    "send_push_notification": {"type": "boolean", "description": "Whether to forcibly send a push notification to the user's phone via send_push_alert when this reminder triggers."}
                 },
-                "required": ["trigger_time", "instruction"]
+                "required": ["trigger_time", "instruction", "send_push_notification"]
             }
         }
     },
@@ -2498,7 +2540,8 @@ BOT_TOOLS_SCHEMA = [
                 "properties": {
                     "reminder_id": {"type": "integer"},
                     "trigger_time": {"type": "string", "description": "Exact YYYY-MM-DD HH:MM:SS or relative like '+30s'"},
-                    "instruction": {"type": "string"}
+                    "instruction": {"type": "string"},
+                    "send_push_notification": {"type": "boolean", "description": "Whether to forcibly send a push notification when triggered."}
                 },
                 "required": ["reminder_id"]
             }
@@ -2994,11 +3037,33 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["pdf_url"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scrape_rendered_page",
+            "description": "Deeply renders and scrapes JavaScript-heavy dynamic websites, university calendars, job portals, or price charts using a headless Chromium browser instance. Bypasses client-side rendering hurdles.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The full HTTP/HTTPS URL of the dynamic page to scrape."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "description": "Optional CSS selector to wait for before extracting page text (e.g. '.calendar-table', '#job-listings')."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
     }
 ] + NEW_50_TOOLS_SCHEMA
 
 SCHEMA_TOOL_NAMES = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
 EXPECTED_TOOL_NAMES = {
+    "scrape_rendered_page",
     "find_government_forms",
     "fill_pdf_form",
     "search_gmail",
@@ -3239,10 +3304,18 @@ async def sync_plaid_accounting(
             f"{upcoming}"
         )
         if post_summary:
-            target_c = DISCORD_CHANNEL_ID
-            channel = bot.get_channel(target_c) or bot.get_user(target_c)
-            if channel:
-                await channel.send(summary)
+            target_channel = None
+            if user_id and user_id.isdigit():
+                try:
+                    u = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+                    if u:
+                        target_channel = u.dm_channel or await u.create_dm()
+                except Exception:
+                    target_channel = None
+            if not target_channel:
+                target_channel = bot.get_channel(DISCORD_CHANNEL_ID) or bot.get_user(DISCORD_CHANNEL_ID)
+            if target_channel:
+                await target_channel.send(summary)
         return summary
     except Exception as exc:
         return f" Plaid accounting workflow failed: {type(exc).__name__}: {exc}"
@@ -3312,6 +3385,7 @@ async def _chat_with_delilah_impl(
     user_id: int | str,
     reply_msg,
     image_b64_list: list[str] | None = None,
+    required_tools: set[str] | None = None,
 ) -> str:
     uid = str(user_id or "").strip()
     if not uid:
@@ -3413,7 +3487,7 @@ async def _chat_with_delilah_impl(
         _canonical_url(u) for u in re.findall(r"https?://[^\s<>\)\]\"']+", recent_text)
     }
 
-    system_prompt = """You are Delilah, an elite Chief Financial Officer (CFO), Wealth Strategist, and Life Architecture Intelligence operating inside Discord.
+    system_prompt = r"""You are Delilah, an elite Chief Financial Officer (CFO), Wealth Strategist, and Life Architecture Intelligence operating inside Discord.
 
 Your primary directive is to maximize the user's financial power, security, and net worth while anchoring all strategy in their holistic ground truth. You manage not only accounts, debts, and cash flows, but also the real-world commitments that govern them: university enrollment, class schedules, transit routines, and life constraints stored in the Active World Model. NEVER deflect or claim that class schedules, academic commitments, or personal routines are out of scope—they are foundational inputs to your financial and lifestyle modeling. Internal model knowledge is untrusted for user specifics: database, world model, and tool results are the sole authoritative sources of truth.
 
@@ -3644,9 +3718,9 @@ ACTIVE WORLD MODEL RULES
 ==================================================
 
 WORLD-MODEL-FIRST HABIT: Before ANY transaction review, correction, merchant research, projection, financial recommendation, or "what should I do" question, check the Active World Model (get_world_model_entity or search_world_model) first when relevant. The Active World Model contains verified epistemic state across institutions, employers, liabilities, rules, user goals, academic enrollment, and schedules. Do not ask permission to check the world model.
-VERIFICATION: When answering questions about terms, rates, caps, obligations, or user constraints, always use get_world_model_entity (e.g. 'cuny_hpc', 'discover_it', 'user:current') or get_world_model_dossier. Never invent SQL table names.
+VERIFICATION: When answering questions about terms, rates, caps, obligations, or user constraints, always use get_world_model_entity (e.g. 'user:current', 'org:employer', 'liability:credit_card') or get_world_model_dossier. Never invent SQL table names.
 
-SCHEDULE & LIFE CONSTRAINTS: The Active World Model holds the user's verified real-world ground truth, including university class schedules, work commitments, and transit constraints. When the user asks about their schedule, routine, classes, or obligations, answer authoritatively from the Active World Model context or retrieve the dossier (e.g., cuny_fall_2026_class_schedule via get_world_model_dossier or search_world_model). NEVER claim or deflect that class schedules or life commitments are out of scope.
+SCHEDULE & LIFE CONSTRAINTS: The Active World Model holds the user's verified real-world ground truth, including university class schedules, work commitments, and transit constraints. When the user asks about their schedule, routine, classes, or obligations, answer authoritatively from the Active World Model context or retrieve the relevant dossier (e.g., via get_world_model_dossier or search_world_model). NEVER claim or deflect that class schedules or life commitments are out of scope.
 
 DEFAULT TO PERMANENCE: Save information proactively when learned (confirmed facts, hypotheses with >60% confidence, verification results, research insights, spending patterns, warnings, correction rules, audit lessons, contextual details, and financial goals) by asserting claims using assert_world_model_claim. Be eager to persist - when in doubt, save it.
 
@@ -3693,6 +3767,7 @@ For recurring maintenance, daily checks, or "loops":
 - The reminder instruction should contain only the work to perform at each occurrence, plus any state/countdown information needed for finite loops.
 - For FINITE loops (e.g., "run this 4 times"), include the current iteration/count in the instruction and stop the recurring schedule once the requested number of executions has been reached.
 - You are a programmable agent: use the recurring and repeat_offset fields instead of simulating recurrence by creating a chain of independent reminders. Never tell the user a finite loop is impossible.
+- ALWAYS specify send_push_notification (true or false). Set send_push_notification=true whenever the reminder requires sending an alert/push notification to the user's phone, or whenever the user asks for reminders/alerts on their phone. When an autonomous reminder triggers with push required, you MUST call send_push_alert before finishing.
 
 ==================================================
 TOOL FAILURE & SELF-DIAGNOSTICS
@@ -3733,11 +3808,42 @@ A follow-up on an existing comparison (price, value, availability, specs, perfor
 - If current info can't be verified, say so explicitly.
 - A previous search result does NOT count as fresh research.
 - Tool use is required before a researched follow-up answer.
-- LaTeX is fully installed in the execution sandbox (`pdflatex`, `latex`, `xelatex`, `dvipng`).
-- When generating reports, formal documents, financial summaries, or math-heavy papers, you can write `.tex` files and compile them to PDF using `pdflatex` via `run_shell`.
-- Always compile documents directly inside the user's persistent workspace (`$FINANCEBOT_WORKSPACE`) so outputs survive. Example:
-  `pdflatex -interaction=nonstopmode -output-directory="$FINANCEBOT_WORKSPACE" document.tex`
-- After successfully compiling a PDF in the workspace, use `send_workspace_file` with the relative path (e.g. `report.pdf`) to deliver the rendered document directly to the user.
+
+==================================================
+EXECUTIVE LATEX & PDF REPORTING PROTOCOL
+==================================================
+
+LaTeX is fully installed in the sandbox (`pdflatex`, `xelatex`). When asked to generate a formal document, executive summary, financial report, or audit PDF:
+- NEVER output raw Computer Modern default LaTeX with ugly unpadded tables or overlapping rules.
+- MANDATORY TYPOGRAPHIC & FORMATTING STANDARDS:
+  1. Font: Use clean modern sans-serif: `\usepackage{helvet}` and `\renewcommand{\familydefault}{\sfdefault}`.
+  2. Margins: Use tight, balanced geometry: `\usepackage[margin=0.75in]{geometry}`.
+  3. Section Dividers: NEVER draw horizontal rules (`\hrule`) that collide or slice through section headings. Always use `titlesec` with proper spacing:
+     `\titleformat{\section}{\large\bfseries\color{primary}}{}{0em}{}[\vspace{2pt}{\color{divider}\hrule height 0.75pt}]`
+  4. Tables: NEVER use raw vertical borders `|` or ugly `\hline`. Always use `\usepackage{booktabs, tabularx}`. Use `\toprule`, `\midrule`, and `\bottomrule`. Set `\renewcommand{\arraystretch}{1.2}` for generous row padding. Always wrap text columns with `X` or fixed `p{...}` widths so numbers and text never clip.
+  5. Executive Cards / Callouts: Use `\usepackage{tcolorbox}` with rounded corners, subtle borders, and shaded backgrounds for key takeaways, urgent warnings, or bottom-line metrics.
+  6. Character Escaping: Always escape special LaTeX characters: `\$` for dollar signs, `\%` for percentages, `\_` for underscores, `\&` for ampersands, and `\#` for numbers.
+  7. Compilation & Delivery: Always compile directly in `$FINANCEBOT_WORKSPACE`:
+     `pdflatex -interaction=nonstopmode -output-directory="$FINANCEBOT_WORKSPACE" report.tex`
+     Then deliver immediately via `send_workspace_file(file_path="report.pdf")`.
+
+RECOMMENDED SKELETON:
+```latex
+\documentclass[11pt,letterpaper]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{xcolor, booktabs, tabularx, titlesec, tcolorbox, helvet, microtype}
+\renewcommand{\familydefault}{\sfdefault}
+\definecolor{primary}{RGB}{20, 35, 60}
+\definecolor{accent}{RGB}{180, 40, 40}
+\definecolor{success}{RGB}{30, 120, 60}
+\definecolor{divider}{RGB}{200, 205, 215}
+\definecolor{cardbg}{RGB}{245, 247, 250}
+\titleformat{\section}{\large\bfseries\color{primary}}{}{0em}{}[\vspace{3pt}{\color{divider}\hrule height 0.75pt}\vspace{4pt}]
+\renewcommand{\arraystretch}{1.25}
+\begin{document}
+% Header, tcolorbox Executive Summary, booktabs tables, action bullets
+\end{document}
+```
 
 ==================================================
 DISCORD EXECUTIVE PRESENTATION PROTOCOL
@@ -3749,7 +3855,15 @@ DISCORD EXECUTIVE PRESENTATION PROTOCOL
   2. Financial Diagnostics (Key data points bolded: e.g. **Safe-to-Spend: $1,420.50**, **Health Score: 84/100 [Grade: A]**).
   3. Strategic Trade-Off Analysis (Clear markdown table or pros/cons comparison).
   4. Prescribed Next Steps (Bulleted list of concrete, high-leverage action items with specific dollar targets).
-- NEVER regurgitate raw JSON or technical database jargon. Convert all internal data into actionable human strategy.
+==================================================
+PROGRESSIVE DISCLOSURE PROTOCOL (CONTEXT EFFICIENCY)
+==================================================
+
+You operate under a 3-Layer Progressive Disclosure architecture:
+- Layer 1 (Index & Priming): The system context contains a concise FINANCIAL GROUND TRUTH INDEX summarizing active domains and estimated retrieval costs.
+- Layer 2 (Context Retrieval): When the user's query pertains to a domain (e.g. accounts, spending, subscriptions, credit, investments, bills), do NOT hallucinate or guess details. Call the designated retrieval tool (e.g. `get_current_financial_position`, `query_spending`, `get_subscriptions`, `get_credit_utilization_breakdown`, `get_billing_calendar`) to fetch precise records.
+- Layer 3 (Deep Dive & Reconciliation): For transaction disputes, deep audits, or external verification, drill down using granular tools (`get_transaction_ledger`, `search_web`, `gmail_*`, `run_python_sandbox`).
+- Show what exists first; fetch deep data only when relevant to the user's explicit objective.
 """
     system_prompt += """
 RUNTIME CONTRACT:
@@ -3798,8 +3912,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Prior financial conversations can contain balances, transactions,
     # merchants, budgets, etc. and therefore must not be exposed merely
     # because SESSION_HISTORY is normally reused across advisor turns.
+    # We maintain a clean, high-signal recent turn window to avoid context pollution.
     history = (
-        SESSION_HISTORY[uid][-1000:]
+        SESSION_HISTORY[uid][-14:]
         if context_policy["include_session_history"]
         else []
     )
@@ -4531,6 +4646,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             chunk_count = 0
             request_success = False
             stall_abort = False
+            was_interrupted = False
 
             try:
                 async with httpx.AsyncClient(timeout=600.0) as client:
@@ -4548,6 +4664,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             if USER_INTERRUPTS.get(uid) is not None:
                                 print(f"\\n [STREAM INTERRUPT] User paused generation.")
                                 full_text += "\\n[SYSTEM: Generation paused by user interrupt.]"
+                                was_interrupted = True
                                 break
 
                             delta = {}
@@ -5048,6 +5165,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             _CORE_READ_TOOLS | {
                 "search_web",
                 "fetch_webpage",
+                "scrape_rendered_page",
                 "crawl_deeper",
                 "send_push_alert",
                 "run_python_sandbox",
@@ -5138,13 +5256,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 "adjust_savings_bucket",
             },
         ),
-        # Schedule / classes / routine / commitments
+        # Schedule / classes / routine / commitments / calendar
         (
-            ("schedule", "class", "classes", "cuny", "routine", "commitment", "commitments"),
+            ("schedule", "class", "classes", "routine", "commitment", "commitments", "calendar", "conversion", "holiday", "holidays", "term", "semester", "break"),
             _CORE_READ_TOOLS | {
                 "get_world_model_entity",
                 "get_world_model_dossier",
                 "search_world_model",
+                "assert_world_model_claim",
                 "get_bills_calendar",
             },
         ),
@@ -5173,7 +5292,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
         return " ".join(tokens[:3])
 
     def _trim_old_tool_results(
-        msgs: list[dict], keep_full_tool_messages: int = 4, max_chars: int = 150
+        msgs: list[dict], keep_full_tool_messages: int = 6, max_chars: int = 150
     ) -> None:
         tool_indices = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
         if len(tool_indices) <= keep_full_tool_messages:
@@ -5181,9 +5300,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
         cutoff = tool_indices[-keep_full_tool_messages]
         for i in tool_indices:
             if i < cutoff:
-                tool_name = str(msgs[i].get("name", ""))
-                # Ultra-compress old tool results to just the tool name
-                msgs[i]["content"] = f"[{tool_name} executed]"
+                tool_name = str(msgs[i].get("name", "")).strip() or "tool"
+                prev_content = str(msgs[i].get("content", ""))
+                first_line = next((ln.strip() for ln in prev_content.splitlines() if ln.strip()), "")
+                if len(first_line) > 120:
+                    first_line = first_line[:120] + "..."
+                # Compress old tool results to name + summary
+                msgs[i]["content"] = f"[{tool_name}: {first_line or 'success'}]"
 
     async def _build_final_summary(alongside_text: str) -> str:
         """Guarantee a truthful terminal summary when end_turn fires."""
@@ -5241,6 +5364,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
         summary = re.sub(r"<thought>.*?</thought>|<think>.*?</think>", "", summary, flags=re.DOTALL).strip()
         return summary or " Task completed."
 
+    recent_tool_signatures: list[str] = []
+    consecutive_repetitive_rounds = 0
+
     while True:
         dynamically_loaded_tools = dynamically_loaded_tools if 'dynamically_loaded_tools' in locals() else set()
         end_turn_called = False
@@ -5248,6 +5374,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
         if (interrupt_msg := USER_INTERRUPTS.pop(uid, None)) is not None:
             consecutive_no_tool_rounds = 0  # Give it a fresh chance
+            pause_active = True
             print(f" [USER INTERRUPT] Injecting: {interrupt_msg}")
             messages.append(
                 {
@@ -5629,6 +5756,26 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     require_fresh_verification = True
                     attempts += 1
                     continue
+
+            executed_tools_so_far = {
+                str(entry.get("name"))
+                for entry in turn_tool_trace
+                if entry.get("ok")
+            }
+            if required_tools and not required_tools.issubset(executed_tools_so_far):
+                missing = required_tools - executed_tools_so_far
+                print(f" [REQUIRED TOOLS ENFORCEMENT] Rejecting end_turn: missing={missing}")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"SYSTEM ENFORCEMENT: This scheduled task requires calling {', '.join(missing)} "
+                        f"to deliver a push notification to the user's phone. You have not called {', '.join(missing)} yet. "
+                        f"You must call {', '.join(missing)} now with the completed message before ending the turn."
+                    ),
+                })
+                attempts += 1
+                continue
+
             summary = await _build_final_summary(content)
             final_content = (
                 f"{accumulated_narrative}\n{summary}".strip()
@@ -5717,6 +5864,24 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         "content": (
                             "SYSTEM ENFORCEMENT: plain-text end_turn is invalid during an audit. "
                             "Emit the native end_turn tool only after final deterministic verification passes."
+                        ),
+                    })
+                    attempts += 1
+                    continue
+                executed_tools_so_far = {
+                    str(entry.get("name"))
+                    for entry in turn_tool_trace
+                    if entry.get("ok")
+                }
+                if required_tools and not required_tools.issubset(executed_tools_so_far):
+                    missing = required_tools - executed_tools_so_far
+                    print(f" [REQUIRED TOOLS ENFORCEMENT] Rejecting plain-text end_turn: missing={missing}")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"SYSTEM ENFORCEMENT: This scheduled task requires calling {', '.join(missing)} "
+                            f"to deliver a push notification to the user's phone. You have not called {', '.join(missing)} yet. "
+                            f"You must call {', '.join(missing)} now with the completed message before finishing."
                         ),
                     })
                     attempts += 1
@@ -5810,11 +5975,45 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 attempts += 1
                 continue
 
-            if len(text_final) > 40 and not promised_tools and not audit_active_now and not require_fresh_verification:
+            if len(text_final) > 40 and not promised_tools and not audit_active_now and not require_fresh_verification and not pause_active:
+                executed_tools_so_far = {
+                    str(entry.get("name"))
+                    for entry in turn_tool_trace
+                    if entry.get("ok")
+                }
+                if required_tools and not required_tools.issubset(executed_tools_so_far):
+                    missing = required_tools - executed_tools_so_far
+                    print(f" [REQUIRED TOOLS ENFORCEMENT] Rejecting plain-text exit: missing={missing}")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"SYSTEM ENFORCEMENT: This scheduled task requires calling {', '.join(missing)} "
+                            f"to deliver a push notification to the user's phone. You have not called {', '.join(missing)} yet. "
+                            f"You must call {', '.join(missing)} now with the completed message before finishing."
+                        ),
+                    })
+                    attempts += 1
+                    continue
                 print(f" [PLAIN TEXT EXIT] Accepting final response ({len(text_final)} chars) and breaking loop.")
                 break
 
             if consecutive_no_tool_rounds >= 5:
+                executed_tools_so_far = {
+                    str(entry.get("name"))
+                    for entry in turn_tool_trace
+                    if entry.get("ok")
+                }
+                if required_tools and not required_tools.issubset(executed_tools_so_far):
+                    missing = required_tools - executed_tools_so_far
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"SYSTEM ENFORCEMENT: You must call {', '.join(missing)} now to send the push alert to the user. "
+                            f"Do not respond with plain text."
+                        ),
+                    })
+                    attempts += 1
+                    continue
                 final_content = (
                     f"{final_content}\n[System halted: no native tool calls or end_turn emitted.]"
                 ).strip()
@@ -6085,7 +6284,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         else:
                             # If called generically (e.g. get_memories() or get_memories(category='general')),
                             # return the verified Active World Model ground truth context so the model has the exact data
-                            awm_block = build_world_model_context("schedule classes debts cuny", max_tokens=600, user_id=uid)
+                            awm_block = build_world_model_context("profile schedule debts obligations", max_tokens=600, user_id=uid)
                             db_result = json.dumps({
                                 "status": "ACTIVE_WORLD_MODEL_VERIFIED_STATE",
                                 "context": awm_block,
@@ -7303,7 +7502,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = json.dumps(health, indent=2)
                     elif func_name == "get_world_model_entity":
                         target = str(args.get("entity_id_or_name", "") or args.get("entity_id", "") or args.get("name", "")).strip()
-                        if not target:
+                        # Auto-map empty, user, me, self, or profile to current tenant user node
+                        if not target or target.lower() in ("user", "me", "myself", "self", "user_profile", "profile"):
                             target = f"user:{uid}"
                         res = get_world_model_entity(target)
                         db_result = json.dumps(res, indent=2)
@@ -7313,30 +7513,62 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         if not query_str:
                             db_result = "ERROR: query is required."
                         else:
-                            res = search_world_model(query_str, limit=limit_val)
+                            res = search_world_model(query_str, limit=limit_val, user_id=uid)
                             db_result = json.dumps(res, indent=2)
                     elif func_name == "get_world_model_dossier":
                         doc_target = str(args.get("doc_id_or_title", "")).strip()
                         if not doc_target:
                             db_result = "ERROR: doc_id_or_title is required."
                         else:
-                            res = get_world_model_dossier(doc_target)
+                            res = get_world_model_dossier(doc_target, user_id=uid)
                             db_result = json.dumps(res, indent=2)
                     elif func_name == "assert_world_model_claim":
-                        s_id = str(args.get("subject_id", "")).strip()
+                        s_id = str(args.get("subject_id") or args.get("entity_id") or args.get("entity") or "").strip()
                         pred = str(args.get("predicate", "")).strip()
                         o_id = args.get("object_id")
-                        s_val = args.get("scalar_value")
+                        s_val = args.get("scalar_value") if args.get("scalar_value") is not None else args.get("value")
                         p_type = str(args.get("provenance_type", "USER_STATED"))
                         s_auth = int(args.get("source_authority", 4))
-                        if not s_id or not pred:
-                            db_result = "ERROR: subject_id and predicate are required."
+                        
+                        # Fallback parsing if model passes "claim" instead of subject/predicate/scalar
+                        claim_text = str(args.get("claim", "")).strip()
+                        if not pred and claim_text:
+                            # Try parsing 'subject -> predicate: value' or 'predicate: value' or natural statement
+                            if "->" in claim_text:
+                                parts = claim_text.split("->", 1)
+                                if not s_id:
+                                    s_id = parts[0].strip()
+                                rest = parts[1].strip()
+                                if ":" in rest:
+                                    p_part, v_part = rest.split(":", 1)
+                                    pred = p_part.strip()
+                                    s_val = s_val or v_part.strip()
+                                else:
+                                    pred = "relationship"
+                                    s_val = s_val or rest
+                            elif ":" in claim_text:
+                                p_part, v_part = claim_text.split(":", 1)
+                                pred = p_part.strip()
+                                s_val = s_val or v_part.strip()
+                            else:
+                                pred = "fact"
+                                s_val = s_val or claim_text
+
+                        # If predicate is still empty but scalar_value exists, default to 'fact'
+                        if not pred and s_val:
+                            pred = "fact"
+
+                        # Automatically default user-referencing subject to active caller uid
+                        if not s_id or s_id.lower() in ("user", "me", "myself", "self", "profile", "user_profile"):
+                            s_id = f"user:{uid}"
+                        if not pred:
+                            db_result = "ERROR: predicate is required."
                         else:
                             cid = assert_claim(
                                 subject_id=s_id,
                                 predicate=pred,
                                 object_id=str(o_id).strip() if o_id else None,
-                                scalar_value=s_val,
+                                scalar_value=str(s_val) if s_val is not None else None,
                                 provenance_type=p_type,
                                 source_authority=s_auth
                             )
@@ -7346,14 +7578,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         if not cid:
                             db_result = "ERROR: claim_id is required."
                         else:
-                            res = retract_world_model_claim(cid)
+                            res = retract_world_model_claim(cid, user_id=uid)
                             db_result = json.dumps(res, indent=2)
                     elif func_name == "schedule_reminder":
                         c.execute(
                             "CREATE TABLE IF NOT EXISTS scheduled_reminders "
                             "(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
                             "trigger_at TEXT, instruction TEXT, status TEXT DEFAULT 'pending', "
-                            "channel_id INTEGER, recurring INTEGER DEFAULT 0, repeat_offset TEXT)"
+                            "channel_id INTEGER, recurring INTEGER DEFAULT 0, repeat_offset TEXT, "
+                            "send_push_notification INTEGER DEFAULT 0)"
                         )
 
                         # Migrate existing databases.
@@ -7368,6 +7601,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             ("channel_id", "INTEGER"),
                             ("recurring", "INTEGER DEFAULT 0"),
                             ("repeat_offset", "TEXT"),
+                            ("send_push_notification", "INTEGER DEFAULT 0"),
                         ):
                             if column not in cols:
                                 try:
@@ -7384,32 +7618,33 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         instruction_val = args.get("instruction")
                         recurring = bool(args.get("recurring", False))
                         repeat_offset = args.get("repeat_offset")
+                        send_push_notification = bool(args.get("send_push_notification", False))
 
                         # Validate recurrence configuration.
                         if recurring and not repeat_offset:
                             db_result = (
                                 "ERROR: recurring=true requires repeat_offset "
-                                "(example: +1d, +6h, +30m)."
+                                "(example: +1w, +1d, +6h, +30m)."
                             )
                         else:
                             repeat_match = None
                             if repeat_offset:
                                 repeat_match = re.fullmatch(
-                                    r"\+(\d+)([smhd])",
+                                    r"\+(\d+)([smhdw])",
                                     str(repeat_offset).strip(),
                                 )
 
                             if repeat_offset and not repeat_match:
                                 db_result = (
                                     "ERROR: repeat_offset must be like "
-                                    "+30s, +5m, +2h, or +1d."
+                                    "+30s, +5m, +2h, +1d, or +1w."
                                 )
                             else:
                                 trigger_match = None
 
                                 if trigger_val.startswith("+"):
                                     trigger_match = re.fullmatch(
-                                        r"\+(\d+)([smhd])",
+                                        r"\+(\d+)([smhdw])",
                                         trigger_val,
                                     )
 
@@ -7430,6 +7665,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                             if unit == "m"
                                             else {"hours": val}
                                             if unit == "h"
+                                            else {"days": val * 7}
+                                            if unit == "w"
                                             else {"days": val}
                                         )
 
@@ -7465,8 +7702,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     c.execute(
                                         "INSERT INTO scheduled_reminders "
                                         "(user_id, trigger_at, instruction, channel_id, "
-                                        "recurring, repeat_offset) "
-                                        "VALUES (?, ?, ?, ?, ?, ?)",
+                                        "recurring, repeat_offset, send_push_notification) "
+                                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                                         (
                                             uid,
                                             trigger_val,
@@ -7478,19 +7715,21 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                                 if repeat_offset
                                                 else None
                                             ),
+                                            1 if send_push_notification else 0,
                                         ),
                                     )
 
                                     conn.commit()
 
+                                    push_str = " with push alert" if send_push_notification else ""
                                     if recurring:
                                         db_result = (
                                             f"Reminder scheduled for {trigger_val} "
-                                            f"(recurring every {repeat_offset})."
+                                            f"(recurring every {repeat_offset}){push_str}."
                                         )
                                     else:
                                         db_result = (
-                                            f"Reminder scheduled for {trigger_val}."
+                                            f"Reminder scheduled for {trigger_val}{push_str}."
                                         )
 
                     elif func_name == "get_scheduled_reminders":
@@ -7535,6 +7774,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         rid = args.get("reminder_id")
                         trigger_val = args.get("trigger_time")
                         instruction = args.get("instruction")
+                        send_push_notification = args.get("send_push_notification")
                         updates = []
                         params = []
                         if trigger_val:
@@ -7550,8 +7790,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         if instruction:
                             updates.append("instruction = ?")
                             params.append(instruction)
+                        if send_push_notification is not None:
+                            updates.append("send_push_notification = ?")
+                            params.append(1 if send_push_notification else 0)
                         if not updates:
-                            db_result = " Provide trigger_time or instruction to update."
+                            db_result = " Provide trigger_time, instruction, or send_push_notification to update."
                         else:
                             params.append(rid)
                             c.execute(f"UPDATE scheduled_reminders SET {', '.join(updates)} WHERE id = ? AND user_id = ?", params + [uid])
@@ -7615,6 +7858,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         field_overrides = args.get("field_overrides") or {}
                         from src.services.forms import fill_pdf_form
                         res = await fill_pdf_form(pdf_url, field_overrides=field_overrides, user_id=uid)
+                        db_result = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
+                    elif func_name == "scrape_rendered_page":
+                        target_url = str(args.get("url") or "").strip()
+                        if not target_url:
+                            raise ValueError("url is required for scrape_rendered_page")
+                        selector = args.get("wait_for_selector")
+                        from src.services.browserless import scrape_rendered_page
+                        res = await scrape_rendered_page(target_url, wait_for_selector=selector)
                         db_result = json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res)
                     elif func_name in ADVISOR_TOOLS_DISPATCH:
                         try:
@@ -7748,6 +7999,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     {
                         "role": "tool",
                         "tool_call_id": _tool_call_id,
+                        "name": str(func_name or "unknown_tool"),
                         "content": tagged_content,
                     }
                 )
@@ -7912,6 +8164,40 @@ CURRENT DATABASE FINANCIAL CONTEXT
             )
             end_turn_called = True
             break
+
+        # ── DUPLICATE / REPETITIVE TOOL BATCH LOOP BREAKER ──
+        if tool_calls and not _audit_is_active():
+            round_sig = json.dumps(sorted([
+                (
+                    tc.get("function", {}).get("name", ""),
+                    tc.get("function", {}).get("arguments", "")
+                )
+                for tc in tool_calls
+                if isinstance(tc, dict)
+            ]))
+            recent_tool_signatures.append(round_sig)
+            if len(recent_tool_signatures) > 10:
+                recent_tool_signatures.pop(0)
+
+            # Check if this exact tool signature or subset was already executed repeatedly
+            recent_repeats = recent_tool_signatures.count(round_sig)
+            if recent_repeats >= 3 or (len(recent_tool_signatures) >= 4 and len(set(recent_tool_signatures[-4:])) <= 2):
+                consecutive_repetitive_rounds += 1
+            else:
+                consecutive_repetitive_rounds = 0
+
+            if consecutive_repetitive_rounds >= 2:
+                print(
+                    f" [REPETITIVE TOOL LOOP BREAKER] Model emitted identical/repetitive tool calls across multiple rounds. Forcing final answer."
+                )
+                summary = await _build_final_summary(content)
+                final_content = (
+                    f"{accumulated_narrative}\n{summary}".strip()
+                    if accumulated_narrative
+                    else (summary.strip() or "Task completed based on retrieved financial data.")
+                )
+                end_turn_called = True
+                break
 
         # ── DUPLICATE MEMORY LOOP BREAKER ──
         if tool_calls:
@@ -8089,6 +8375,7 @@ async def chat_with_delilah(
     user_id: int | str,
     reply_msg,
     image_b64_list: list[str] | None = None,
+    required_tools: set[str] | None = None,
 ) -> str:
     """Cancellable, observable wrapper. Turn timeout is a 2-hour safety net only."""
     print(
@@ -8119,7 +8406,7 @@ async def chat_with_delilah(
     print(f" [ADVISOR START] uid={uid} prompt_chars={len(prompt_text or '')}")
     try:
         result = await _chat_with_delilah_impl(
-            prompt_text, uid, reply_msg, image_b64_list=image_b64_list
+            prompt_text, uid, reply_msg, image_b64_list=image_b64_list, required_tools=required_tools
         )
         duration = round(time.monotonic() - started, 2)
         await _set_advisor_status(

@@ -52,6 +52,7 @@ CAPABILITY_REGISTRY = {
     },
     "External Services": {
         "Gmail": ["search_gmail", "read_gmail_thread", "read_gmail_message", "analyze_price_drop_and_draft_refund"],
+        "Web Browsing & Scraping": ["scrape_rendered_page", "fetch_webpage", "crawl_deeper"],
     }
 }
 

@@ -1257,11 +1257,22 @@ async def _get_playwright_browser():
         except ImportError:
             print(" Playwright unavailable; install playwright + Chromium to enable JS rendering.")
             return None
+        browserless_url = os.getenv("BROWSERLESS_URL")
+        if browserless_url:
+            try:
+                ws_url = browserless_url.rstrip("/").replace("http://", "ws://").replace("https://", "wss://") + "/chrome"
+                _PLAYWRIGHT_INSTANCE = await async_playwright().start()
+                _PLAYWRIGHT_BROWSER = await _PLAYWRIGHT_INSTANCE.chromium.connect_over_cdp(ws_url)
+                print(f" [Playwright] Connected to Browserless CDP at {ws_url}")
+                return _PLAYWRIGHT_BROWSER
+            except Exception as e:
+                print(f" [Playwright] Failed to connect to Browserless CDP ({e}); falling back to local Chromium.")
+
         _PLAYWRIGHT_INSTANCE = await async_playwright().start()
         _PLAYWRIGHT_BROWSER = await _PLAYWRIGHT_INSTANCE.chromium.launch(
             headless=PLAYWRIGHT_HEADLESS
         )
-        print(" [Playwright] Chromium coprocessor ready")
+        print(" [Playwright] Local Chromium coprocessor ready")
         return _PLAYWRIGHT_BROWSER
 
 async def _shutdown_playwright():

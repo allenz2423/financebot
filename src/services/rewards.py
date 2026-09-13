@@ -31,25 +31,62 @@ KNOWN_CARD_PROFILES = {
 }
 
 MERCHANT_CATEGORY_RULES = {
-    r"starbucks|dunkin|mcdonald|chipotle|wendy|burger|taco|chick-fil-a|subway|panera|pizza|coffee|cafe|restaurant|bistro|deli|bar\b|grill": "dining",
-    r"whole\s*foods|trader\s*joe|safeway|kroger|wegmans|aldi|publix|heb|market|grocery|supermarket": "groceries",
-    r"uber(?!\s*eats)|lyft|delta|united\s*air|american\s*air|southwest|jetblue|hotel|marriott|hilton|hyatt|airbnb|expedia": "travel",
-    r"amazon|target\.com|walmart\.com|ebay|bestbuy|apple\.com": "online retail",
-    r"chevron|shell|bp|exxon|mobil|sunoco|wawa|speedway|gas\b": "gas",
-    r"netflix|spotify|hulu|disney|hbo|max|apple\s*tv|youtube\s*prem": "streaming",
+    r"starbucks|dunkin|mcdonald|chipotle|wendy|burger|taco|chick-fil-a|subway|panera|pizza|coffee|cafe|restaurant|bistro|deli|bar\b|grill|olive\s*garden|applebee|cheesecake|outback|red\s*lobster|texas\s*roadhouse|ihop|denny|buffalo\s*wild|panda\s*express|shake\s*shack|five\s*guys|sweetgreen|cava|ramen|sushi|noodle|bakery|diner|eatery|kitchen|pub\b|brewery|taqueria": "dining",
+    r"whole\s*foods|trader\s*joe|safeway|kroger|wegmans|aldi|publix|heb|market|grocery|supermarket|food\s*bazaar|h\s*mart|costco|bj'?s\s*club|sam'?s\s*club": "groceries",
+    r"uber(?!\s*eats)|lyft|delta|united\s*air|american\s*air|southwest|jetblue|hotel|marriott|hilton|hyatt|airbnb|expedia|booking|airline|flight": "travel",
+    r"amazon|target|walmart|ebay|best\s*buy|apple\.com|newegg|b&h|aliexpress|temu|shein|etsy|wayfair|homedepot|lowe'?s|ikea": "online retail",
+    r"chevron|shell|bp|exxon|mobil|sunoco|wawa|speedway|gas\b|citgo|marathon|valero|7-eleven|circle\s*k": "gas",
+    r"netflix|spotify|hulu|disney|hbo|max|apple\s*tv|youtube\s*prem|paramount|peacock|crunchyroll": "streaming",
+    r"amc|regal|cinemark|ticketmaster|stubhub|live\s*nation|bowling|arcade|concert|theatre|theater|cinema": "entertainment",
+    r"cvs|walgreens|rite\s*aid|duane\s*reade|pharmacy|drugstore|chemist": "drugstores",
+}
+
+# Explicit categories recognized by rewards profiles
+KNOWN_REWARD_CATEGORIES = {
+    "dining", "groceries", "online retail", "gas", "streaming",
+    "travel", "entertainment", "drugstores", "transit", "rent",
+    "apple", "online groceries", "apple pay"
 }
 
 def infer_category(category: str, merchant: Optional[str] = None) -> str:
-    """Normalize or infer category from merchant name."""
+    """Normalize or infer category from category string and/or merchant name."""
     cat = (category or "").strip().lower()
-    if cat and cat not in {"other", "general", "uncategorized"}:
-        return cat
-
+    
+    # 1. If merchant is provided, check rule matches first
     if merchant:
-        m_lower = merchant.lower()
+        m_lower = merchant.strip().lower()
         for pattern, inferred in MERCHANT_CATEGORY_RULES.items():
             if re.search(pattern, m_lower):
                 return inferred
+
+    # 2. If category is an exact known category or contains key terms
+    if cat and cat not in {"other", "general", "uncategorized"}:
+        if cat in KNOWN_REWARD_CATEGORIES:
+            return cat
+        # Check if category text itself matches merchant/category rules
+        for pattern, inferred in MERCHANT_CATEGORY_RULES.items():
+            if re.search(pattern, cat):
+                return inferred
+        # Check standard category fuzzy mappings
+        if any(term in cat for term in ["dining", "food", "restaurant", "cafe", "coffee", "fast food", "bakery", "deli", "bistro", "ramen", "sushi"]):
+            return "dining"
+        if any(term in cat for term in ["grocer", "supermarket", "market"]):
+            return "groceries"
+        if any(term in cat for term in ["retail", "shopping", "merchandise", "electronics", "online shopping"]):
+            return "online retail"
+        if any(term in cat for term in ["travel", "airline", "hotel", "flight", "lodging"]):
+            return "travel"
+        if any(term in cat for term in ["transit", "commute", "subway", "bus", "train", "mta"]):
+            return "transit"
+        if any(term in cat for term in ["gas", "fuel"]):
+            return "gas"
+        if any(term in cat for term in ["stream", "music", "video"]):
+            return "streaming"
+        if any(term in cat for term in ["entertain", "movie", "theater", "concert", "ticket"]):
+            return "entertainment"
+        if any(term in cat for term in ["pharmacy", "drug", "health & beauty", "beauty"]):
+            return "drugstores"
+        return cat
 
     return cat or "other"
 

@@ -14,8 +14,9 @@ python-dotenv>=1.0.1
 pydantic>=2.9.0
 pydantic-settings>=2.6.0
 
-# Web Scraping
+# Web Scraping & MCP
 playwright>=1.52.0
+mcp>=1.2.0
 
 # Image & PDF Processing
 Pillow>=10.0.0

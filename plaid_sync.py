@@ -66,6 +66,32 @@ def _format_net_cash(net_cash: float) -> str:
     return f"+${net_cash:.2f}" if net_cash >= 0 else f"-${abs(net_cash):.2f}"
 
 
+async def _get_user_notification_target(bot, user_id: Optional[str] = None, fallback_channel_id: Optional[int] = None):
+    """
+    Resolve the notification target for a user: attempts DM channel first,
+    falling back to the channel ID if DM is unavailable.
+    """
+    if not bot:
+        return None
+    uid = str(user_id or "").strip()
+    if uid and uid.isdigit():
+        try:
+            target_user = bot.get_user(int(uid))
+            if not target_user:
+                target_user = await bot.fetch_user(int(uid))
+            if target_user:
+                dm = target_user.dm_channel
+                if dm is None:
+                    dm = await target_user.create_dm()
+                if dm:
+                    return dm
+        except Exception as exc:
+            logger.debug(f"Failed to resolve user DM for {uid}: {exc}")
+    if fallback_channel_id:
+        return bot.get_channel(fallback_channel_id)
+    return None
+
+
 def _ensure_visibility_tables(conn: sqlite3.Connection) -> None:
     """
     Ensure all required tables exist with proper schema.
@@ -479,16 +505,16 @@ async def run_hourly_balance_update(
     ))
     conn.commit()
     
-    if bot and channel_id and post_discord:
-        channel = bot.get_channel(channel_id)
-        if channel:
+    if bot and post_discord:
+        target = await _get_user_notification_target(bot, user_id=user_id, fallback_channel_id=channel_id)
+        if target:
             msg = (
                 f" **Hourly Balance Update**\n"
                 f" Liquid Checking: ${pos['checking_balance']:.2f}\n"
                 f" Cards: {card_summary}\n"
                 f" Net Cash: {_format_net_cash(pos['net_cash'])}"
             )
-            await channel.send(msg)
+            await target.send(msg)
     
     return pos
 
@@ -535,7 +561,18 @@ async def _handle_new_transaction(
     )
     conn.commit()
     if send_alert and post_discord:
-        await _send_transaction_alert(bot, channel_id, merchant_name, amount, account_name, total_liquid, net_cash, transaction_id, txn_date)
+        await _send_transaction_alert(
+            bot,
+            channel_id,
+            merchant_name,
+            amount,
+            account_name,
+            total_liquid,
+            net_cash,
+            transaction_id,
+            txn_date,
+            user_id=user_id,
+        )
 
 
 async def _handle_modified_transaction(
@@ -613,10 +650,10 @@ async def sync_plaid_transactions(
                     logger.error(f"Plaid transactions sync batch failed: {exc}")
                     break
             _set_cursor(conn, user_id, token_key, cursor)
-            if is_initial_sync and count and bot and channel_id and post_discord:
-                channel = bot.get_channel(channel_id)
-                if channel:
-                    await channel.send(f" **Initial sync complete** for account ending `...{token[-6:]}`: {count} transactions imported.")
+            if is_initial_sync and count and bot and post_discord:
+                target = await _get_user_notification_target(bot, user_id=user_id, fallback_channel_id=channel_id)
+                if target:
+                    await target.send(f" **Initial sync complete** for account ending `...{token[-6:]}`: {count} transactions imported.")
 
 
 async def _send_transaction_alert(
@@ -629,15 +666,17 @@ async def _send_transaction_alert(
     net_cash: float,
     transaction_id: str,
     txn_date: str,
+    *,
+    user_id: Optional[str] = None,
 ) -> None:
-    if not bot or not channel_id:
+    if not bot:
         return
-    channel = bot.get_channel(channel_id)
-    if not channel:
+    target = await _get_user_notification_target(bot, user_id=user_id, fallback_channel_id=channel_id)
+    if not target:
         return
     is_purchase = amount > 0
     action = "New Purchase Detected" if is_purchase else "Payment/Refund Received"
-    await channel.send(
+    await target.send(
         f" **{action}**\n"
         f" Merchant: {merchant or 'Unknown'}\n"
         f" Amount: ${abs(amount):.2f}\n"

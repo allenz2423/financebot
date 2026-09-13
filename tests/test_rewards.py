@@ -18,10 +18,15 @@ def test_rewards_recommendation():
 
 def test_merchant_category_inference():
     assert infer_category("", "Starbucks") == "dining"
+    assert infer_category("", "Olive Garden") == "dining"
     assert infer_category("", "Trader Joe's") == "groceries"
     assert infer_category("", "Uber") == "travel"
     assert infer_category("", "Shell Oil") == "gas"
     assert infer_category("", "Netflix") == "streaming"
+    assert infer_category("", "bestbuy") == "online retail"
+    assert infer_category("", "Amazon") == "online retail"
+    assert infer_category("bestbuy", "bestbuy") == "online retail"
+    assert infer_category("Olive Garden", "Olive Garden") == "dining"
 
 def test_wallet_card_lookup_and_audit():
     res = recommend_best_card(user_id="342385739952160769", merchant="Chipotle")

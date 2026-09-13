@@ -37,9 +37,9 @@ from src.services.llm import BOT_TOOLS_SCHEMA, EXPECTED_TOOL_NAMES, SCHEMA_TOOL_
 
 def test_schema_registration_and_invariants():
     """Verify tool registration in BOT_TOOLS_SCHEMA and 50-tools invariants."""
-    # Invariant: advisor tools collections must match pruned count (38)
-    assert len(NEW_50_TOOLS_SCHEMA) == 38
-    assert len(ADVISOR_TOOLS_DISPATCH) == 38
+    # Invariant: advisor tools collections must match pruned count (39)
+    assert len(NEW_50_TOOLS_SCHEMA) == 39
+    assert len(ADVISOR_TOOLS_DISPATCH) == 39
     schema_advisor_names = {t["function"]["name"] for t in NEW_50_TOOLS_SCHEMA}
     assert schema_advisor_names == set(ADVISOR_TOOLS_DISPATCH.keys())
 

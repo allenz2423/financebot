@@ -91,8 +91,8 @@ def test_db():
 
 
 def test_advisor_tools_total_count():
-    assert len(ADVISOR_TOOLS_DISPATCH) == 38
-    assert len(NEW_50_TOOLS_SCHEMA) == 38
+    assert len(ADVISOR_TOOLS_DISPATCH) == 39
+    assert len(NEW_50_TOOLS_SCHEMA) == 39
     # Every tool in schema has a corresponding dispatcher function
     schema_names = {t["function"]["name"] for t in NEW_50_TOOLS_SCHEMA}
     dispatch_names = set(ADVISOR_TOOLS_DISPATCH.keys())
