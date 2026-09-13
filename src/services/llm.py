@@ -2300,7 +2300,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_world_model_entity",
-            "description": "Look up an entity in the Active World Model Knowledge Graph (e.g. 'cuny_hpc', 'discover_it', 'apple_upgrade', 'person:allen'). Returns full profile, attributes, verified active claims, and attached dossiers.",
+            "description": "Look up an entity in the Active World Model Knowledge Graph (e.g. 'cuny_hpc', 'discover_it', 'apple_upgrade', 'user:current'). Returns full profile, attributes, verified active claims, and attached dossiers.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2361,7 +2361,7 @@ BOT_TOOLS_SCHEMA = [
                 "properties": {
                     "subject_id": {
                         "type": "string",
-                        "description": "Subject entity ID (e.g. 'person:allen', 'org:cuny_hpc', 'liability:discover_it')."
+                        "description": "Subject entity ID (e.g. 'user:current', 'org:cuny_hpc', 'liability:discover_it')."
                     },
                     "predicate": {
                         "type": "string",
@@ -3688,7 +3688,7 @@ ACTIVE WORLD MODEL RULES
 ==================================================
 
 WORLD-MODEL-FIRST HABIT: Before ANY transaction review, correction, merchant research, projection, financial recommendation, or "what should I do" question, check the Active World Model (get_world_model_entity or search_world_model) first when relevant. The Active World Model contains verified epistemic state across institutions, employers, liabilities, rules, and user goals. Do not ask permission to check the world model.
-VERIFICATION: When answering questions about terms, rates, caps, obligations, or user constraints, always use get_world_model_entity (e.g. 'cuny_hpc', 'discover_it', 'person:allen') or get_world_model_dossier. Never invent SQL table names.
+VERIFICATION: When answering questions about terms, rates, caps, obligations, or user constraints, always use get_world_model_entity (e.g. 'cuny_hpc', 'discover_it', 'user:current') or get_world_model_dossier. Never invent SQL table names.
 
 DEFAULT TO PERMANENCE: Save durable information when learned (confirmed merchant identities, user preferences, recurring income, recurring bills, spending triggers, correction rules, audit definitions, important mistakes or lessons, durable financial goals) by asserting claims using assert_world_model_claim.
 

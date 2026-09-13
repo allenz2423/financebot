@@ -9,6 +9,7 @@ Provides:
 - Explainability engine tracing claims to parent sources and raw documents.
 """
 
+import os
 import re
 import sqlite3
 import json
@@ -19,17 +20,24 @@ from typing import List, Dict, Any, Optional, Tuple
 from src.core.state import DB_PATH
 
 def get_primary_user_id() -> str:
-    """Retrieve canonical primary user_id from user_info, falling back to active user."""
+    """Retrieve canonical primary user_id dynamically from the database or environment."""
+    env_uid = os.getenv("DISCORD_USER_ID") or os.getenv("PRIMARY_USER_ID")
+    if env_uid:
+        return env_uid.strip()
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute("SELECT user_id FROM user_info LIMIT 1")
-            row = c.fetchone()
-            if row and row[0]:
-                return str(row[0]).strip()
+            for table in ("user_info", "plaid_accounts", "transactions"):
+                try:
+                    c.execute(f"SELECT user_id FROM {table} WHERE user_id IS NOT NULL AND user_id != '' LIMIT 1")
+                    row = c.fetchone()
+                    if row and row[0]:
+                        return str(row[0]).strip()
+                except Exception:
+                    continue
     except Exception:
         pass
-    return "342385739952160769"
+    return "primary_user"
 
 def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)

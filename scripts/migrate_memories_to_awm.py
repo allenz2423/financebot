@@ -12,14 +12,16 @@ the 72 raw delilah_memories records and asserts them into:
 import sqlite3
 import json
 from src.core.state import DB_PATH
-from src.services.world_model import upsert_entity, assert_claim, audit_world_model_health
+from src.services.world_model import upsert_entity, assert_claim, audit_world_model_health, get_primary_user_id
 
 def run_comprehensive_migration():
     print("Beginning full migration of all 72 memories into Delilah Active World Model...")
+    primary_uid = get_primary_user_id()
+    user_eid = f"user:{primary_uid}"
 
     # 1. CANONICAL ENTITIES
     entities = [
-        ("person:allen", "person", "Allen Zhao", ["Allen", "incoming", "me", "user"], {
+        (user_eid, "person", "Allen Zhao", ["Allen", "incoming", "me", "user", "primary_user"], {
             "name": "Allen Zhao",
             "residence": "Sunset Park, Brooklyn, NY",
             "rent": 0.00,
@@ -144,10 +146,12 @@ def run_comprehensive_migration():
     ]
 
     for subj, pred, obj, val, prov, auth, valid_from, refs in claims:
+        actual_subj = user_eid if subj == "person:allen" else subj
+        actual_obj = user_eid if obj == "person:allen" else obj
         assert_claim(
-            subject_id=subj,
+            subject_id=actual_subj,
             predicate=pred,
-            object_id=obj,
+            object_id=actual_obj,
             scalar_value=val,
             provenance_type=prov,
             source_authority=auth,
