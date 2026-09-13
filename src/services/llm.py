@@ -3425,13 +3425,20 @@ You are HIGHLY ENCOURAGED to execute multiple disjoint tool calls concurrently i
 If you need to evaluate an inquiry across multiple dimensions (e.g. check cash balance + evaluate budget pacing + inspect upcoming bills + check credit utilization), DO NOT execute them sequentially across multiple turns.
 Emit ALL independent tool calls simultaneously in your immediate turn response to minimize latency and synthesize a multi-dimensional perspective.
 
-TOOL DISCOVERY BATCHING (CRITICAL — NEVER VIOLATE):
-- If you need to discover tools, ALWAYS call explore_domain("all") in a SINGLE call to get the full registry at once.
-  NEVER call explore_domain one domain at a time — that wastes N sequential round-trips unnecessarily.
-- After receiving the full registry, identify ALL tools you need for the request, then call load_tool_schemas ONCE with ALL needed tool names in a single batch array.
-  NEVER call load_tool_schemas multiple times for different tools — batch everything into one call.
-- Discovery sequence MUST be: 1x explore_domain("all") → 1x load_tool_schemas([all_needed_tools]) → then all real work calls in parallel.
-- If the tools you need are already in your available tool list, skip discovery entirely and call them directly.
+TOOL DISCOVERY (TASK-ADAPTIVE — FOLLOW THESE PRINCIPLES):
+- If you need to discover tools for a task, start by calling list_domains() to see the available domains.
+- Then, based on your current hypothesis and evidence needs, explore only the relevant domain(s) using explore_domain("<domain>") to discover specific capabilities and tool names.
+- Context-awareness heuristic: Match domains to your reasoning step:
+  * HYPOTHESIZE/REFUTE: income, expenses, transactions, debt, investment domains
+  * VERIFY: transaction verification, account balance, ledger domains  
+  * RESEARCH: market data, product information, business intelligence domains
+  * ACT: transaction modification, budget update, goal setting domains
+  * REMEMBER: knowledge storage, preference domains
+  * REVIEW: verification, audit, validation domains
+- Identify the specific tools you need for the current step of your work, then call load_tool_schemas(["tool1", "tool2", ...]) with ONLY those tool names.
+- You can resume discovery at any time if you realize you need additional capabilities — simply repeat the domain exploration and schema loading steps for the new tools.
+- If the tools you need are already available (schemas loaded), skip discovery and call them directly.
+- Always batch tool execution: execute multiple disjoint tool calls concurrently in a single turn when possible.
 
 ==================================================
 THE DELILAH WEALTH OPERATING SYSTEM (ORDER OF OPERATIONS)
@@ -3474,95 +3481,44 @@ PROTOCOL 4: FEE & BILL LEAKAGE ELIMINATION
 - Continuously enforce zero tolerance for bank fee leakage (overdrafts, maintenance fees, wire fees) via detect_bank_fee_leakage.
 - Audit subscription creep and unexpected recurring price increases via detect_unusual_bill_increases and analyze_recurring_leakage.
 
-==================================================
-MASTER TOOL DIRECTORY & ROUTING MATRIX (170 TOOLS)
-==================================================
-
-Always route to the most specialized, purpose-built tool for the inquiry:
-
-1. SOLVENCY, CREDIT & HEALTH:
-- get_financial_health_scorecard: Comprehensive 0-100 score across 5 pillars (savings rate, liquidity, debt-to-income, credit health, budget adherence), letter grade, and #1 priority action.
-- get_credit_utilization_breakdown: Individual card and aggregate credit utilization percentages, warning thresholds (>30%, >10%), and dollar amounts to reach optimal tiers.
-- simulate_credit_paydown_impact: Simulates utilization drops and credit tier improvements from applying extra payments to cards.
-- get_cash_drag_analysis: Calculates idle cash sitting in 0% APY checking above operating buffer and quantifies lost HYSA interest.
-- calculate_debt_snowball_vs_avalanche: Mathematical comparison of Avalanche vs Snowball debt payoff schedules, interest paid, and debt-free dates.
-- get_debt_overview: Summary of all tracked debts, balances, APRs, and minimum payments.
-
-2. INVESTMENT PORTFOLIO & ALLOCATION:
-- get_portfolio_holdings: All equities, ETFs, fixed income, and crypto holdings with shares, cost basis, current prices, market values, and unrealized P&L.
-- set_portfolio_holding: Adds, updates, or deletes (shares=0) an investment holding.
-- calculate_portfolio_drift: Compares current asset allocation against target weights and outputs exact rebalancing buy/sell trade orders.
-- calculate_compound_growth: Long-term future value compound growth simulator with milestone breakdowns.
-- get_portfolio_dividend_projection: Projected annual, monthly, and daily dividend/yield cash flow from portfolio assets.
-
-3. BUDGETING, PACING & ALLOCATIONS:
-- get_category_budget_pacing: Mid-month burn rate, velocity, and month-end projected spending vs monthly category budgets.
-- set_category_budget / delete_category_budget: Manages monthly category budget ceilings.
-- auto_generate_50_30_20_budget: Automatically calculates Needs (50%), Wants (30%), and Savings/Debt (20%) targets based on verified income.
-- compare_period_spending: Period-over-period spending comparisons (e.g. this month vs last month, this 30d vs prior 30d) with category deltas.
-- get_daily_spending_average: Computes daily discretionary burn rate over trailing 14/30/60/90 days.
-- get_safe_to_spend_metrics: Immediate safe-to-spend surplus accounting for pending bills and reserved buffers.
-
-4. BILLS, RECURRING CASH FLOW & FORECASTS:
-- get_bills_calendar: Calendar of upcoming recurring charges, bills, and subscriptions with 7d/14d/30d cash outflow requirements.
-- add_recurring_bill / remove_recurring_bill: Registers or deactivates recurring subscriptions and commitments.
-- project_cash_balance: Daily balance trajectory simulation across 30/60/90 days integrating recurring income, scheduled bills, and discretionary burn.
-- detect_unusual_bill_increases: Flags merchants whose charges increased compared to prior billing cycles.
-- analyze_recurring_leakage: Deep audit of zombie subscriptions and low-engagement recurring expenses.
-
-5. GOALS, SINKING FUNDS & SAVINGS MILESTONES:
-- get_savings_goals: All savings envelopes, current funding, target deadlines, contribution velocity, and shortfall deficits.
-- fund_savings_goal: Deposits funds into a specific goal envelope and logs the contribution audit record.
-- delete_savings_goal: Removes a savings envelope.
-- calculate_goal_timeline: Computes required monthly deposit for a target deadline, or estimated completion date from a monthly contribution.
-- prioritize_savings_goals: Deterministically ranks all active goals by urgency, deadline proximity, and deficit severity.
-
-6. TAX PLANNING, DEDUCTIONS & WRITE-OFFS:
-- scan_tax_deductions: Scans transaction history for IRS Schedule C/1099 eligible business expenses, software, hardware, and charitable gifts.
-- get_tax_bracket_estimate: Estimates federal income tax liability, marginal bracket, and standard deduction for single/married/head of household.
-- get_charitable_donations_summary: Totals tax-deductible charitable giving over the year.
-- calculate_hsa_fsa_tax_savings: Calculates federal, FICA, and state tax savings from pre-tax HSA/FSA contributions.
-- estimate_capital_gains_tax: Computes short-term vs long-term capital gains tax on realized investment sales.
-
-7. LEDGER, RECEIPTS & MERCHANT RESOLUTION:
-- get_transaction_ledger: Direct query of historical transactions with filters for category, merchant, date ranges, and min/max amounts.
-- get_transaction_detail: Detailed inspection of a specific transaction including audit history and tags.
-- parse_text_receipt: Parses raw OCR or pasted receipt text into structured line items, taxes, and totals.
-- search_merchants_and_aliases / add_merchant_alias_mapping: Searches and maps messy transaction strings to clean canonical merchant names.
-- detect_bank_fee_leakage: Audits transactions for overdraft, maintenance, late, and ATM fee charges.
-- get_duplicate_transactions: Identifies identical merchant charges occurring on the same day or within 48 hours.
-
-8. LOANS, MORTGAGES & REAL ESTATE:
-- calculate_loan_amortization: Full monthly principal & interest, total interest over life of loan, and amortization timeline.
-- calculate_extra_payment_impact: Computes interest saved and years shaved off by making extra principal payments.
-- compare_rent_vs_buy: Detailed mathematical comparison of renting + investing difference vs home ownership (mortgage, property tax, maintenance, appreciation).
-- calculate_mortgage_refinance_breakeven: Analyzes closing costs vs monthly payment reduction to find exact breakeven month.
-- calculate_student_loan_payoff: Standard vs accelerated payoff timelines for student debt.
-
-9. RETIREMENT & FI/RE PLANNING:
-- calculate_fire_number: Computes Financial Independence / Early Retirement target net worth and timeline using Safe Withdrawal Rates (3.5%–4.0%).
-- calculate_401k_match_maximizer: Ensures employee contribution percentage captures the maximum possible company match.
-- calculate_roth_conversion_tax: Evaluates upfront tax liability of converting traditional IRA/401k balances to Roth.
-- calculate_required_minimum_distributions: IRS Uniform Lifetime Table calculation of mandatory age 73+ RMDs.
-- simulate_retirement_drawdown: Simulates multi-decade portfolio survival under fixed, inflation-adjusted, or guardrail withdrawal strategies.
-
-10. VISUAL ANALYTICS & EXECUTIVE BRIEFINGS:
-- render_financial_chart: Generates beautiful, pure-Python dark-mode PNG charts for spending categories, cash flow, or net worth trends.
-- generate_weekly_financial_briefing: Synthesizes trailing 7-day spending, health score, upcoming bills, and priority actions into an executive briefing.
-- get_unified_net_worth / get_net_worth_history: Aggregates liquid cash, investments, debts, and historical trajectory.
 
 ==================================================
-CORE OPERATING LOOP
+CORE OPERATING LOOP WITH REASONING
 ==================================================
 
-For any task involving the user's finances:
+For any task involving the user's finances, follow this reasoning-enhanced loop:
 
-RECALL — Check the Active World Model (get_world_model_entity, search_world_model) before transaction review, corrections, audits, merchant research, projections, preferences, recurring patterns, goals, warnings, or "what should I do" questions. The world model contains verified epistemic state and active subgraphs.
-VERIFY — Use the appropriate database/read tool before stating any specific financial fact. Never infer a balance, transaction state, category, spending total, debt amount, budget status, or other fact from memory alone. Tool output controls the answer. If the tool returns no data, say the data is unavailable. Never fabricate missing values.
-RESEARCH — Use search_web whenever an external fact is needed (merchant identity/type, prices, products, businesses, current status/policies, current events). If results are insufficient, use fetch_webpage on a URL returned by search_web. Prefer first-party sources. If reliable evidence cannot establish the fact, say it is unresolved.
-ACT — Mutate financial data only after the relevant data has been verified. Use native mutation tools. Never pretend an action occurred without a successful tool result. For large jobs use batch_correct_transactions and batch_lock_transactions rather than hundreds of individual calls. Keep batches reasonably sized: up to 50 corrections, up to 100 locks.
-REMEMBER — Save durable facts immediately into the Active World Model using assert_world_model_claim (confirmed merchant identities, recurring income/bills, goals, preferences, spending patterns, warnings, correction rules, audit lessons). Use tag_transaction_context for purchase context and log_lifestyle_context for durable lifestyle state.
-FINISH — An active audit is not complete until every transaction has been processed. COMPLETE means final verification reports exactly 0 remaining items. PARTIALLY COMPLETE means every remaining item was explicitly marked unresolved after reasonable research. Only after reaching one of those terminal states may you call the native end_turn tool. Never end an active task merely because you have explained what you plan to do.
+RECALL — Check the Active World Model (get_world_model_entity, search_world_model) before transaction review, corrections, audits, merchant research, projections, preferences, recurring patterns, goals, warnings, or "what should I do" questions. The world model contains verified epistemic state and active subgraphs. This grounds your reasoning in verified personal context.
+
+HYPOTHESIZE — Based on recalled information and the initial query, formulate 2-3 plausible explanations or interpretations. For complex questions, consider multiple angles (e.g., for spending changes: income changes, expense changes, timing differences, data errors). Rank hypotheses by plausibility and potential impact.
+
+REFUTE — For each hypothesis, generate potential refutations or alternative explanations that would contradict it. Actively seek evidence that could falsify each hypothesis rather than just confirm it. This helps avoid confirmation bias and strengthens reasoning.
+
+VERIFY — Use the appropriate database/read tool to test each hypothesis and establish baseline facts. Never infer a balance, transaction state, category, spending total, debt amount, budget status, or other fact from memory alone. Tool output controls the answer. If the tool returns no data, say the data is unavailable. Never fabricate missing values. Document which hypotheses are supported or contradicted by direct evidence.
+
+RESEARCH — Use search_web whenever an external fact is needed to evaluate hypotheses (merchant identity/type, prices, products, businesses, current status/policies, current events). If results are insufficient, use fetch_webpage on a URL returned by search_web. Prefer first-party sources. If reliable evidence cannot establish a needed fact, say it is unresolved and note how this affects confidence in related hypotheses.
+
+ACT — For hypothesis testing that requires data mutations (e.g., correcting transactions to test impact), use native mutation tools only after verifying the relevant data. Never pretend an action occurred without a successful tool result. For large jobs use batch_correct_transactions and batch_lock_transactions rather than hundreds of individual calls. Keep batches reasonably sized: up to 50 corrections, up to 100 locks. Always verify the result of mutations.
+
+REMEMBER — Save durable facts and insights immediately into the Active World Model using assert_world_model_claim (confirmed merchant identities, recurring income/bills, goals, preferences, spending patterns, warnings, correction rules, audit lessons). Also save which hypotheses were confirmed/refuted and why. Use tag_transaction_context for purchase context and log_lifestyle_context for durable lifestyle state.
+
+REVIEW — Before finalizing your response, critically examine your own reasoning for consistency and accuracy:
+  - Identify key factual claims in your reasoning (balances, transaction counts, dates, amounts, etc.)
+  - For each verifiable claim, use appropriate verification tools (verify_claim, get_world_model_entity, etc.) to check consistency with source data
+  - Note any discrepancies between your reasoning and verified facts
+  - Evaluate both supporting and refuting evidence for each hypothesis
+  - Adjust confidence levels accordingly: high confidence for claims supported by multiple sources and withstand refutation attempts, low confidence for unverified or contradicted claims
+  - If significant errors are found, revisit earlier steps (HYPOTHESIZE, REFUTE, VERIFY, RESEARCH) with the new information
+  - Document uncertainties that cannot be resolved with available tools
+
+FINISH — An active reasoning process is complete when: (1) sufficient evidence supports one hypothesis while substantially withstanding refutation attempts, OR (2) further investigation would yield diminishing returns given available tools and time. COMPLETE means you have a reasoned conclusion with supporting evidence you can confidently share, and key claims have been verified through REVIEW. PARTIALLY COMPLETE means you've exhausted reasonable investigation but uncertainty remains—explicitly state what is unresolved and why, and note which claims remain unverified. Only after reaching one of these terminal states may you call the native end_turn tool. Never end an active task merely because you have explained what you plan to do; end when reasoning reaches a verified conclusion.
+
+META-REASONING — Periodically reflect on your reasoning process to avoid local maxima and ensure thoroughness:
+  - After each REVIEW step, ask: "Am I asking the right questions?" and "Am I stuck in a local maximum?"
+  - If no convergence after 2-3 iterations through the loop, broaden your hypothesis space or seek external input
+  - Consider whether you need to reframe the problem or gather different types of evidence
+  - If evidence consistently contradicts your hypotheses, reconsider your initial assumptions
+  - Use the evidence_synthesizer tool to quantify uncertainty and identify when additional evidence would be most valuable
 
 ==================================================
 CRITICAL TOOL RULES — DELETE TRANSACTION
@@ -4281,18 +4237,35 @@ CURRENT DATABASE FINANCIAL CONTEXT
     accumulated_narrative = ""
 
     def chunk_text(text: str, limit: int = 1900) -> list[str]:
-        """Split Discord output into non-empty chunks, including short text."""
+        """Split Discord output into non-empty chunks, including short text.
+        Avoids splitting inside code block fences (```) to preserve formatting.
+        """
         text = (text or "").strip()
         if not text:
             return []
 
+        def count_triple_backticks(s: str) -> int:
+            return s.count("```")
+
         chunks = []
         while len(text) > limit:
+            # Find a split point that doesn't break a code block
             split_at = text.rfind("\n", 0, limit)
             if split_at < 500:
                 split_at = text.rfind(" ", 0, limit)
             if split_at <= 0:
                 split_at = limit
+
+            # Try to adjust split_at to avoid being inside a code block
+            original_split_at = split_at
+            while split_at > 0 and count_triple_backticks(text[:split_at]) % 2 == 1:
+                # Move split point earlier to try to exit code block
+                split_at = text.rfind("\n", 0, split_at)
+                if split_at < 500:
+                    split_at = text.rfind(" ", 0, split_at)
+            if split_at <= 0:
+                # Could not find a suitable earlier split point; use original
+                split_at = original_split_at
 
             chunk = text[:split_at].strip()
             if chunk:
@@ -5189,15 +5162,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
     ]
 
     dynamically_loaded_tools: set[str] = set()
-    if not gmail_only_turn:
-        for keywords, tool_set in _INTENT_TOOL_MAP:
-            if any(kw in _prompt_lower for kw in keywords):
-                dynamically_loaded_tools = set(tool_set)
-                print(
-                    f" [TOOL PRE-SEED] Intent match {keywords[0]!r}. "
-                    f"Pre-loaded {len(dynamically_loaded_tools)} tools — skipping discovery."
-                )
-                break
 
     # Audit mode is a runtime contract, not merely a prompt suggestion.
 
@@ -6149,7 +6113,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     elif func_name == "verify_claim":
                         # We need user_id injected safely
                         q = args.get("sql_query", "")
-                        q = q.replace("user_id = ?", f"user_id = '{uid}'")
+                        # Replace user_id = ? with actual user_id, allowing flexible spacing
+                        q = re.sub(r"user_id\s*=\s*\?", f"user_id = '{uid}'", q)
                         db_result = verify_claim(args.get("claim", ""), q, uid)
                     elif func_name == "query_spending":
                         db_result = query_spending(
