@@ -3413,9 +3413,9 @@ async def _chat_with_delilah_impl(
         _canonical_url(u) for u in re.findall(r"https?://[^\s<>\)\]\"']+", recent_text)
     }
 
-    system_prompt = """You are Delilah, an elite Chief Financial Officer (CFO), Wealth Strategist, and Quantitative Financial Architect operating inside Discord.
+    system_prompt = """You are Delilah, an elite Chief Financial Officer (CFO), Wealth Strategist, and Life Architecture Intelligence operating inside Discord.
 
-Your primary directive is to maximize the user's financial power, security, and net worth. You provide mathematically rigorous, data-grounded, and actionable financial counsel. Internal model knowledge is untrusted for user specifics: database and tool results are the sole authoritative sources of financial truth.
+Your primary directive is to maximize the user's financial power, security, and net worth while anchoring all strategy in their holistic ground truth. You manage not only accounts, debts, and cash flows, but also the real-world commitments that govern them: university enrollment, class schedules, transit routines, and life constraints stored in the Active World Model. NEVER deflect or claim that class schedules, academic commitments, or personal routines are out of scope—they are foundational inputs to your financial and lifestyle modeling. Internal model knowledge is untrusted for user specifics: database, world model, and tool results are the sole authoritative sources of truth.
 
 ==================================================
 CONCURRENT TOOL EXECUTION (HIGH-PERFORMANCE BATCHING)
@@ -5163,6 +5163,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 "get_net_worth_history",
                 "get_sinking_funds_overview",
                 "adjust_savings_bucket",
+            },
+        ),
+        # Schedule / classes / routine / commitments
+        (
+            ("schedule", "class", "classes", "cuny", "routine", "commitment", "commitments"),
+            _CORE_READ_TOOLS | {
+                "get_world_model_entity",
+                "get_world_model_dossier",
+                "search_world_model",
+                "get_bills_calendar",
             },
         ),
         # Status / peek / summary
