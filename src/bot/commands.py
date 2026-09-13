@@ -2346,6 +2346,7 @@ async def clear_all(ctx: commands.Context):
         c.execute("DELETE FROM financial_snapshots WHERE user_id = ?", (uid,))
         c.execute("INSERT INTO budget_settings (user_id, weekly_discretionary_limit, impulse_threshold) VALUES (?, 150.00, 50.00)", (uid,))
         conn.commit()
+        import plaid_sync
         plaid_sync.resets_cursors(conn)
     except Exception as e:
         await ctx.send(f" Failed to reset database: {e}")
@@ -4634,19 +4635,28 @@ async def on_ready():
 
     load_history_on_boot(limit=100)
 
+    print(f" [DEBUG] on_ready: BACKGROUND_TASKS_STARTED={BACKGROUND_TASKS_STARTED}", flush=True)
     if BACKGROUND_TASKS_STARTED:
+        print(" [DEBUG] on_ready: skipping task creation (already started)", flush=True)
         return
     BACKGROUND_TASKS_STARTED = True
+    print(" [DEBUG] Creating queue_worker task...", flush=True)
     t1 = bot.loop.create_task(queue_worker())
     _PERSISTENT_TASKS.add(t1)
     t1.add_done_callback(_PERSISTENT_TASKS.discard)
+    print(" [DEBUG] queue_worker task created. Running _ensure_cursor_table...", flush=True)
     # Ensure Plaid-managed tables (plaid_cursors, plaid_accounts, balance_snapshots,
     # financial_snapshots) exist regardless of whether the autosync loop runs —
     # !clear, !checknow, etc. all assume this schema is already in place.
-    plaid_sync._ensure_cursor_table(conn)
+    try:
+        import plaid_sync
+        plaid_sync._ensure_cursor_table(conn)
+        print(" [DEBUG] _ensure_cursor_table done.", flush=True)
+    except Exception as _ensure_exc:
+        print(f" [DEBUG] _ensure_cursor_table FAILED: {type(_ensure_exc).__name__}: {_ensure_exc}", flush=True)
+        import traceback; traceback.print_exc()
 
-    # Apply idempotent DB migrations (monitor_rules, monitor_alerts, ...).
-    # Existing financial data is preserved: migrations only ADD tables/columns.
+    # Apply idempotent DB migrations (monitor_rules, monitor_alerts, ...).\n    # Existing financial data is preserved: migrations only ADD tables/columns.
     try:
         from src.db.migrations import apply_all
         applied = apply_all(conn)
@@ -4654,6 +4664,7 @@ async def on_ready():
             print(f" [DB] Applied migrations: {', '.join(applied)}")
     except Exception as exc:
         print(f" [DB] Migration apply failed: {type(exc).__name__}: {exc}")
+    print(" [DEBUG] Migrations done. Starting monitor watchdog...", flush=True)
 
     # Persistent, LLM-free financial monitor.  Rules are declarative
     # predicates; when one fires an alert row is written and pushed.
@@ -4667,6 +4678,7 @@ async def on_ready():
         print(f" [MONITOR] Monitor watchdog failed to start: {type(exc).__name__}: {exc}")
 
     if os.getenv("ENABLE_PLAID_AUTOSYNC", "true").lower() not in ("0", "false", "no"):
+        import plaid_sync
         t2 = bot.loop.create_task(plaid_sync.plaid_polling_loop(conn, tx_queue, bot, DISCORD_CHANNEL_ID))
         _PERSISTENT_TASKS.add(t2)
         t2.add_done_callback(_PERSISTENT_TASKS.discard)
@@ -4676,6 +4688,7 @@ async def on_ready():
     t3 = bot.loop.create_task(reminder_watchdog_loop())
     _PERSISTENT_TASKS.add(t3)
     t3.add_done_callback(_PERSISTENT_TASKS.discard)
+    print(f" [WATCHDOG] Reminder watchdog task registered (task={t3.get_name()}).")
     c.execute("""SELECT id, message_id, merchant, amount, account_used, net_cash, date
         FROM transactions WHERE status = 'Pending' ORDER BY id ASC""")
     backlog = c.fetchall()

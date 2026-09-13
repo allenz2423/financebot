@@ -22,6 +22,18 @@ from src.services.intelligence import calculate_lifestyle_creep, allocate_next_b
 from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.services.advisor_tools import NEW_50_TOOLS_SCHEMA, ADVISOR_TOOLS_DISPATCH
+from src.services.world_model import (
+    build_world_model_context,
+    explain_claim,
+    upsert_entity,
+    assert_claim,
+    run_counterfactual_comparison,
+    audit_world_model_health,
+    get_world_model_entity,
+    search_world_model,
+    get_world_model_dossier,
+    retract_world_model_claim
+)
 
 import os
 import re
@@ -166,44 +178,70 @@ async def send_push_alert(message: str, title: str = "Delilah CFO", priority: st
 # Time-Based Reminder Watchdog
 # ============================================================
 async def reminder_watchdog_loop():
+    """
+    Background watchdog that fires due scheduled reminders.
+
+    Uses its own dedicated SQLite connection (not the shared module-level `c`)
+    to avoid cursor contention with the main advisor event loop.
+    """
+    import sqlite3 as _sqlite3
+    from src.core.state import DB_PATH as _DB_PATH
+
+    # Own connection — never shares a cursor with the main advisor path.
+    _wconn = _sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=10.0)
+    _wconn.execute("PRAGMA journal_mode=WAL")
+    _wconn.execute("PRAGMA busy_timeout=10000")
+    _wc = _wconn.cursor()
+
+    print(" [WATCHDOG] Reminder watchdog starting in 5s...")
     await asyncio.sleep(5)
+    print(" [WATCHDOG] Reminder watchdog loop active.")
+
+    # When a reminder can't fire because the advisor for this user is busy,
+    # re-arm it for this many seconds later instead of dropping it.
+    _REARM_DELAY_SECONDS = int(os.getenv("REMINDER_REARM_DELAY_SECONDS", "300"))
+
     while True:
         try:
-            c.execute("CREATE TABLE IF NOT EXISTS scheduled_reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, trigger_at TEXT, instruction TEXT, status TEXT DEFAULT 'pending', channel_id INTEGER)")
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            
-            try:
-                c.execute("SELECT id, instruction, channel_id, user_id FROM scheduled_reminders WHERE status = 'pending' AND trigger_at <= ?", (now_str,))
-            except Exception:
-                c.execute("SELECT id, instruction, NULL, user_id FROM scheduled_reminders WHERE status = 'pending' AND trigger_at <= ?", (now_str,))
-            due = c.fetchall()
+            _wc.execute(
+                "CREATE TABLE IF NOT EXISTS scheduled_reminders "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
+                "trigger_at TEXT, instruction TEXT, status TEXT DEFAULT 'pending', "
+                "channel_id INTEGER, recurring INTEGER DEFAULT 0, repeat_offset TEXT)"
+            )
+            _wconn.commit()
 
-            # Force the read transaction to close so the next loop gets a fresh DB snapshot
-            conn.commit()
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            _wc.execute(
+                "SELECT id, instruction, channel_id, user_id, recurring, repeat_offset, trigger_at "
+                "FROM scheduled_reminders "
+                "WHERE status = 'pending' AND trigger_at <= ?",
+                (now_str,),
+            )
+            due = _wc.fetchall()
 
             for row_data in due:
-                r_id, instruction = row_data[0], row_data[1]
-                channel_id = row_data[2] if len(row_data) > 2 else None
-                uid = str(row_data[3]) if len(row_data) > 3 and row_data[3] else "0"
+                r_id = row_data[0]
+                instruction = row_data[1]
+                channel_id = row_data[2]
+                uid = str(row_data[3]) if row_data[3] else "0"
+                is_recurring = bool(row_data[4])
+                repeat_offset = row_data[5]
+                trigger_at_str = str(row_data[6]) if row_data[6] else None
 
-                # Atomically claim the reminder so the same job cannot execute twice.
-                c.execute(
-                    """
-                    UPDATE scheduled_reminders
-                    SET status = 'running'
-                    WHERE id = ?
-                      AND status = 'pending'
-                    """,
+                # Atomically claim this reminder.
+                _wc.execute(
+                    "UPDATE scheduled_reminders SET status = 'running' "
+                    "WHERE id = ? AND status = 'pending'",
                     (r_id,),
                 )
-                if c.rowcount != 1:
+                if _wc.rowcount != 1:
                     continue
-                conn.commit()
+                _wconn.commit()
 
-                # Resolve the intended reminder destination only.
-                # Never fall back to the global DISCORD_CHANNEL_ID.
+                # Resolve destination channel.
                 channel = None
-
                 if channel_id:
                     channel = bot.get_channel(channel_id)
                     if not channel:
@@ -222,23 +260,38 @@ async def reminder_watchdog_loop():
 
                 if not channel:
                     print(
-                        f" Watchdog could not resolve destination for reminder {r_id} "
-                        f"(user={uid}, channel={channel_id})"
+                        f" [WATCHDOG] Could not resolve destination for reminder {r_id} "
+                        f"(user={uid}, channel={channel_id}) — marking failed."
                     )
-                    c.execute(
+                    _wc.execute(
                         "UPDATE scheduled_reminders SET status = 'failed' WHERE id = ?",
                         (r_id,),
                     )
-                    conn.commit()
+                    _wconn.commit()
                     continue
 
                 class _PseudoHandle:
                     def __init__(self, ch): self.channel = ch
                     async def delete(self): pass
 
-                prompt = f"[SYSTEM: AUTONOMOUS WAKEUP]\nA scheduled reminder has triggered:\n\n{instruction}\n\nExecute any necessary tools to fulfill this reminder now. If you need to run an audit, do it. If you need to send a push notification, do it."
+                prompt = (
+                    f"[SYSTEM: AUTONOMOUS WAKEUP]\n"
+                    f"A scheduled reminder has triggered:\n\n{instruction}\n\n"
+                    f"Execute any necessary tools to fulfill this reminder now."
+                )
 
-                async def autonomous_run(prompt_text, user_id, ch, rem_id):
+                async def autonomous_run(
+                    prompt_text, user_id, ch, rem_id,
+                    _is_recurring=is_recurring, _repeat_offset=repeat_offset,
+                    _instruction=instruction, _channel_id=channel_id,
+                    _trigger_at_str=trigger_at_str,
+                ):
+                    import sqlite3 as _sq3
+                    # Each autonomous task gets its own connection to avoid cursor contention.
+                    _ac = _sq3.connect(_DB_PATH, check_same_thread=False, timeout=10.0)
+                    _ac.execute("PRAGMA journal_mode=WAL")
+                    _ac.execute("PRAGMA busy_timeout=10000")
+                    _acur = _ac.cursor()
                     try:
                         print(
                             f" [WATCHDOG] Firing reminder {rem_id} "
@@ -250,49 +303,121 @@ async def reminder_watchdog_loop():
                         )
                         await chat_with_delilah(prompt_text, user_id, handle)
 
-                        c.execute(
-                            "UPDATE scheduled_reminders "
-                            "SET status = 'completed' WHERE id = ? "
-                            "AND status = 'running'",
+                        _acur.execute(
+                            "UPDATE scheduled_reminders SET status = 'completed' "
+                            "WHERE id = ? AND status = 'running'",
                             (rem_id,),
                         )
-                        conn.commit()
+                        _ac.commit()
                         print(f" [WATCHDOG] Reminder {rem_id} completed.")
 
+                        # Re-schedule recurring reminders on the dot.
+                        if _is_recurring and _repeat_offset:
+                            repeat_match = re.fullmatch(
+                                r"\+(\d+)([smhd])", str(_repeat_offset).strip()
+                            )
+                            if repeat_match:
+                                val = int(repeat_match.group(1))
+                                unit = repeat_match.group(2)
+                                kw = (
+                                    {"seconds": val} if unit == "s"
+                                    else {"minutes": val} if unit == "m"
+                                    else {"hours": val} if unit == "h"
+                                    else {"days": val}
+                                )
+                                delta = timedelta(**kw)
+                                now_utc = datetime.now(timezone.utc)
+
+                                # If original trigger_at was provided, advance from that scheduled time
+                                # to prevent wall-clock execution drift (keeping it 'on the dot').
+                                base_dt = None
+                                if _trigger_at_str:
+                                    try:
+                                        base_dt = datetime.strptime(_trigger_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                                    except Exception:
+                                        base_dt = None
+
+                                if base_dt:
+                                    next_dt = base_dt + delta
+                                    # If it was significantly overdue, advance in whole multiples until in the future
+                                    while next_dt <= now_utc:
+                                        next_dt += delta
+                                else:
+                                    next_dt = now_utc + delta
+
+                                next_trigger = next_dt.strftime("%Y-%m-%d %H:%M:%S")
+                                _acur.execute(
+                                    "INSERT INTO scheduled_reminders "
+                                    "(user_id, trigger_at, instruction, channel_id, "
+                                    "recurring, repeat_offset) "
+                                    "VALUES (?, ?, ?, ?, 1, ?)",
+                                    (user_id, next_trigger, _instruction, _channel_id, _repeat_offset),
+                                )
+                                _ac.commit()
+                                print(
+                                    f" [WATCHDOG] Reminder {rem_id} re-scheduled "
+                                    f"→ next trigger at {next_trigger}"
+                                )
+
                     except asyncio.CancelledError:
-                        c.execute(
-                            "UPDATE scheduled_reminders "
-                            "SET status = 'failed' WHERE id = ? "
-                            "AND status = 'running'",
+                        _acur.execute(
+                            "UPDATE scheduled_reminders SET status = 'failed' "
+                            "WHERE id = ? AND status = 'running'",
                             (rem_id,),
                         )
-                        conn.commit()
+                        _ac.commit()
                         print(f" [WATCHDOG] Reminder {rem_id} cancelled.")
                         raise
 
                     except Exception as e:
-                        c.execute(
-                            "UPDATE scheduled_reminders "
-                            "SET status = 'failed' WHERE id = ? "
-                            "AND status = 'running'",
+                        _acur.execute(
+                            "UPDATE scheduled_reminders SET status = 'failed' "
+                            "WHERE id = ? AND status = 'running'",
                             (rem_id,),
                         )
-                        conn.commit()
+                        _ac.commit()
                         print(f" [WATCHDOG] Reminder {rem_id} failed: {e}")
 
-                existing = ACTIVE_ADVISOR_TASKS.get(uid)
-                if existing and not existing.done():
-                    try: await existing
-                    except Exception: pass
+                    finally:
+                        _ac.close()
 
-                task = asyncio.create_task(autonomous_run(prompt, uid, channel, r_id), name=f"autonomous:{r_id}")
+                # Fire the reminder as an independent task — do NOT await it here.
+                # Awaiting the existing advisor task would block the entire watchdog.
+                #
+                # Guard against concurrent fires for the same user: the advisor
+                # is single-threaded per uid, so if one is already running we
+                # re-arm this reminder for later instead of dropping it.
+                existing = ACTIVE_ADVISOR_TASKS.get(uid)
+                if existing is not None and not existing.done():
+                    delay = _REARM_DELAY_SECONDS
+                    next_trigger = (
+                        datetime.now(timezone.utc) + timedelta(seconds=delay)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    _wc.execute(
+                        "UPDATE scheduled_reminders SET trigger_at = ?, status = 'pending' "
+                        "WHERE id = ? AND status = 'running'",
+                        (next_trigger, r_id),
+                    )
+                    _wconn.commit()
+                    print(
+                        f" [WATCHDOG] Reminder {r_id} deferred to {next_trigger} "
+                        f"(advisor for {uid} already running)."
+                    )
+                    continue
+
+                task = asyncio.create_task(
+                    autonomous_run(prompt, uid, channel, r_id),
+                    name=f"autonomous:{r_id}",
+                )
                 ADVISOR_STATUS.setdefault(uid, {})["cancel_requested"] = False
                 ADVISOR_STATUS.setdefault(uid, {})["cancelled"] = False
                 ACTIVE_ADVISOR_TASKS[uid] = task
 
         except Exception as e:
-            print(f" Watchdog error: {e}")
+            print(f" [WATCHDOG] Loop error: {type(e).__name__}: {e}")
+
         await asyncio.sleep(10)
+
 
 # ============================================================
 async def maybe_flag_windfall(merchant, amount, *, user_id: str):
@@ -959,40 +1084,7 @@ BOT_TOOLS_SCHEMA = [
     },
 
 
-    {
-        "type": "function",
-        "function": {
-            "name": "semantic_search_memory",
-            "description": "Query the structured Epistemic Memory system using semantic meaning. Retrieves facts, preferences, hypotheses, and goals.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer", "description": "Number of results to retrieve (default 5)."},
-                    "min_confidence": {"type": "number", "description": "Minimum confidence threshold (0.0 to 1.0). Use higher for hard facts, lower for hypotheses."}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_epistemic_memory",
-            "description": "Save a structured memory with strict provenance and confidence. Do not save speculations as hard facts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                    "memory_type": {"type": "string", "enum": ["fact", "preference", "event", "goal", "decision", "pattern", "hypothesis"]},
-                    "provenance_type": {"type": "string", "enum": ["user_stated", "llm_inferred", "deterministic_calculation"]},
-                    "confidence": {"type": "number", "description": "Confidence from 0.0 to 1.0"},
-                    "evidence_refs": {"type": "array", "items": {"type": "string"}, "description": "JSON array of evidence strings (e.g. 'Transaction ID 123', 'User chat on 2026-09-11')"}
-                },
-                "required": ["content", "memory_type", "provenance_type", "confidence"]
-            }
-        }
-    },
+
 
 
     {
@@ -1030,12 +1122,12 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "verify_claim",
-            "description": "The Verification Layer: Verify a factual/numerical claim against the deterministic database using a SQL SELECT query.",
+            "description": "The Verification Layer: Verify a factual or numerical claim against the deterministic ledger/financial tables using a SQL SELECT query. For ledger verification only: tables include transactions, plaid_accounts, subscriptions, savings_buckets, planned_transactions, balance_snapshots. Note: Do NOT use this for knowledge graph facts (employers, caps, rules, classes)—use get_world_model_entity or search_world_model instead. Always scope with 'user_id = ?'.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "claim": {"type": "string"},
-                    "sql_query": {"type": "string", "description": "Deterministic SQLite SELECT query to verify the claim. The schema includes tables like transactions, balance_snapshots, savings_buckets, etc. IMPORTANT: You MUST use 'user_id = ?' and the system will auto-inject the correct user."}
+                    "sql_query": {"type": "string", "description": "Deterministic SQLite SELECT query to verify the claim. Available ledger tables: transactions, plaid_accounts, subscriptions, savings_buckets, planned_transactions, balance_snapshots. IMPORTANT: You MUST use 'user_id = ?' and the system will auto-inject the correct user."}
                 },
                 "required": ["claim", "sql_query"]
             }
@@ -1886,6 +1978,11 @@ BOT_TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of queries to search concurrently in a single tool call.",
+                    },
                     "transaction_row_id": {
                         "type": "integer",
                         "description": "When researching a transaction merchant during an audit, include the numeric transaction row id (#1234) so the runtime can bind the research result to the exact transaction.",
@@ -2109,54 +2206,6 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "save_memory",
-            "description": "Save a durable memory/note for future reference. Use this LIBERALLY — memories are cheap, forgetting is expensive. Save anything worth remembering: user preferences, recurring patterns, important context, lessons learned, etc. Set pinned=true for facts that rarely change and should ALWAYS be visible (e.g. credit card APRs, the user's identity/name for internal-transfer detection, core standing preferences) so they never age out of the rolling memory window.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "content": {
-                        "type": "string",
-                        "description": "The memory content to save.",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Category for retrieval (e.g. 'preference', 'pattern', 'goal', 'warning'). Default: 'general'.",
-                    },
-                    "importance": {
-                        "type": "string",
-                        "description": "Importance level: 'low', 'normal', 'high'. Default: 'normal'.",
-                    },
-                    "pinned": {
-                        "type": "boolean",
-                        "description": "CRITICAL: Set true ONLY for unchanging core identity facts (APRs, rules). If updating a dynamic value or preference, use delete_memory on the old one first. NEVER pin dynamic numbers (balances, net worth). Default: false.",
-                    },
-                },
-                "required": ["content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_memories",
-            "description": "Retrieve saved memories, optionally filtered by category. Use limit and offset to page through large amounts of memories.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "description": "Filter by category. Omit to get all.",
-                    },
-                    "days": {"type": "integer"},
-                    "limit": {"type": "integer"},
-                    "offset": {"type": "integer", "description": "Number of memories to skip (for pagination)."},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "mark_audit_unresolved",
             "description": (
                 "AUDIT STATUS TOOL. Mark one or more CURRENT audit transactions as unresolved after "
@@ -2189,30 +2238,172 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "delete_memory",
-            "description": (
-                "Delete one or more saved memories. Use memory_id for a single "
-                "precise deletion (get the ID from get_memories first). Use "
-                "content_match to delete all memories containing that text. "
-                "Use this to remove stale, incorrect, or duplicate memories."
-            ),
+            "name": "explain_world_model_claim",
+            "description": "Explain why Delilah believes a specific claim in the Active World Model, tracing its provenance, evidence, and parent derivation chain.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "memory_id": {
-                        "type": "integer",
-                        "description": "Exact memory ID to delete (from get_memories output).",
-                    },
-                    "content_match": {
+                    "claim_id": {
                         "type": "string",
-                        "description": "Delete all memories whose content contains this text.",
-                    },
-                    "category": {
-                        "type": "string",
-                        "description": "Optional: only delete memories in this category when using content_match.",
-                    },
+                        "description": "The ID of the claim to audit/explain (e.g. claim_1234abcd)."
+                    }
                 },
-            },
+                "required": ["claim_id"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "simulate_counterfactual_scenario",
+            "description": "Evaluate a What-If financial scenario (e.g. buying a laptop cash vs leasing, quitting a job, cutting expenses) using deterministic numerical simulation without altering production data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scenario_name": {
+                        "type": "string",
+                        "description": "Descriptive name for the scenario (e.g. 'MacBook Cash Buyout', 'FWS Ends Early')."
+                    },
+                    "starting_cash_delta": {
+                        "type": "number",
+                        "description": "Immediate cash change in dollars (e.g. -4082.01 for cash purchase, 200.0 for cash deposit)."
+                    },
+                    "monthly_expense_delta": {
+                        "type": "number",
+                        "description": "Monthly recurring expense delta in dollars (e.g. 77.69 for lease payment, -50.0 for cancelled subscription)."
+                    },
+                    "fws_terminated": {
+                        "type": "boolean",
+                        "description": "Set to true if simulating an early termination of FWS income."
+                    },
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "Number of days to simulate forward (default 60)."
+                    }
+                },
+                "required": ["scenario_name"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "audit_cognitive_health",
+            "description": "Audit the health, due predictions, and unresolved contradictions inside the Active World Model.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_world_model_entity",
+            "description": "Look up an entity in the Active World Model Knowledge Graph (e.g. 'cuny_hpc', 'discover_it', 'apple_upgrade', 'user:current'). Returns full profile, attributes, verified active claims, and attached dossiers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_id_or_name": {
+                        "type": "string",
+                        "description": "Entity ID (e.g. 'org:cuny_hpc') or plain name/alias (e.g. 'CUNY HPC', 'Discover', 'Apple Upgrade')."
+                    }
+                },
+                "required": ["entity_id_or_name"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_world_model",
+            "description": "Full-text search across all entities, claims, and dossiers in the Active World Model Knowledge Graph using BM25 index.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search phrase (e.g. 'fws cap', 'seek stipend', 'fragrance freeze', 'tuition rate')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 5)."
+                    }
+                },
+                "required": ["query"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_world_model_dossier",
+            "description": "Retrieve a detailed markdown dossier/document from the Active World Model (e.g. 'cuny_aid_disbursement_2026', 'delilah_system_protocols', 'apple_macbook_upgrade_evaluation').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doc_id_or_title": {
+                        "type": "string",
+                        "description": "Dossier ID or title snippet."
+                    }
+                },
+                "required": ["doc_id_or_title"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assert_world_model_claim",
+            "description": "Assert a verified fact or relationship into the Active World Model Knowledge Graph. Automatically manages bi-temporal validity and history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject_id": {
+                        "type": "string",
+                        "description": "Subject entity ID (e.g. 'user:current', 'org:cuny_hpc', 'liability:discover_it')."
+                    },
+                    "predicate": {
+                        "type": "string",
+                        "description": "Relationship or property name (e.g. 'hourly_wage', 'employed_by', 'owes_debt_to', 'target_graduation')."
+                    },
+                    "object_id": {
+                        "type": "string",
+                        "description": "Target entity ID if pointing to another entity (e.g. 'org:cuny_hpc')."
+                    },
+                    "scalar_value": {
+                        "type": "string",
+                        "description": "Scalar value if property is a number, string, or boolean (e.g. '17.00', '2026-10-29', 'true')."
+                    },
+                    "provenance_type": {
+                        "type": "string",
+                        "enum": ["USER_STATED", "DIRECT_OBSERVATION", "DOCUMENT", "CALCULATION"],
+                        "description": "Evidence source category."
+                    },
+                    "source_authority": {
+                        "type": "integer",
+                        "description": "Authority confidence score from 1 (low) to 5 (highest, official document / user direct instruction)."
+                    }
+                },
+                "required": ["subject_id", "predicate"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retract_world_model_claim",
+            "description": "Retract an existing claim in the Active World Model by claim ID when it is no longer valid or has been superseded.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim_id": {
+                        "type": "string",
+                        "description": "Claim ID to retract."
+                    }
+                },
+                "required": ["claim_id"]
+            }
         },
     },
     {
@@ -2867,9 +3058,14 @@ EXPECTED_TOOL_NAMES = {
     "get_transactions_by_context",
     "log_lifestyle_context",
     "get_lifestyle_context",
-    "save_memory",
-    "get_memories",
-    "delete_memory",
+    "explain_world_model_claim",
+    "simulate_counterfactual_scenario",
+    "audit_cognitive_health",
+    "get_world_model_entity",
+    "search_world_model",
+    "get_world_model_dossier",
+    "assert_world_model_claim",
+    "retract_world_model_claim",
     "crawl_deeper",
     "send_push_alert",
     "schedule_reminder",
@@ -2912,8 +3108,6 @@ EXPECTED_TOOL_NAMES = {
 
     "load_tool_schemas",
     "verify_claim",
-    "semantic_search_memory",
-    "save_epistemic_memory",
     "get_temporal_projection",
     "save_to_knowledge_base",
     "query_knowledge_base",
@@ -2998,7 +3192,6 @@ def refresh_knowledge_base(*,user_id: str) -> dict:
         "expected_income": get_expected_income(status="Pending", days=60, user_id=user_id),
         "planned_transactions": get_planned_transactions(status="Expected", days=30, user_id=user_id),
         "upcoming_cash_flow": get_upcoming_cash_flow(days=30, user_id=user_id),
-        "recent_memories": get_memories(days=90, limit=10, user_id=user_id),
     }
 
 async def sync_plaid_accounting(
@@ -3220,9 +3413,9 @@ async def _chat_with_delilah_impl(
         _canonical_url(u) for u in re.findall(r"https?://[^\s<>\)\]\"']+", recent_text)
     }
 
-    system_prompt = """You are Delilah, an elite Chief Financial Officer (CFO), Wealth Strategist, and Quantitative Financial Architect operating inside Discord.
+    system_prompt = """You are Delilah, an elite Chief Financial Officer (CFO), Wealth Strategist, and Life Architecture Intelligence operating inside Discord.
 
-Your primary directive is to maximize the user's financial power, security, and net worth. You provide mathematically rigorous, data-grounded, and actionable financial counsel. Internal model knowledge is untrusted for user specifics: database and tool results are the sole authoritative sources of financial truth.
+Your primary directive is to maximize the user's financial power, security, and net worth while anchoring all strategy in their holistic ground truth. You manage not only accounts, debts, and cash flows, but also the real-world commitments that govern them: university enrollment, class schedules, transit routines, and life constraints stored in the Active World Model. NEVER deflect or claim that class schedules, academic commitments, or personal routines are out of scope—they are foundational inputs to your financial and lifestyle modeling. Internal model knowledge is untrusted for user specifics: database, world model, and tool results are the sole authoritative sources of truth.
 
 ==================================================
 CONCURRENT TOOL EXECUTION (HIGH-PERFORMANCE BATCHING)
@@ -3232,13 +3425,20 @@ You are HIGHLY ENCOURAGED to execute multiple disjoint tool calls concurrently i
 If you need to evaluate an inquiry across multiple dimensions (e.g. check cash balance + evaluate budget pacing + inspect upcoming bills + check credit utilization), DO NOT execute them sequentially across multiple turns.
 Emit ALL independent tool calls simultaneously in your immediate turn response to minimize latency and synthesize a multi-dimensional perspective.
 
-TOOL DISCOVERY BATCHING (CRITICAL — NEVER VIOLATE):
-- If you need to discover tools, ALWAYS call explore_domain("all") in a SINGLE call to get the full registry at once.
-  NEVER call explore_domain one domain at a time — that wastes N sequential round-trips unnecessarily.
-- After receiving the full registry, identify ALL tools you need for the request, then call load_tool_schemas ONCE with ALL needed tool names in a single batch array.
-  NEVER call load_tool_schemas multiple times for different tools — batch everything into one call.
-- Discovery sequence MUST be: 1x explore_domain("all") → 1x load_tool_schemas([all_needed_tools]) → then all real work calls in parallel.
-- If the tools you need are already in your available tool list, skip discovery entirely and call them directly.
+TOOL DISCOVERY (TASK-ADAPTIVE — FOLLOW THESE PRINCIPLES):
+- If you need to discover tools for a task, start by calling list_domains() to see the available domains.
+- Then, based on your current hypothesis and evidence needs, explore only the relevant domain(s) using explore_domain("<domain>") to discover specific capabilities and tool names.
+- Context-awareness heuristic: Match domains to your reasoning step:
+  * HYPOTHESIZE/REFUTE: income, expenses, transactions, debt, investment domains
+  * VERIFY: transaction verification, account balance, ledger domains  
+  * RESEARCH: market data, product information, business intelligence domains
+  * ACT: transaction modification, budget update, goal setting domains
+  * REMEMBER: knowledge storage, preference domains
+  * REVIEW: verification, audit, validation domains
+- Identify the specific tools you need for the current step of your work, then call load_tool_schemas(["tool1", "tool2", ...]) with ONLY those tool names.
+- You can resume discovery at any time if you realize you need additional capabilities — simply repeat the domain exploration and schema loading steps for the new tools.
+- If the tools you need are already available (schemas loaded), skip discovery and call them directly.
+- Always batch tool execution: execute multiple disjoint tool calls concurrently in a single turn when possible.
 
 ==================================================
 THE DELILAH WEALTH OPERATING SYSTEM (ORDER OF OPERATIONS)
@@ -3281,95 +3481,44 @@ PROTOCOL 4: FEE & BILL LEAKAGE ELIMINATION
 - Continuously enforce zero tolerance for bank fee leakage (overdrafts, maintenance fees, wire fees) via detect_bank_fee_leakage.
 - Audit subscription creep and unexpected recurring price increases via detect_unusual_bill_increases and analyze_recurring_leakage.
 
-==================================================
-MASTER TOOL DIRECTORY & ROUTING MATRIX (170 TOOLS)
-==================================================
-
-Always route to the most specialized, purpose-built tool for the inquiry:
-
-1. SOLVENCY, CREDIT & HEALTH:
-- get_financial_health_scorecard: Comprehensive 0-100 score across 5 pillars (savings rate, liquidity, debt-to-income, credit health, budget adherence), letter grade, and #1 priority action.
-- get_credit_utilization_breakdown: Individual card and aggregate credit utilization percentages, warning thresholds (>30%, >10%), and dollar amounts to reach optimal tiers.
-- simulate_credit_paydown_impact: Simulates utilization drops and credit tier improvements from applying extra payments to cards.
-- get_cash_drag_analysis: Calculates idle cash sitting in 0% APY checking above operating buffer and quantifies lost HYSA interest.
-- calculate_debt_snowball_vs_avalanche: Mathematical comparison of Avalanche vs Snowball debt payoff schedules, interest paid, and debt-free dates.
-- get_debt_overview: Summary of all tracked debts, balances, APRs, and minimum payments.
-
-2. INVESTMENT PORTFOLIO & ALLOCATION:
-- get_portfolio_holdings: All equities, ETFs, fixed income, and crypto holdings with shares, cost basis, current prices, market values, and unrealized P&L.
-- set_portfolio_holding: Adds, updates, or deletes (shares=0) an investment holding.
-- calculate_portfolio_drift: Compares current asset allocation against target weights and outputs exact rebalancing buy/sell trade orders.
-- calculate_compound_growth: Long-term future value compound growth simulator with milestone breakdowns.
-- get_portfolio_dividend_projection: Projected annual, monthly, and daily dividend/yield cash flow from portfolio assets.
-
-3. BUDGETING, PACING & ALLOCATIONS:
-- get_category_budget_pacing: Mid-month burn rate, velocity, and month-end projected spending vs monthly category budgets.
-- set_category_budget / delete_category_budget: Manages monthly category budget ceilings.
-- auto_generate_50_30_20_budget: Automatically calculates Needs (50%), Wants (30%), and Savings/Debt (20%) targets based on verified income.
-- compare_period_spending: Period-over-period spending comparisons (e.g. this month vs last month, this 30d vs prior 30d) with category deltas.
-- get_daily_spending_average: Computes daily discretionary burn rate over trailing 14/30/60/90 days.
-- get_safe_to_spend_metrics: Immediate safe-to-spend surplus accounting for pending bills and reserved buffers.
-
-4. BILLS, RECURRING CASH FLOW & FORECASTS:
-- get_bills_calendar: Calendar of upcoming recurring charges, bills, and subscriptions with 7d/14d/30d cash outflow requirements.
-- add_recurring_bill / remove_recurring_bill: Registers or deactivates recurring subscriptions and commitments.
-- project_cash_balance: Daily balance trajectory simulation across 30/60/90 days integrating recurring income, scheduled bills, and discretionary burn.
-- detect_unusual_bill_increases: Flags merchants whose charges increased compared to prior billing cycles.
-- analyze_recurring_leakage: Deep audit of zombie subscriptions and low-engagement recurring expenses.
-
-5. GOALS, SINKING FUNDS & SAVINGS MILESTONES:
-- get_savings_goals: All savings envelopes, current funding, target deadlines, contribution velocity, and shortfall deficits.
-- fund_savings_goal: Deposits funds into a specific goal envelope and logs the contribution audit record.
-- delete_savings_goal: Removes a savings envelope.
-- calculate_goal_timeline: Computes required monthly deposit for a target deadline, or estimated completion date from a monthly contribution.
-- prioritize_savings_goals: Deterministically ranks all active goals by urgency, deadline proximity, and deficit severity.
-
-6. TAX PLANNING, DEDUCTIONS & WRITE-OFFS:
-- scan_tax_deductions: Scans transaction history for IRS Schedule C/1099 eligible business expenses, software, hardware, and charitable gifts.
-- get_tax_bracket_estimate: Estimates federal income tax liability, marginal bracket, and standard deduction for single/married/head of household.
-- get_charitable_donations_summary: Totals tax-deductible charitable giving over the year.
-- calculate_hsa_fsa_tax_savings: Calculates federal, FICA, and state tax savings from pre-tax HSA/FSA contributions.
-- estimate_capital_gains_tax: Computes short-term vs long-term capital gains tax on realized investment sales.
-
-7. LEDGER, RECEIPTS & MERCHANT RESOLUTION:
-- get_transaction_ledger: Direct query of historical transactions with filters for category, merchant, date ranges, and min/max amounts.
-- get_transaction_detail: Detailed inspection of a specific transaction including audit history and tags.
-- parse_text_receipt: Parses raw OCR or pasted receipt text into structured line items, taxes, and totals.
-- search_merchants_and_aliases / add_merchant_alias_mapping: Searches and maps messy transaction strings to clean canonical merchant names.
-- detect_bank_fee_leakage: Audits transactions for overdraft, maintenance, late, and ATM fee charges.
-- get_duplicate_transactions: Identifies identical merchant charges occurring on the same day or within 48 hours.
-
-8. LOANS, MORTGAGES & REAL ESTATE:
-- calculate_loan_amortization: Full monthly principal & interest, total interest over life of loan, and amortization timeline.
-- calculate_extra_payment_impact: Computes interest saved and years shaved off by making extra principal payments.
-- compare_rent_vs_buy: Detailed mathematical comparison of renting + investing difference vs home ownership (mortgage, property tax, maintenance, appreciation).
-- calculate_mortgage_refinance_breakeven: Analyzes closing costs vs monthly payment reduction to find exact breakeven month.
-- calculate_student_loan_payoff: Standard vs accelerated payoff timelines for student debt.
-
-9. RETIREMENT & FI/RE PLANNING:
-- calculate_fire_number: Computes Financial Independence / Early Retirement target net worth and timeline using Safe Withdrawal Rates (3.5%–4.0%).
-- calculate_401k_match_maximizer: Ensures employee contribution percentage captures the maximum possible company match.
-- calculate_roth_conversion_tax: Evaluates upfront tax liability of converting traditional IRA/401k balances to Roth.
-- calculate_required_minimum_distributions: IRS Uniform Lifetime Table calculation of mandatory age 73+ RMDs.
-- simulate_retirement_drawdown: Simulates multi-decade portfolio survival under fixed, inflation-adjusted, or guardrail withdrawal strategies.
-
-10. VISUAL ANALYTICS & EXECUTIVE BRIEFINGS:
-- render_financial_chart: Generates beautiful, pure-Python dark-mode PNG charts for spending categories, cash flow, or net worth trends.
-- generate_weekly_financial_briefing: Synthesizes trailing 7-day spending, health score, upcoming bills, and priority actions into an executive briefing.
-- get_unified_net_worth / get_net_worth_history: Aggregates liquid cash, investments, debts, and historical trajectory.
 
 ==================================================
-CORE OPERATING LOOP
+CORE OPERATING LOOP WITH REASONING
 ==================================================
 
-For any task involving the user's finances:
+For any task involving the user's finances, follow this reasoning-enhanced loop:
 
-RECALL — Check memory (get_memories) before transaction review, corrections, audits, merchant research, projections, preferences, recurring patterns, goals, warnings, or "what should I do" questions. Memory is context, not a substitute for current database verification.
-VERIFY — Use the appropriate database/read tool before stating any specific financial fact. Never infer a balance, transaction state, category, spending total, debt amount, budget status, or other fact from memory alone. Tool output controls the answer. If the tool returns no data, say the data is unavailable. Never fabricate missing values.
-RESEARCH — Use search_web whenever an external fact is needed (merchant identity/type, prices, products, businesses, current status/policies, current events). If results are insufficient, use fetch_webpage on a URL returned by search_web. Prefer first-party sources. If reliable evidence cannot establish the fact, say it is unresolved.
-ACT — Mutate financial data only after the relevant data has been verified. Use native mutation tools. Never pretend an action occurred without a successful tool result. For large jobs use batch_correct_transactions and batch_lock_transactions rather than hundreds of individual calls. Keep batches reasonably sized: up to 50 corrections, up to 100 locks.
-REMEMBER — Save durable facts immediately when learned (confirmed merchant identities, recurring income/bills, goals, preferences, spending patterns, warnings, correction rules, audit lessons). Use tag_transaction_context for purchase context and log_lifestyle_context for durable lifestyle state.
-FINISH — An active audit is not complete until every transaction has been processed. COMPLETE means final verification reports exactly 0 remaining items. PARTIALLY COMPLETE means every remaining item was explicitly marked unresolved after reasonable research. Only after reaching one of those terminal states may you call the native end_turn tool. Never end an active task merely because you have explained what you plan to do.
+RECALL — Check the Active World Model (get_world_model_entity, search_world_model) before transaction review, corrections, audits, merchant research, projections, preferences, recurring patterns, goals, warnings, or "what should I do" questions. The world model contains verified epistemic state and active subgraphs. This grounds your reasoning in verified personal context.
+
+HYPOTHESIZE — Based on recalled information and the initial query, formulate 2-3 plausible explanations or interpretations. For complex questions, consider multiple angles (e.g., for spending changes: income changes, expense changes, timing differences, data errors). Rank hypotheses by plausibility and potential impact.
+
+REFUTE — For each hypothesis, generate potential refutations or alternative explanations that would contradict it. Actively seek evidence that could falsify each hypothesis rather than just confirm it. This helps avoid confirmation bias and strengthens reasoning.
+
+VERIFY — Use the appropriate database/read tool to test each hypothesis and establish baseline facts. Never infer a balance, transaction state, category, spending total, debt amount, budget status, or other fact from memory alone. Tool output controls the answer. If the tool returns no data, say the data is unavailable. Never fabricate missing values. Document which hypotheses are supported or contradicted by direct evidence.
+
+RESEARCH — Use search_web whenever an external fact is needed to evaluate hypotheses (merchant identity/type, prices, products, businesses, current status/policies, current events). If results are insufficient, use fetch_webpage on a URL returned by search_web. Prefer first-party sources. If reliable evidence cannot establish a needed fact, say it is unresolved and note how this affects confidence in related hypotheses.
+
+ACT — For hypothesis testing that requires data mutations (e.g., correcting transactions to test impact), use native mutation tools only after verifying the relevant data. Never pretend an action occurred without a successful tool result. For large jobs use batch_correct_transactions and batch_lock_transactions rather than hundreds of individual calls. Keep batches reasonably sized: up to 50 corrections, up to 100 locks. Always verify the result of mutations.
+
+REMEMBER — Save information proactively into the Active World Model using assert_world_model_claim. Be eager to persist: save confirmed facts (merchant identities, income/bills, goals, preferences), hypotheses with >60% confidence, verification results, research insights, spending patterns, warnings, correction rules, audit lessons, and contextual details. Also save which hypotheses were confirmed/refuted and why. Use tag_transaction_context for purchase context and log_lifestyle_context for durable lifestyle state. When in doubt, save it — the KG benefits from abundance of evidence.
+
+REVIEW — Before finalizing your response, critically examine your own reasoning for consistency and accuracy:
+  - Identify key factual claims in your reasoning (balances, transaction counts, dates, amounts, etc.)
+  - For each verifiable claim, use appropriate verification tools (verify_claim, get_world_model_entity, etc.) to check consistency with source data
+  - Note any discrepancies between your reasoning and verified facts
+  - Evaluate both supporting and refuting evidence for each hypothesis
+  - Adjust confidence levels accordingly: high confidence for claims supported by multiple sources and withstand refutation attempts, low confidence for unverified or contradicted claims
+  - If significant errors are found, revisit earlier steps (HYPOTHESIZE, REFUTE, VERIFY, RESEARCH) with the new information
+  - Document uncertainties that cannot be resolved with available tools
+
+FINISH — An active reasoning process is complete when: (1) sufficient evidence supports one hypothesis while substantially withstanding refutation attempts, OR (2) further investigation would yield diminishing returns given available tools and time. COMPLETE means you have a reasoned conclusion with supporting evidence you can confidently share, and key claims have been verified through REVIEW. PARTIALLY COMPLETE means you've exhausted reasonable investigation but uncertainty remains—explicitly state what is unresolved and why, and note which claims remain unverified. Only after reaching one of these terminal states may you call the native end_turn tool. Never end an active task merely because you have explained what you plan to do; end when reasoning reaches a verified conclusion.
+
+META-REASONING — Periodically reflect on your reasoning process to avoid local maxima and ensure thoroughness:
+  - After each REVIEW step, ask: "Am I asking the right questions?" and "Am I stuck in a local maximum?"
+  - If no convergence after 2-3 iterations through the loop, broaden your hypothesis space or seek external input
+  - Consider whether you need to reframe the problem or gather different types of evidence
+  - If evidence consistently contradicts your hypotheses, reconsider your initial assumptions
+  - Use the evidence_synthesizer tool to quantify uncertainty and identify when additional evidence would be most valuable
 
 ==================================================
 CRITICAL TOOL RULES — DELETE TRANSACTION
@@ -3402,8 +3551,7 @@ NO HALLUCINATED EXITS: Never invent user instructions such as "sum it up", "wrap
 WEB: search_web (external facts), fetch_webpage (returned-page verification)
 CODE / MATH: run_python_sandbox (Python, calculations, statistics, simulations, charts)
 SHELL / TESTING: run_shell
-PACKAGES: install_python_package for a missing module, then retry the failed operation
-MEMORY: get_memories, save_memory, delete_memory
+ACTIVE WORLD MODEL: get_world_model_entity (query entity & verified claims), search_world_model (BM25 search across knowledge graph), get_world_model_dossier (pull full markdown dossier), assert_world_model_claim (record new facts/relationships), retract_world_model_claim (revoke stale claims), explain_world_model_claim (audit claim provenance), simulate_counterfactual_scenario (What-If scenario simulation), audit_cognitive_health (verify graph consistency). ALWAYS use get_world_model_entity or search_world_model to verify facts about institutions, debts, employers, aid, or user terms before inventing SQL tables or guessing.
 TRANSACTION CONTEXT: tag_transaction_context (purchase context), log_lifestyle_context (lifestyle context)
 
 ==================================================
@@ -3466,7 +3614,7 @@ UNRESOLVED: If reliable research cannot establish the merchant or transaction ty
 MERCHANT RESEARCH RULES
 ==================================================
 
-Before merchant research: (1) check get_memories(category='merchant', user_id=uid), (2) check relevant transaction context, (3) check the known merchant registry when available, (4) search only when required.
+Before merchant research: (1) check known merchant registry when available or search_world_model, (2) check relevant transaction context, (3) search only when required.
 Search behavior: Search the exact raw merchant name. Do not pad queries with "merchant type", "business type", "what is", or "category". Do not manufacture unnecessary query terms. If results are weak, retry using genuinely different evidence sources (official site, parent company, spelling variants, city/location, menu, product page, registry, LinkedIn, receipts). Only fetch URLs returned by search_web or directly supplied by the user.
 
 RELEVANCE CHECK: The search result must actually describe the requested entity. If results are clearly unrelated, do not use them as evidence, do not guess the merchant category, classify as unresolved / Uncategorized Purchase when appropriate, and explain that reliable search evidence did not identify the entity.
@@ -3475,7 +3623,7 @@ RELEVANCE CHECK: The search result must actually describe the requested entity. 
 TRANSACTION CORRECTIONS
 ==================================================
 
-Before correcting: (1) retrieve memory, (2) retrieve the actual transaction, (3) verify the transaction_row_id, (4) determine whether it is unlocked, (5) research the merchant when required, (6) determine the category using evidence, (7) call the appropriate correction tool, (8) verify the mutation succeeded, (9) lock the transaction when it is fully audited and finalized.
+Before correcting: (1) verify transaction context and Active World Model state, (2) retrieve the actual transaction, (3) verify the transaction_row_id, (4) determine whether it is unlocked, (5) research the merchant when required, (6) determine the category using evidence, (7) call the appropriate correction tool, (8) verify the mutation succeeded, (9) lock the transaction when it is fully audited and finalized.
 
 correct_transaction: Requires the exact numeric transaction_row_id, a reason, and judgment when changing category. Cannot modify immutable identity fields.
 
@@ -3492,22 +3640,22 @@ SEARCH RULES
 search_web is the authority for external facts. Use it for merchant identity/type, current prices, current product information, businesses, current status, current policies, and uncertain external facts. Search immediately when external verification is required. Do not rely on model memory for current external information. If the first search is weak, retry with a genuinely different search strategy; do not repeatedly issue near-identical searches. When reporting web-derived facts, use the citation mechanism supplied by search_web, only state what the evidence supports, and clearly distinguish verified facts from uncertainty.
 
 ==================================================
-MEMORY RULES
+ACTIVE WORLD MODEL RULES
 ==================================================
 
-MEMORY-FIRST HABIT: Before ANY transaction review, correction, merchant research, projection, financial recommendation, or "what should I do" question, check memory first when relevant. Useful categories include merchant, preference, pattern, goal, warning, correction, income, budget, lifestyle. Do not ask permission to check memory.
-MEMORY RECALL GATE: Before the FIRST search_web, correct_transaction, or batch_correct_transactions in a task involving transaction review or merchant research, call get_memories(category='merchant', user_id=uid) at least once this turn, unless it was already called earlier in this same conversation and no new merchant has appeared.
+WORLD-MODEL-FIRST HABIT: Before ANY transaction review, correction, merchant research, projection, financial recommendation, or "what should I do" question, check the Active World Model (get_world_model_entity or search_world_model) first when relevant. The Active World Model contains verified epistemic state across institutions, employers, liabilities, rules, user goals, academic enrollment, and schedules. Do not ask permission to check the world model.
+VERIFICATION: When answering questions about terms, rates, caps, obligations, or user constraints, always use get_world_model_entity (e.g. 'cuny_hpc', 'discover_it', 'user:current') or get_world_model_dossier. Never invent SQL table names.
 
-DEFAULT TO PERMANENCE: Save durable information when learned (confirmed merchant identities, user preferences, recurring income, recurring bills, spending triggers, correction rules, audit definitions, important mistakes or lessons, durable financial goals).
+SCHEDULE & LIFE CONSTRAINTS: The Active World Model holds the user's verified real-world ground truth, including university class schedules, work commitments, and transit constraints. When the user asks about their schedule, routine, classes, or obligations, answer authoritatively from the Active World Model context or retrieve the dossier (e.g., cuny_fall_2026_class_schedule via get_world_model_dossier or search_world_model). NEVER claim or deflect that class schedules or life commitments are out of scope.
 
-MERCHANT MEMORY FORMAT: "Merchant: X is Y. Evidence: Z. Confidence: high/medium."
+DEFAULT TO PERMANENCE: Save information proactively when learned (confirmed facts, hypotheses with >60% confidence, verification results, research insights, spending patterns, warnings, correction rules, audit lessons, contextual details, and financial goals) by asserting claims using assert_world_model_claim. Be eager to persist - when in doubt, save it.
 
-MEMORY QUALITY: Save one durable fact per memory when practical. Never claim a memory was saved without a successful save_memory result. Do not save a memory that already exists; check existing memories first. If save_memory reports "Duplicate memory blocked", accept that result and continue; do not rephrase and retry. Delete stale, incorrect, or duplicate memories using delete_memory after finding the appropriate memory ID. At the end of a task, if memories were actually saved, briefly state what was saved. Never claim a save that did not occur.
+CLAIM QUALITY: Assert precise predicates and scalar values. Set source_authority (1 to 5) and appropriate provenance_type ('USER_STATED', 'DIRECT_OBSERVATION', 'DOCUMENT', 'CALCULATION'). Stale claims can be revoked via retract_world_model_claim.
 
 ==================================================
 DATABASE EAGERNESS
 ==================================================
-Financial facts must be persisted rather than held only in model context. If the user provides durable financial information (a job, paycheck, bill, manual cash purchase, recurring income, recurring expense, financial goal, durable preference), use the appropriate database mutation tool in the same turn. Do not merely say you will remember it. Use add_expected_income, add_planned_transaction, save_memory, add_transaction, log_lifestyle_context, or the appropriate specialized tool. Do not wait for permission when the user has clearly provided durable information that belongs in the database.
+Financial facts must be persisted rather than held only in model context. If the user provides durable financial information (a job, paycheck, bill, manual cash purchase, recurring income, recurring expense, financial goal, durable preference), use the appropriate database mutation tool in the same turn. Do not merely say you will remember it. Use add_expected_income, add_planned_transaction, assert_world_model_claim, add_transaction, log_lifestyle_context, or the appropriate specialized tool. Do not wait for permission when the user has clearly provided durable information that belongs in the database.
 
 WORKSPACE PATTERN FOR LONG SCRIPTS:
 Write long scripts to /tmp/ (persists during the session).
@@ -3627,62 +3775,18 @@ RUNTIME CONTRACT:
         else "(financial context intentionally withheld for this Gmail-only turn)"
     )
 
-    # Pull existing memories so the model knows what it already has.
-    # Gmail-only turns are a hard isolation boundary: persisted memories may
-    # contain financial or other unrelated user data and must not be exposed.
+    # All facts, identities, debts, schedules, and policies are managed
+    # exclusively via the Active World Model (kg_entities, kg_claims, kg_dossiers).
+    awm_context = ""
     if context_policy["include_session_history"]:
-        # Pinned memories are ALWAYS included in full, on top of the rolling
-        # 40-most-recent list, so durable facts never silently age out.
-        c.execute(
-            """SELECT category, content FROM delilah_memories
-            WHERE user_id = ? AND is_active = 1 AND is_pinned = 1
-            ORDER BY datetime(created_at) DESC LIMIT 50""", (uid,)
-        )
-        _pinned_rows = c.fetchall()
+        try:
+            awm_context = build_world_model_context(prompt_text, max_tokens=300, user_id=uid)
+        except Exception as e:
+            awm_context = ""
 
-        c.execute(
-            """SELECT category, content FROM delilah_memories
-            WHERE user_id = ? AND is_active = 1 AND is_pinned = 0
-            ORDER BY datetime(created_at) DESC LIMIT 40""", (uid,)
-        )
-        _memory_rows = c.fetchall()
-
-        _memory_parts = []
-        if _pinned_rows:
-            _memory_parts.append(" PINNED (always shown):")
-            _memory_parts.extend(
-                f"- [{cat}] {cont}" for cat, cont in _pinned_rows
-            )
-        if _memory_rows:
-            if _pinned_rows:
-                _memory_parts.append("")
-            _memory_parts.append("Recent:")
-            _memory_parts.extend(
-                f"- [{cat}] {cont}" for cat, cont in _memory_rows
-            )
-        _memory_context = (
-            "\n".join(_memory_parts)
-            if _memory_parts
-            else "(no memories stored yet)"
-        )
-    else:
-        _pinned_rows = []
-        _memory_rows = []
-        _memory_parts = []
-        _memory_context = (
-            "(user memories intentionally withheld for this Gmail-only turn)"
-        )
-
-    # Static system_prompt (instructions only) is kept byte-identical across
-    # turns so its KV-cache prefix can be reused. Volatile data (timestamp,
-    # live financial context, memories) is injected as a SEPARATE system
-    # message placed right before the user turn, so only that small trailing
-    # block needs reprocessing each turn instead of invalidating everything
-    # after the first changed byte in one giant system string.
     volatile_context = f"""
-EXISTING MEMORIES — DO NOT RE-SAVE THESE
-========================================
-{_memory_context}
+{awm_context}
+
 CURERENT SYSTEM DATE & TIME: {current_time}
 
 CURRENT DATABASE FINANCIAL CONTEXT
@@ -4133,18 +4237,35 @@ CURRENT DATABASE FINANCIAL CONTEXT
     accumulated_narrative = ""
 
     def chunk_text(text: str, limit: int = 1900) -> list[str]:
-        """Split Discord output into non-empty chunks, including short text."""
+        """Split Discord output into non-empty chunks, including short text.
+        Avoids splitting inside code block fences (```) to preserve formatting.
+        """
         text = (text or "").strip()
         if not text:
             return []
 
+        def count_triple_backticks(s: str) -> int:
+            return s.count("```")
+
         chunks = []
         while len(text) > limit:
+            # Find a split point that doesn't break a code block
             split_at = text.rfind("\n", 0, limit)
             if split_at < 500:
                 split_at = text.rfind(" ", 0, limit)
             if split_at <= 0:
                 split_at = limit
+
+            # Try to adjust split_at to avoid being inside a code block
+            original_split_at = split_at
+            while split_at > 0 and count_triple_backticks(text[:split_at]) % 2 == 1:
+                # Move split point earlier to try to exit code block
+                split_at = text.rfind("\n", 0, split_at)
+                if split_at < 500:
+                    split_at = text.rfind(" ", 0, split_at)
+            if split_at <= 0:
+                # Could not find a suitable earlier split point; use original
+                split_at = original_split_at
 
             chunk = text[:split_at].strip()
             if chunk:
@@ -4599,6 +4720,77 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 }
             )
 
+        # 2. Parse XML-style tool calls (e.g. <tool_call><function=foo><parameter=bar>val</parameter></function></tool_call>)
+        # Commonly emitted by Qwen, DeepSeek, Nemotron, or dot-format prompts
+        xml_pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
+        for match in re.finditer(xml_pattern, text, re.DOTALL):
+            body = match.group(1).strip()
+            span = match.span()
+            func_name = None
+            args = {}
+
+            # Check <function=foo>...</function>
+            fn_match = re.search(r"<function=([a-zA-Z0-9_]+)>(.*?)(?:</function>|$)", body, re.DOTALL)
+            if fn_match:
+                candidate = fn_match.group(1).strip()
+                if candidate in KNOWN_TOOLS:
+                    func_name = candidate
+                    fn_body = fn_match.group(2).strip()
+                    for p in re.finditer(r"<parameter=([a-zA-Z0-9_]+)>(.*?)(?:</parameter>|$)", fn_body, re.DOTALL):
+                        pname = p.group(1).strip()
+                        pval = p.group(2).strip()
+                        try:
+                            pval = json.loads(pval)
+                        except Exception:
+                            pass
+                        args[pname] = pval
+            else:
+                # Check if body inside <tool_call> is raw JSON
+                for obj, _, _ in _iter_json_objects(body):
+                    if isinstance(obj, dict):
+                        for k in ("name", "tool", "function"):
+                            v = obj.get(k)
+                            if isinstance(v, str) and v in KNOWN_TOOLS:
+                                func_name = v
+                                args = obj.get("arguments", obj.get("parameters", {}))
+                                break
+                            elif isinstance(v, dict) and v.get("name") in KNOWN_TOOLS:
+                                func_name = v["name"]
+                                args = v.get("arguments", v.get("parameters", {}))
+                                break
+
+            # Check Python function call syntax inside <tool_call>: func_name(arg=val)
+            if not func_name:
+                py_fn_match = re.match(r"^([a-zA-Z0-9_]+)\s*\((.*?)\)$", body, re.DOTALL)
+                if py_fn_match and py_fn_match.group(1) in KNOWN_TOOLS:
+                    func_name = py_fn_match.group(1)
+                    # Extract keyword args
+                    kwargs_str = py_fn_match.group(2)
+                    for kw in re.finditer(r"([a-zA-Z0-9_]+)\s*=\s*(['\"](.*?)['\"]|[^,]+)", kwargs_str):
+                        k = kw.group(1)
+                        v = kw.group(3) if kw.group(3) is not None else kw.group(2).strip()
+                        try:
+                            v = json.loads(v)
+                        except Exception:
+                            pass
+                        args[k] = v
+
+            if func_name:
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                parsed_calls.append(
+                    {
+                        "function": {
+                            "name": func_name,
+                            "arguments": args if isinstance(args, dict) else {},
+                        },
+                        "_span": span,
+                    }
+                )
+
         return parsed_calls
 
     def _strip_fallback_tool_json(text: str, calls: list[dict] | None = None) -> str:
@@ -4850,6 +5042,17 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Each entry: (keywords_tuple, tools_set)
     # First matching entry wins; fallback stays empty (pure discovery mode).
     _INTENT_TOOL_MAP: list[tuple[tuple[str, ...], set[str]]] = [
+        # Web search / news / research / internships / jobs / trackers (evaluated first)
+        (
+            ("search", "internship", "internships", "swe", "job", "career", "tracker", "news", "scrape", "briefing", "article"),
+            _CORE_READ_TOOLS | {
+                "search_web",
+                "fetch_webpage",
+                "crawl_deeper",
+                "send_push_alert",
+                "run_python_sandbox",
+            },
+        ),
         # Reconcile / ledger sync
         (
             ("reconcile", "ledger", "sync"),
@@ -4935,6 +5138,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 "adjust_savings_bucket",
             },
         ),
+        # Schedule / classes / routine / commitments
+        (
+            ("schedule", "class", "classes", "cuny", "routine", "commitment", "commitments"),
+            _CORE_READ_TOOLS | {
+                "get_world_model_entity",
+                "get_world_model_dossier",
+                "search_world_model",
+                "get_bills_calendar",
+            },
+        ),
         # Status / peek / summary
         (
             ("status", "peek", "summary", "check", "update"),
@@ -4949,15 +5162,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
     ]
 
     dynamically_loaded_tools: set[str] = set()
-    if not gmail_only_turn:
-        for keywords, tool_set in _INTENT_TOOL_MAP:
-            if any(kw in _prompt_lower for kw in keywords):
-                dynamically_loaded_tools = set(tool_set)
-                print(
-                    f" [TOOL PRE-SEED] Intent match {keywords[0]!r}. "
-                    f"Pre-loaded {len(dynamically_loaded_tools)} tools — skipping discovery."
-                )
-                break
 
     # Audit mode is a runtime contract, not merely a prompt suggestion.
 
@@ -5872,22 +6076,34 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             user_id=uid,
                             days_ahead=args.get("days_ahead", 90)
                         )
-                    elif func_name == "semantic_search_memory":
-                        db_result = await semantic_search_memory(
-                            user_id=uid,
-                            query=args.get("query", ""),
-                            top_k=args.get("top_k", 5),
-                            min_confidence=args.get("min_confidence", 0.0)
+                    elif func_name in ("semantic_search_memory", "get_memories"):
+                        # Legacy fallback: transparently redirect to Active World Model
+                        q_arg = str(args.get("query") or args.get("category") or "").strip()
+                        if q_arg and q_arg.lower() not in ("general", "all"):
+                            res = search_world_model(q_arg, limit=args.get("top_k", 5))
+                            db_result = json.dumps(res, indent=2)
+                        else:
+                            # If called generically (e.g. get_memories() or get_memories(category='general')),
+                            # return the verified Active World Model ground truth context so the model has the exact data
+                            awm_block = build_world_model_context("schedule classes debts cuny", max_tokens=600, user_id=uid)
+                            db_result = json.dumps({
+                                "status": "ACTIVE_WORLD_MODEL_VERIFIED_STATE",
+                                "context": awm_block,
+                                "notice": "Direct memory tools sunset in favor of Active World Model Knowledge Graph."
+                            }, indent=2)
+                    elif func_name in ("save_epistemic_memory", "save_memory"):
+                        # Legacy fallback: redirect to assert_claim
+                        content_str = str(args.get("content") or "").strip()
+                        pred_str = str(args.get("memory_type") or "fact").strip().lower()
+                        cid = assert_claim(
+                            subject_id=f"user:{uid}",
+                            predicate=pred_str,
+                            scalar_value=content_str,
+                            provenance_type="USER_STATED" if args.get("provenance_type") == "user_stated" else "INFERRED",
+                            source_authority=4 if args.get("provenance_type") == "user_stated" else 3,
+                            valid_from=datetime.date.today().isoformat(),
                         )
-                    elif func_name == "save_epistemic_memory":
-                        db_result = await save_epistemic_memory(
-                            user_id=uid,
-                            content=args.get("content", ""),
-                            memory_type=args.get("memory_type", "fact"),
-                            provenance_type=args.get("provenance_type", "llm_inferred"),
-                            confidence=args.get("confidence", 0.5),
-                            evidence_refs=args.get("evidence_refs", [])
-                        )
+                        db_result = json.dumps({"status": "SUCCESS", "claim_id": cid, "migrated_to": "Active World Model"}, indent=2)
                     elif func_name == "explore_domain":
                         db_result = explore_domain(args.get("domain", ""))
                     elif func_name == "load_tool_schemas":
@@ -5897,7 +6113,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     elif func_name == "verify_claim":
                         # We need user_id injected safely
                         q = args.get("sql_query", "")
-                        q = q.replace("user_id = ?", f"user_id = '{uid}'")
+                        # Replace user_id = ? with actual user_id, allowing flexible spacing
+                        q = re.sub(r"user_id\s*=\s*\?", f"user_id = '{uid}'", q)
                         db_result = verify_claim(args.get("claim", ""), q, uid)
                     elif func_name == "query_spending":
                         db_result = query_spending(
@@ -6665,6 +6882,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         # one `query` string. Never let that malformed shape kill the
                         # research loop. Execute each query independently and aggregate
                         # the model-facing results.
+                        # Trailing location/noise suffixes to strip from batched
+                        # queries before they reach the search engine. Mirrors the
+                        # locationish set in src/services/search.py.
+                        _JUNK_SUFFIXES = {
+                            "avenel", "hudson", "brooklyn", "manhattan", "ny", "nyc",
+                            "usa", "us", "gb", "uk", "ca", "ch", "herald", "square",
+                            "7th", "ave", "st", "rd", "dr", "ct", "ln", "way",
+                            "suite", "ste", "fl", "bldg", "bld", "plaza", "center",
+                            "centre", "mall", "market", "station", "airport",
+                        }
                         batched_queries = args.get("queries")
                         if not args.get("query") and isinstance(batched_queries, list):
                             clean_queries = []
@@ -6693,6 +6920,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             pending_set = set(audit_state.get("research_pending") or []) if audit_state else set()
                             inflight_set = set(audit_state.get("research_inflight") or []) if audit_state else set()
                             active_batch = list(audit_state.get("active_research_batch") or []) if audit_state else []
+                            # Filter and prepare queries
+                            queries_to_search = []
+                            query_meta = []
                             for q in batch_queries:
                                 clean_query = q
                                 lower_q = clean_query.lower()
@@ -6710,15 +6940,30 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     print(f" [AUDIT SEARCH QUEUE] skipping non-pending query={clean_query!r}")
                                     batch_parts.append(f"[QUERY: {clean_query}]\n Skipped: Merchant is not in the pending unknown list.")
                                     continue
-                                search_payload = await search_searxng(clean_query, time_range=time_range_arg, prior_queries=[])
-                                text = str(search_payload.get("text", "") or "").strip()
-                                compact = text[:650] + ("\n[search result compacted by controller]" if len(text) > 650 else "")
-                                batch_parts.append(f"[QUERY: {clean_query}]\n{compact}")
-                                _research_set().add(query_key)
-                                if audit_state:
-                                    for matched in matched_pending:
-                                        inflight_set.add(matched)
-                                        _research_set().add(matched)
+                                queries_to_search.append(clean_query)
+                                query_meta.append((clean_query, query_key, matched_pending))
+
+                            # Execute all eligible queries concurrently
+                            if queries_to_search:
+                                search_results = await asyncio.gather(
+                                    *[
+                                        search_searxng(cq, time_range=time_range_arg, prior_queries=[])
+                                        for cq in queries_to_search
+                                    ],
+                                    return_exceptions=True,
+                                )
+                                for (clean_query, query_key, matched_pending), search_payload in zip(query_meta, search_results):
+                                    if isinstance(search_payload, Exception):
+                                        batch_parts.append(f"[QUERY: {clean_query}]\n Search failed: {search_payload}")
+                                        continue
+                                    text = str(search_payload.get("text", "") or "").strip()
+                                    compact = text[:650] + ("\n[search result compacted by controller]" if len(text) > 650 else "")
+                                    batch_parts.append(f"[QUERY: {clean_query}]\n{compact}")
+                                    _research_set().add(query_key)
+                                    if audit_state:
+                                        for matched in matched_pending:
+                                            inflight_set.add(matched)
+                                            _research_set().add(matched)
                             if audit_state:
                                 audit_state["research_inflight"] = sorted(inflight_set)
                                 audit_state["researched_merchants"] = []
@@ -6956,20 +7201,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = get_lifestyle_context(
                             days=args.get("days", 90), limit=args.get("limit", 20)
                         , user_id=uid)
-                    elif func_name == "save_memory":
-                        db_result = save_memory(
-                            content=args.get("content"),
-                            category=args.get("category", "general"),
-                            importance=args.get("importance", "normal"),
-                            pinned=bool(args.get("pinned", False)),
-                         user_id=uid)
-                    elif func_name == "get_memories":
-                        db_result = get_memories(
-                            category=args.get("category"),
-                            days=args.get("days", 90),
-                            limit=args.get("limit", 20),
-                            offset=args.get("offset", 0),
-                         user_id=uid)
+
                     elif func_name == "monitor_list_rules":
                         include_disabled = bool(args.get("include_disabled", False))
                         rules = list_monitor_rules(
@@ -7048,6 +7280,74 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             content_match=args.get("content_match"),
                             category=args.get("category"),
                          user_id=uid)
+                    elif func_name == "explain_world_model_claim":
+                        claim_id = str(args.get("claim_id", "")).strip()
+                        if not claim_id:
+                            db_result = "ERROR: claim_id is required."
+                        else:
+                            exp = explain_claim(claim_id)
+                            db_result = json.dumps(exp, indent=2)
+                    elif func_name == "simulate_counterfactual_scenario":
+                        s_name = str(args.get("scenario_name", "Hypothetical Scenario")).strip()
+                        days_ahead = int(args.get("days_ahead", 60))
+                        overrides = {}
+                        if "starting_cash_delta" in args:
+                            overrides["starting_cash_delta"] = float(args["starting_cash_delta"])
+                        if "monthly_expense_delta" in args:
+                            overrides["monthly_expense_delta"] = float(args["monthly_expense_delta"])
+                        if "fws_terminated" in args:
+                            overrides["fws_terminated"] = bool(args["fws_terminated"])
+                        db_result = run_counterfactual_comparison(uid, s_name, overrides, days_ahead=days_ahead)
+                    elif func_name == "audit_cognitive_health":
+                        health = audit_world_model_health()
+                        db_result = json.dumps(health, indent=2)
+                    elif func_name == "get_world_model_entity":
+                        target = str(args.get("entity_id_or_name", "") or args.get("entity_id", "") or args.get("name", "")).strip()
+                        if not target:
+                            target = f"user:{uid}"
+                        res = get_world_model_entity(target)
+                        db_result = json.dumps(res, indent=2)
+                    elif func_name == "search_world_model":
+                        query_str = str(args.get("query", "")).strip()
+                        limit_val = int(args.get("limit", 5))
+                        if not query_str:
+                            db_result = "ERROR: query is required."
+                        else:
+                            res = search_world_model(query_str, limit=limit_val)
+                            db_result = json.dumps(res, indent=2)
+                    elif func_name == "get_world_model_dossier":
+                        doc_target = str(args.get("doc_id_or_title", "")).strip()
+                        if not doc_target:
+                            db_result = "ERROR: doc_id_or_title is required."
+                        else:
+                            res = get_world_model_dossier(doc_target)
+                            db_result = json.dumps(res, indent=2)
+                    elif func_name == "assert_world_model_claim":
+                        s_id = str(args.get("subject_id", "")).strip()
+                        pred = str(args.get("predicate", "")).strip()
+                        o_id = args.get("object_id")
+                        s_val = args.get("scalar_value")
+                        p_type = str(args.get("provenance_type", "USER_STATED"))
+                        s_auth = int(args.get("source_authority", 4))
+                        if not s_id or not pred:
+                            db_result = "ERROR: subject_id and predicate are required."
+                        else:
+                            cid = assert_claim(
+                                subject_id=s_id,
+                                predicate=pred,
+                                object_id=str(o_id).strip() if o_id else None,
+                                scalar_value=s_val,
+                                provenance_type=p_type,
+                                source_authority=s_auth
+                            )
+                            db_result = json.dumps({"status": "ASSERTED", "claim_id": cid, "subject_id": s_id, "predicate": pred}, indent=2)
+                    elif func_name == "retract_world_model_claim":
+                        cid = str(args.get("claim_id", "")).strip()
+                        if not cid:
+                            db_result = "ERROR: claim_id is required."
+                        else:
+                            res = retract_world_model_claim(cid)
+                            db_result = json.dumps(res, indent=2)
                     elif func_name == "schedule_reminder":
                         c.execute(
                             "CREATE TABLE IF NOT EXISTS scheduled_reminders "

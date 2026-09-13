@@ -18,6 +18,7 @@ Security model:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -1287,6 +1288,20 @@ async def monitor_watchdog_loop():
                                         pass
                 except Exception:
                     pass
+
+            # ============================================================
+            # AWM Cognitive Substrate Audit (Phase 3 Autonomous Health)
+            # ============================================================
+            try:
+                from src.services.world_model import audit_world_model_health
+                awm_health = audit_world_model_health()
+                if awm_health.get("due_predictions_count", 0) > 0:
+                    print(f" [AWM] Watchdog detected {awm_health['due_predictions_count']} due prediction(s) awaiting validation.")
+                if awm_health.get("unresolved_contradictions_count", 0) > 0:
+                    print(f" [AWM] Watchdog detected {awm_health['unresolved_contradictions_count']} unresolved contradiction(s).")
+            except Exception as awm_exc:
+                print(f" [AWM] Health audit error: {awm_exc}")
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -37,8 +37,8 @@ from src.utils.helpers import sanitize_merchant_name
 # Import configuration constants needed at module load time
 from src.core.state import CHAT_HISTORY_TURNS, DB_PATH
 
-# Import database connection from state module (single shared connection)
-from src.core.state import conn, c, bot
+# Import database connection and merchant helpers from state module
+from src.core.state import conn, c, bot, _resolve_known_merchant, _merchant_key, _research_set
 
 
 # ============================================================

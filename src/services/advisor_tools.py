@@ -1219,6 +1219,246 @@ def tool_generate_weekly_financial_briefing(user_id: str, args: Dict[str, Any], 
         return _eval(db)
 
 
+def tool_evidence_synthesizer(user_id: str, args: Dict[str, Any], conn: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
+    """51. Synthesizes multiple pieces of evidence using weighted averaging to assess claim validity, considering source reliability, recency, relevance, consistency, and stance. Use when evaluating complex hypotheses with conflicting or uncertain evidence."""
+    _ensure_user_id(user_id, "evidence_synthesizer")
+
+    claim = str(args.get("claim", ""))
+    evidence_list = args.get("evidence_list", [])
+    prior_probability = float(args.get("prior_probability", 0.5))
+    confidence_desired = float(args.get("confidence_desired", 0.95))
+    evidence_half_life_days = float(args.get("evidence_half_life_days", 30.0))  # Half-life for evidence decay
+
+    if not claim:
+        return {"error": "Claim is required"}
+    if not evidence_list or not isinstance(evidence_list, list):
+        return {"error": "evidence_list must be a non-empty list"}
+
+    # Process each evidence item
+    weighted_support = 0.0
+    weighted_contradiction = 0.0
+    total_weight = 0.0
+    evidence_details = []
+    sources_used = {}  # Track sources to detect correlation
+
+    for i, evidence in enumerate(evidence_list):
+        if not isinstance(evidence, dict):
+            continue
+
+        content = str(evidence.get("content", ""))
+        source = str(evidence.get("source", "unknown"))
+        reliability = max(0.0, min(1.0, float(evidence.get("reliability", 0.5))))
+        recency_days = max(0, float(evidence.get("recency_days", 30)))
+        relevance = max(0.0, min(1.0, float(evidence.get("relevance", 0.5))))
+        confidence = max(0.0, min(1.0, float(evidence.get("confidence", 0.8))))
+
+        # Support continuous stance score (-1 to 1) or fall back to keyword heuristic
+        stance = evidence.get("stance")
+        if stance is not None:
+            # Stance provided directly: -1 (strong contradict) to +1 (strong support)
+            stance = max(-1.0, min(1.0, float(stance)))
+        else:
+            # Fall back to keyword heuristic
+            content_lower = content.lower()
+            support_indicators = ['yes', 'true', 'confirms', 'supports', 'shows', 'indicates', 'suggests', 'demonstrates', 'proves', 'validates']
+            contradict_indicators = ['no', 'false', 'refutes', 'contradicts', 'shows no', 'does not support', 'indicates not', 'suggests not']
+
+            support_score = sum(1 for indicator in support_indicators if indicator in content_lower)
+            contradict_score = sum(1 for indicator in contradict_indicators if indicator in content_lower)
+
+            # Normalize to [-1, 1] range
+            net_indicator = (support_score - contradict_score) / max(1, support_score + contradict_score)
+            if net_indicator == 0 and (support_score > 0 or contradict_score > 0):
+                net_indicator = 0.1  # Slight bias toward support if any indicators found
+            elif net_indicator == 0 and support_score == 0 and contradict_score == 0:
+                net_indicator = 0.0  # Neutral if no indicators
+            else:
+                stance = net_indicator
+
+        # Recency weighting: more recent evidence gets higher weight
+        # Using exponential decay with configurable half-life
+        recency_weight = math.exp(-recency_days / evidence_half_life_days)
+
+        # Overall weight for this evidence
+        weight = reliability * recency_weight * relevance * confidence
+
+        # Source reliability tracking for correlation detection
+        if source not in sources_used:
+            sources_used[source] = 0
+        sources_used[source] += 1
+
+        # Apply stance to weight
+        if stance > 0:
+            weighted_support += weight * stance
+        else:
+            weighted_contradiction += weight * abs(stance)
+
+        total_weight += weight
+
+        evidence_details.append({
+            "index": i,
+            "source": source,
+            "weight": weight,
+            "stance": stance,
+            "reliability": reliability,
+            "recency_days": recency_days,
+            "relevance": relevance,
+            "confidence": confidence
+        })
+
+    # Calculate evidence statistics for uncertainty analysis
+    evidence_count = len([e for e in evidence_details if isinstance(e, dict)])
+    stance_variance = 0.0
+    if evidence_count > 1:
+        stances = [e["stance"] for e in evidence_details]
+        mean_stance = sum(stances) / len(stances)
+        stance_variance = sum((s - mean_stance) ** 2 for s in stances) / len(stances)
+
+    # Detect and adjust for correlated evidence (evidence from same source is less independent)
+    adjusted_total_weight = 0.0
+    adjusted_weighted_support = 0.0
+    adjusted_weighted_contradiction = 0.0
+
+    for evidence in evidence_details:
+        source = evidence["source"]
+        source_count = sources_used[source]
+        # If multiple pieces of evidence from same source, reduce effective weight
+        # Using square root penalty: n pieces from same source = sqrt(n) effective pieces
+        correlation_penalty = 1.0 / math.sqrt(source_count) if source_count > 0 else 1.0
+        
+        adjusted_weight = evidence["weight"] * correlation_penalty
+        stance = evidence["stance"]
+        
+        if stance > 0:
+            adjusted_weighted_support += adjusted_weight * stance
+        else:
+            adjusted_weighted_contradiction += adjusted_weight * abs(stance)
+            
+        adjusted_total_weight += adjusted_weight
+
+    # Use adjusted weights for final calculation
+    total_weight = adjusted_total_weight if adjusted_total_weight > 0 else total_weight
+    weighted_support = adjusted_weighted_support if adjusted_weighted_support > 0 else weighted_support
+    weighted_contradiction = adjusted_weighted_contradiction if adjusted_weighted_contradiction > 0 else weighted_contradiction
+
+    # Calculate posterior probability using Bayesian-like updating
+    if total_weight > 0:
+        support_ratio = weighted_support / total_weight if total_weight > 0 else 0
+        contradiction_ratio = weighted_contradiction / total_weight if total_weight > 0 else 0
+        net_evidence = support_ratio - contradiction_ratio
+
+        # Convert net evidence to likelihood ratio
+        # net_evidence in [-1, 1] -> likelihood ratio in [0.1, 10]
+        # Using exponential scaling: 0.1 * (100.0^((net_evidence + 1) / 2))
+        likelihood_ratio = 0.1 * (100.0 ** ((net_evidence + 1) / 2))
+
+        # Bayesian update: posterior = (prior * likelihood) / (prior * likelihood + (1 - prior))
+        likelihood = likelihood_ratio
+        posterior = (prior_probability * likelihood) / (prior_probability * likelihood + (1 - prior_probability))
+
+        # Clamp to reasonable bounds
+        posterior = max(0.01, min(0.99, posterior))
+    else:
+        posterior = prior_probability
+
+    # Calculate confidence interval based on evidence quality and quantity
+    # Higher uncertainty when: low total weight, high variance in stances, low evidence count
+    evidence_count = len([e for e in evidence_details if isinstance(e, dict)])
+    stance_variance = 0.0
+    if evidence_count > 1:
+        stances = [e["stance"] for e in evidence_details]
+        mean_stance = sum(stances) / len(stances)
+        stance_variance = sum((s - mean_stance) ** 2 for s in stances) / len(stances)
+    
+    # Base uncertainty from evidence amount (normalized)
+    amount_uncertainty = max(0.0, 1.0 - min(total_weight, 5.0) / 5.0)  # Decreases with more weight
+    # Variance uncertainty (high variance = high uncertainty)
+    variance_uncertainty = min(stance_variance, 1.0)  # Stance variance in [0,1]
+    # Source diversity uncertainty (fewer sources = higher uncertainty)
+    source_diversity = len(sources_used) / max(evidence_count, 1) if evidence_count > 0 else 0
+    diversity_uncertainty = 1.0 - source_diversity  # Less diversity = more uncertainty
+    
+    # Combined uncertainty
+    uncertainty = (amount_uncertainty * 0.5) + (variance_uncertainty * 0.3) + (diversity_uncertainty * 0.2)
+    uncertainty = max(0.0, min(1.0, uncertainty))
+    
+    margin = uncertainty * 0.25  # Up to ±0.25
+    ci_lower = max(0.0, posterior - margin)
+    ci_upper = min(1.0, posterior + margin)
+
+    # Identify key evidence contributors
+    sorted_evidence = sorted(evidence_details, key=lambda x: x['weight'], reverse=True)
+    key_supporters = [e for e in sorted_evidence if e['stance'] > 0.1][:3]
+    key_contradictors = [e for e in sorted_evidence if e['stance'] < -0.1][:3]
+
+    # Generate uncertainty factors
+    uncertainty_factors = []
+    if total_weight == 0:
+        uncertainty_factors.append("No valid evidence provided")
+    if evidence_count < 3:
+        uncertainty_factors.append(f"Limited evidence ({evidence_count} pieces)")
+    if any(e['reliability'] < 0.5 for e in evidence_details):
+        uncertainty_factors.append("Some evidence sources have low reliability")
+    if any(e['recency_days'] > 90 for e in evidence_details):
+        uncertainty_factors.append("Some evidence is outdated (>90 days)")
+    if abs(posterior - prior_probability) < 0.1:
+        uncertainty_factors.append("Evidence had minimal impact on prior belief")
+    if stance_variance > 0.3:
+        uncertainty_factors.append("High disagreement among evidence sources")
+    if len(sources_used) < max(2, evidence_count // 2):
+        uncertainty_factors.append("Evidence lacks source diversity (potential correlation)")
+
+    # Recommended next steps
+    recommended_next_steps = []
+    if total_weight < 1.0:
+        recommended_next_steps.append("Gather more evidence to increase confidence")
+    if evidence_count < 3:
+        recommended_next_steps.append("Seek additional independent evidence")
+    if any(e['relevance'] < 0.5 for e in evidence_details):
+        recommended_next_steps.append("Seek more directly relevant evidence")
+    if posterior < confidence_desired and posterior > (1 - confidence_desired):
+        recommended_next_steps.append("Inconclusive result - consider additional verification")
+    if stance_variance > 0.3:
+        recommended_next_steps.append("Investigate sources of disagreement in evidence")
+    if len(sources_used) < max(2, evidence_count // 2):
+        recommended_next_steps.append("Seek evidence from more diverse sources")
+
+    return {
+        "claim": claim,
+        "posterior_probability": round(posterior, 3),
+        "confidence_interval": [round(ci_lower, 3), round(ci_upper, 3)],
+        "evidence_weight": {
+            "support": round(weighted_support, 3),
+            "contradiction": round(weighted_contradiction, 3),
+            "net": round(weighted_support - weighted_contradiction, 3)
+        },
+        "key_supporters": [
+            {
+                "source": e["source"],
+                "weight": round(e["weight"], 3),
+                "stance": round(e["stance"], 3)
+            }
+            for e in key_supporters
+        ],
+        "key_contradictors": [
+            {
+                "source": e["source"],
+                "weight": round(e["weight"], 3),
+                "stance": round(e["stance"], 3)
+            }
+            for e in key_contradictors
+        ],
+        "uncertainty_factors": uncertainty_factors,
+        "recommended_next_steps": recommended_next_steps,
+        "total_evidence_weight": round(total_weight, 3),
+        "evidence_count": evidence_count,
+        "source_diversity": len(sources_used),
+        "stance_variance": round(stance_variance, 3),
+        "prior_probability": prior_probability,
+        "confidence_desired": confidence_desired
+    }
+
+
 # ============================================================
 # Central Dispatcher & Tool Schema Generator
 # ============================================================
@@ -1279,6 +1519,7 @@ ADVISOR_TOOLS_DISPATCH: Dict[str, Callable[[str, Dict[str, Any], Optional[sqlite
     "get_duplicate_transactions": tool_get_duplicate_transactions,
     "render_financial_chart": tool_render_financial_chart,
     "generate_weekly_financial_briefing": tool_generate_weekly_financial_briefing,
+    "evidence_synthesizer": tool_evidence_synthesizer,
 }
 
 
@@ -1802,6 +2043,75 @@ NEW_50_TOOLS_SCHEMA = [
                     "days": {"type": "integer", "description": "Days to chart (default 30)"}
                 },
                 "required": ["chart_type"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "evidence_synthesizer",
+            "description": "Synthesizes multiple pieces of evidence using weighted averaging to assess claim validity, considering source reliability, recency, relevance, consistency, and stance. Use when evaluating complex hypotheses with conflicting or uncertain evidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "claim": {
+                        "type": "string",
+                        "description": "The claim to evaluate"
+                    },
+                    "evidence_list": {
+                        "type": "array",
+                        "description": "List of evidence objects to synthesize",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "The evidence content"
+                                },
+                                "stance": {
+                                    "type": "number",
+                                    "description": "Stance score from -1 (strong contradiction) to +1 (strong support)"
+                                },
+                                "reliability": {
+                                    "type": "number",
+                                    "description": "Source reliability score from 0 to 1"
+                                },
+                                "recency_days": {
+                                    "type": "integer",
+                                    "description": "Age of evidence in days"
+                                },
+                                "relevance": {
+                                    "type": "number",
+                                    "description": "Relevance of evidence to claim from 0 to 1"
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "description": "Confidence in evidence from 0 to 1"
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "description": "Source identifier for correlation detection"
+                                }
+                            }
+                        }
+                    },
+                    "prior_probability": {
+                        "type": "number",
+                        "description": "Prior probability of claim being true (0 to 1)",
+                        "default": 0.5
+                    },
+                    "confidence_desired": {
+                        "type": "number",
+                        "description": "Desired confidence level (0 to 1)",
+                        "default": 0.95
+                    },
+                    "evidence_half_life_days": {
+                        "type": "number",
+                        "description": "Half-life for evidence decay in days",
+                        "default": 30.0
+                    }
+                },
+                "required": ["claim", "evidence_list"]
             }
         }
     },

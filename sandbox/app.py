@@ -460,7 +460,7 @@ def _limit_resources(timeout: int):
 
     resource.setrlimit(
         resource.RLIMIT_NPROC,
-        (64, 64),
+        (512, 512),
     )
 
     memory = MEMORY_LIMIT_MB * 1024 * 1024
@@ -503,9 +503,11 @@ def _prepare_workspace(
             exist_ok=True,
         )
     else:
+        SESSION_ROOT.mkdir(parents=True, exist_ok=True)
         workdir = Path(
             tempfile.mkdtemp(
-                prefix=f"run_{run_id}_"
+                prefix=f"run_{run_id}_",
+                dir=str(SESSION_ROOT),
             )
         )
 
@@ -711,6 +713,11 @@ async def _run_process(
                 "HOME": str(execution_root),
                 "TMPDIR": str(execution_root),
                 "PYTHONUNBUFFERED": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "OMP_NUM_THREADS": "1",
+                "NUMEXPR_NUM_THREADS": "1",
+                "VECLIB_MAXIMUM_THREADS": "1",
                 "PYTHONPATH": os.pathsep.join(
                     p
                     for p in [

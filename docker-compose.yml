@@ -169,7 +169,7 @@ services:
       - financebot-internal
     mem_limit: 3072m
     cpus: 8.0
-    pids_limit: 256
+    pids_limit: 1024
     read_only: true
     tmpfs:
       - /tmp:size=256m
