@@ -46,6 +46,7 @@ def test_schema_registration_and_invariants():
     # Verify new tools appear in EXPECTED_TOOL_NAMES
     assert "find_government_forms" in EXPECTED_TOOL_NAMES
     assert "fill_pdf_form" in EXPECTED_TOOL_NAMES
+    assert "request_user_form" in EXPECTED_TOOL_NAMES
 
     # Verify SCHEMA_TOOL_NAMES matches EXPECTED_TOOL_NAMES exactly
     assert SCHEMA_TOOL_NAMES == EXPECTED_TOOL_NAMES

@@ -3091,6 +3091,23 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "request_user_form",
+            "description": "Asks the user to fill in a structured, multi-page questionnaire with their own free-text answers. Use this whenever the bot needs information that only the user can provide and that is best captured as typed answers across several pages — e.g. a financial-planning questionnaire, risk-tolerance assessment, custom recommendation form, or profile data gathering. The model emits a JSON form_schema; the bot renders it as a modal-per-page Discord UI and, once every page is answered, persists each answer to the user's Knowledge Graph as an assertion (and embeds it) using the predicate supplied for the question. Do NOT use this for filling official PDF government forms (use fill_pdf_form/find_government_forms for that, or scrape_rendered_page for a generic web form). Each question must have a unique 'key'; provide a human-readable 'label'; input_type is one of short|long|number|email|paragraph (defaults to short); set 'required' (defaults true); optional 'help_text' and 'predicate' (falls back to the key if omitted). Emit only form_schema — no text prose alongside the tool call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "form_schema": {
+                        "type": "object",
+                        "description": "The form definition: {title: str, purpose?: str, pages: [{page_title: str, questions: [{key: str, label: str, input_type?: str, required?: bool, help_text?: str, predicate?: str}]}]}. Up to 10 pages and 5 questions per page."
+                    }
+                },
+                "required": ["form_schema"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "scrape_rendered_page",
             "description": "Deeply renders and scrapes JavaScript-heavy dynamic websites, university calendars, job portals, or price charts using a headless Chromium browser instance. Bypasses client-side rendering hurdles.",
             "parameters": {
@@ -3116,6 +3133,7 @@ EXPECTED_TOOL_NAMES = {
     "scrape_rendered_page",
     "find_government_forms",
     "fill_pdf_form",
+    "request_user_form",
     "search_gmail",
     "read_gmail_message",
     "read_gmail_thread",
@@ -7673,6 +7691,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         from src.services.forms import fill_pdf_form
                         res = await fill_pdf_form(pdf_url, field_overrides=field_overrides, user_id=uid)
                         db_result = json.dumps(res, separators=(',', ':')) if isinstance(res, (dict, list)) else str(res)
+                    elif func_name == "request_user_form":
+                        form_schema = args.get("form_schema")
+                        if not form_schema or not isinstance(form_schema, dict):
+                            raise ValueError("form_schema is required for request_user_form")
+                        from src.services.form_flow import queue_form
+                        result = queue_form(uid, reply_msg.channel.id, form_schema)
+                        try:
+                            from src.bot.form_flow import render_start_button
+                            await render_start_button(
+                                reply_msg, result["session_id"], uid, result["form_title"]
+                            )
+                        except Exception as exc:  # noqa: BLE001 — UI must never kill the advisor loop
+                            print(f" [FORMS] render_start_button failed: {exc}")
+                        db_result = json.dumps(result, separators=(',', ':'))
                     elif func_name == "scrape_rendered_page":
                         target_url = str(args.get("url") or "").strip()
                         if not target_url:
