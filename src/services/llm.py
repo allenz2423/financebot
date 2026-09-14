@@ -3531,10 +3531,10 @@ MERCHANT RESEARCH & AMBIGUITY:
 - AMBIGUOUS MERCHANTS: Marketplaces (Amazon, Walmart), shipping, and payment processors (PayPal, Square, Venmo) are presumptively ambiguous. Do not categorize without context or receipts; leave as Uncategorized Purchase if unresolved.
 
 ACTIVE WORLD MODEL & AGGRESSIVE MEMORY PERSISTENCE:
-- Ground all schedules, courses, work commitments, and life constraints in the Active World Model (get_world_model_entity, search_world_model).
-- AGGRESSIVE MEMORY RETENTION: Whenever the user discloses or mentions ANY personal fact, possession, asset, subscription, preference, habit, plan, life context, or constraint—even if casually dropped in passing or embedded within a research question (e.g. "I already have X", "I work at Y", "I prefer Z", "I bought W")—you MUST call assert_world_model_claim in your very first tool batch before or alongside answering.
-- Example: assert_world_model_claim(subject_id='user:current', predicate='owns', scalar_value='Clive Christian 1872 Masculine', provenance_type='USER_STATED', source_authority=5).
-- Never ignore user self-disclosures. Persist them immediately. Retract stale facts with retract_world_model_claim.
+- AGGRESSIVE MEMORY RETENTION (ZERO EXTRA TOOL CALLS NEEDED):
+  Whenever the user discloses or mentions ANY personal fact, possession, preference, habit, plan, life context, or constraint (e.g. "I already have X", "I work at Y", "I prefer Z"), you do NOT need an extra tool call round! Simply emit an inline memory tag at the start or end of your reply:
+  <memory>[{"predicate": "owns", "value": "Clive Christian 1872 Masculine"}]</memory>
+  This tag is automatically stripped before the user sees your message and saves straight to the knowledge graph and vector DB. You can also still call assert_world_model_claim if needed. Never ignore user self-disclosures!
 
 MONITOR & AUTOMATION:
 - Background monitor rules evaluated via monitor_list_rules, monitor_add_rule, monitor_run_pass, monitor_list_alerts, monitor_ack_alert.
@@ -7953,6 +7953,31 @@ CURRENT DATABASE FINANCIAL CONTEXT
     final_content = re.sub(
         r"<thought>.*?</thought>|<think>.*?</think>", "", final_content, flags=re.DOTALL
     ).strip()
+
+    # Inline Memory Extraction (Zero Tool Calls):
+    memory_matches = re.findall(r"<memory>(.*?)</memory>", final_content, flags=re.DOTALL | re.IGNORECASE)
+    for mem_text in memory_matches:
+        mem_text = mem_text.strip()
+        try:
+            mem_data = json.loads(mem_text)
+            claims_to_add = mem_data if isinstance(mem_data, list) else [mem_data] if isinstance(mem_data, dict) else []
+            for c_obj in claims_to_add:
+                if isinstance(c_obj, dict):
+                    pred = str(c_obj.get("predicate") or "fact").strip()
+                    val = str(c_obj.get("value") or c_obj.get("scalar_value") or "").strip()
+                    if val:
+                        cid = assert_claim(
+                            subject_id=f"user:{uid}",
+                            predicate=pred,
+                            scalar_value=val,
+                            provenance_type="USER_STATED",
+                            source_authority=5
+                        )
+                        print(f" [INLINE MEMORY PERSISTED] uid={uid} claim={cid} {pred}: {val}")
+        except Exception as mem_err:
+            print(f" [INLINE MEMORY PARSE ERROR] uid={uid}: {mem_err} raw={mem_text[:100]}")
+
+    final_content = re.sub(r"<memory>.*?</memory>", "", final_content, flags=re.DOTALL | re.IGNORECASE).strip()
 
     try:
         await render_stream(final_content)
