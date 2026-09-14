@@ -1,0 +1,70 @@
+# SearXNG engine configuration — copy to settings.yml and edit.
+#
+# IMPORTANT: This SearXNG image version loads settings from /etc/searxng/settings.yml
+# and MERGES them with the image's built-in defaults at
+# /usr/local/searxng/searx/settings.yml. The defaults disable most engines
+# (disabled: true). To enable an engine you MUST explicitly set disabled: false
+# — omitting the key does NOT override the default's disabled: true.
+#
+# Engines that are also marked inactive: true in the defaults (e.g. swisscows,
+# searchzee) need inactive: false as well, or they will be filtered out at runtime.
+#
+# Engines known to be blocked from this host's IP:
+#   - google cse: IP-banned (Suspended: too many requests)
+#   - duckduckgo: CAPTCHA-blocked
+#   - qwant: API 403
+#   - yahoo: upstream broken
+#   - fireball / yep / searchzee: access denied / too many requests
+# These are kept enabled as fallbacks but will appear in unresponsive_engines.
+# Reliable engines: bing, mojeek, yandex, seznam, wikipedia.
+
+use_default_settings: true
+
+server:
+  secret_key: "CHANGE_ME_generate_with_searxng_secret_key"
+  limiter: false
+  image_proxy: true
+
+search:
+  formats:
+    - html
+    - json
+
+engines:
+  # --- Disabled (blocked or unnecessary) ---
+  - name: google
+    disabled: true
+  - name: yahoo
+    disabled: true
+  - name: qwant
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: duckduckgo
+    disabled: true
+
+  # --- Enabled, reliable ---
+  - name: bing
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: yandex
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: seznam
+    disabled: false
+
+  # --- Enabled but often unresponsive from this host ---
+  - name: fireball
+    disabled: false
+  - name: swisscows
+    disabled: false
+    inactive: false
+  - name: searchzee
+    disabled: false
+    inactive: false
+  - name: yep
+    disabled: false

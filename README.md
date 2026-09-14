@@ -1,5 +1,14 @@
 # Delilah Financial OS
 
+> **⚠️ This thing was vibecoded and hacked together.**
+>
+> I would not expect the highest code quality out of this since it was a
+> project made on a whim. If you have bugs please raise them and let me
+> know about them or if you have a fix.
+> This project is vibecoded slop. Do not complain if functionalities are
+> broken. Just fork and fix. I'm sure your agentic harness could cobble
+> up some slop fix too.
+
 A personal finance operating system for Discord. Delilah connects your live bank data, local/cloud LLMs, web search, Stirling PDF form engines, headless Chromium browsers via MCP, and an isolated code execution sandbox to provide **deterministic financial verification alongside proactive, conversational advisory**.
 
 ---

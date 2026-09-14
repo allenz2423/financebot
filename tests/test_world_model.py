@@ -74,12 +74,13 @@ def test_claim_assertion_and_bi_temporal_retraction(clean_test_entities):
     assert subgraph2["claims"][0]["claim_id"] == cid2
     assert subgraph2["claims"][0]["scalar_value"] == "Resigned"
 
-    # Verify cid1 exists in database with tx_retracted_at populated
+    # Verify cid1 was superseded (valid_to set) and is no longer current
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("SELECT tx_retracted_at FROM kg_claims WHERE claim_id = ?", (cid1,))
-        retracted_at = c.fetchone()[0]
-        assert retracted_at is not None
+        c.execute("SELECT tx_retracted_at, valid_to FROM kg_claims WHERE claim_id = ?", (cid1,))
+        retracted_at, valid_to = c.fetchone()
+        assert retracted_at is None
+        assert valid_to is not None
 
 def test_provenance_explainability(clean_test_entities):
     cid = assert_claim(
@@ -220,6 +221,235 @@ def test_parse_xml_and_dot_tool_calls():
     assert len(parsed_calls) == 1
     assert parsed_calls[0]["function"]["name"] == "get_world_model_entity"
     assert parsed_calls[0]["function"]["arguments"]["entity_id_or_name"] == "cuny_hpc"
+
+
+# ============================================================
+# Vector DB consistency (multi-value owns, Qdrant sync, reconciliation)
+# ============================================================
+
+import asyncio
+
+@pytest.fixture
+def no_vector_network(monkeypatch):
+    """Stub out Qdrant/embedding calls so background sync tasks never hit the network."""
+    import src.services.qdrant_client as qclient
+
+    async def fake_index(claim_id, subject_id, predicate, value, authority, user_id):
+        return None
+
+    async def fake_delete(claim_id, collection_name=None):
+        return True
+
+    monkeypatch.setattr(qclient, "index_single_claim", fake_index)
+    monkeypatch.setattr(qclient, "delete_claim_point", fake_delete)
+    return qclient
+
+def _active_claims_for(subject_id, predicate):
+    """Query the same path production retrieval uses: get_entity_subgraph,
+    which filters on tx_retracted_at IS NULL AND valid_from <= now
+    AND (valid_to IS NULL OR valid_to > now)."""
+    sub = get_entity_subgraph([subject_id], depth=1)
+    return {
+        c["claim_id"]: c.get("scalar_value") or c.get("object_id")
+        for c in sub["claims"]
+        if c.get("predicate") == predicate
+    }
+
+
+def test_multi_value_owns_accumulates(clean_test_entities, no_vector_network):
+    # Regression: 'owns' used to be single-slot, so asserting a second
+    # possession silently closed the first's validity window. The old test
+    # only checked tx_retracted_at IS NULL — which superseded claims still
+    # satisfy — so it passed while the bug was live. Query the production
+    # retrieval path instead.
+    cid1 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="owns",
+        scalar_value="Clive Christian 1872 Masculine",
+    )
+    cid2 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="owns",
+        scalar_value="Creed Aventus",
+    )
+    assert cid1 != cid2
+
+    active = _active_claims_for("test_person:bob", "owns")
+    assert active == {cid1: "Clive Christian 1872 Masculine", cid2: "Creed Aventus"}
+
+    # Re-asserting the same value stays idempotent — no duplicate claim.
+    cid3 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="owns",
+        scalar_value="Creed Aventus",
+    )
+    assert cid3 == cid2
+    active2 = _active_claims_for("test_person:bob", "owns")
+    assert active2 == {cid1: "Clive Christian 1872 Masculine", cid2: "Creed Aventus"}
+
+
+def test_single_slot_predicate_supersedes(clean_test_entities, no_vector_network):
+    # A "one" cardinality predicate must close the prior claim's validity
+    # window, so only the newest value is current.
+    cid1 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="security_clearance",
+        scalar_value="Level 3",
+    )
+    cid2 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="security_clearance",
+        scalar_value="Level 5",
+    )
+    assert cid1 != cid2
+
+    active = _active_claims_for("test_person:bob", "security_clearance")
+    assert active == {cid2: "Level 5"}
+
+
+def test_unknown_predicate_defaults_to_one(clean_test_entities, no_vector_network):
+    # An unmapped predicate must behave single-slot — the safer failure mode
+    # than silently accumulating contradictory claims.
+    cid1 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="totally_unknown_predicate",
+        scalar_value="value_a",
+    )
+    cid2 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="totally_unknown_predicate",
+        scalar_value="value_b",
+    )
+    assert cid1 != cid2
+
+    active = _active_claims_for("test_person:bob", "totally_unknown_predicate")
+    assert active == {cid2: "value_b"}
+
+async def test_supersession_does_not_delete_vector_points(clean_test_entities, no_vector_network, monkeypatch):
+    # Under the new semantics, asserting a second claim on the same predicate
+    # SUPERSEDES the first (valid_to set) — it does NOT retract it, so its vector
+    # point must be KEPT (it's valid history). Only explicit retraction deletes.
+    deleted = []
+
+    async def recording_delete(claim_id, collection_name=None):
+        deleted.append(claim_id)
+        return True
+
+    monkeypatch.setattr(no_vector_network, "delete_claim_point", recording_delete)
+
+    cid1 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="security_clearance",
+        scalar_value="Level 3",
+    )
+    assert_claim(
+        subject_id="test_person:bob",
+        predicate="security_clearance",
+        scalar_value="Level 5",
+    )
+    await asyncio.sleep(0)
+    assert deleted == []
+
+    from src.services.world_model import retract_world_model_claim
+    cid3 = assert_claim(
+        subject_id="test_person:bob",
+        predicate="security_clearance",
+        scalar_value="Level 7",
+    )
+    await asyncio.sleep(0)
+    deleted.clear()
+    res = retract_world_model_claim(cid3)
+    assert res["status"] == "RETRACTED"
+    await asyncio.sleep(0)
+    assert cid3 in deleted
+
+async def test_rag_context_filters_retracted_vector_hits(clean_test_entities, no_vector_network, monkeypatch):
+    from src.services.world_model import build_semantic_world_model_context
+
+    cid = assert_claim(
+        subject_id="test_person:bob",
+        predicate="favorite_fragrance",
+        scalar_value="Clive Christian 1872",
+    )
+    await asyncio.sleep(0)
+
+    async def fake_search(query, limit=5, user_id=None, collection_name=None):
+        return [{
+            "score": 0.9,
+            "id": "point_stale",
+            "payload": {
+                "domain": "world_model_claim",
+                "claim_id": cid,
+                "subject_id": "test_person:bob",
+                "predicate": "favorite_fragrance",
+                "value": "Clive Christian 1872",
+                "authority": 5,
+            },
+        }]
+
+    monkeypatch.setattr(no_vector_network, "search_vectors", fake_search)
+
+    # Claim is active: the vector hit should surface in RAG context.
+    ctx_active = await build_semantic_world_model_context("what fragrance does bob own", max_tokens=200)
+    assert "Clive Christian" in ctx_active
+
+    # After retraction, a stale Qdrant point must NOT leak into RAG context.
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE kg_claims SET tx_retracted_at = datetime('now') WHERE claim_id = ?",
+            (cid,),
+        )
+        conn.commit()
+    ctx_retracted = await build_semantic_world_model_context("what fragrance does bob own", max_tokens=200)
+    assert "Clive Christian" not in ctx_retracted
+
+async def test_reconcile_user_vectors_converges(clean_test_entities, no_vector_network, monkeypatch):
+    from src.services.qdrant_client import reconcile_user_vectors
+
+    cid_active = assert_claim(
+        subject_id="test_person:bob",
+        predicate="favorite_fragrance",
+        scalar_value="Creed Aventus",
+    )
+    cid_missing = assert_claim(
+        subject_id="test_person:bob",
+        predicate="owns",
+        scalar_value="Tom Ford Oud Wood",
+    )
+    await asyncio.sleep(0)
+
+    async def fake_scroll(user_id, collection_name=None):
+        return [
+            {"id": "stale-point-1", "claim_id": "claim_no_longer_exists", "domain": "world_model_claim"},
+            {"id": "active-point-1", "claim_id": cid_active, "domain": "world_model_claim"},
+            {"id": "snapshot-point", "claim_id": None, "domain": "financial_position"},
+        ]
+
+    deleted_ids = []
+
+    async def fake_delete_batch(point_ids, collection_name=None):
+        deleted_ids.extend(point_ids)
+        return len(point_ids)
+
+    reindexed = []
+
+    async def fake_index(claim_id, subject_id, predicate, value, authority, user_id):
+        reindexed.append(claim_id)
+
+    monkeypatch.setattr(no_vector_network, "_scroll_user_point_ids", fake_scroll)
+    monkeypatch.setattr(no_vector_network, "_delete_point_ids", fake_delete_batch)
+    monkeypatch.setattr(no_vector_network, "index_single_claim", fake_index)
+
+    result = await reconcile_user_vectors("test_person:bob")
+
+    # Stale claim point deleted; snapshot point untouched.
+    assert deleted_ids == ["stale-point-1"]
+    # The missing active claim gets re-indexed; the already-indexed one does not.
+    assert cid_missing in reindexed
+    assert cid_active not in reindexed
+    assert result["status"] == "RECONCILED"
+    assert result["stale_deleted"] == 1
+    assert result["active_claims"] >= 2
 
 
 

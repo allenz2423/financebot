@@ -260,6 +260,12 @@ async def help_command(ctx: commands.Context, *, section: str = ""):
          "`!ntfysetup` — DM yourself secret ntfy topic and instructions.\n"
          "`!gmail connect|status|disconnect` — Connect Gmail account via read-only OAuth."),
 
+        ("Memory & Knowledge Graph",
+         "`!inspectmemory` (aliases: `!memories`, `!viewmemory`) — Paginated view of active world model claims and saved notes.\n"
+         "`!vectordb` (aliases: `!vectorstatus`, `!vdb`) — Vector DB diagnostics: embedding pipeline health, collection status, SQLite vs Qdrant drift.\n"
+         "`!reindexmemory` (aliases: `!reindex`, `!resyncvectors`) — Force a vector re-sync: delete stale points, re-index missed claims, refresh snapshot.\n"
+         "`!wipememory` — Clear your conversation history (claims and financial data are kept)."),
+
         ("Database Verification & Banking Sync",
          "`!dbstatus` — Full database health snapshot.\n"
          "`!unlocked` — Every currently unlocked transaction.\n"
@@ -4573,6 +4579,13 @@ async def inspect_memory(ctx: commands.Context):
             """, (uid,))
             legacy_memories = cur.fetchall()
 
+        qdrant_count = None
+        try:
+            from src.services.qdrant_client import count_user_points
+            qdrant_count = await count_user_points(uid)
+        except Exception:
+            pass
+
         if not claims and not legacy_memories:
             embed = discord.Embed(
                 title="🧠 Memory Inspection",
@@ -4583,7 +4596,10 @@ async def inspect_memory(ctx: commands.Context):
             return
 
         body_parts = []
-        body_parts.append(f"**Verified World Model Claims:** {len(claims)} active | **Legacy Notes:** {len(legacy_memories)}\n")
+        header = f"**Verified World Model Claims:** {len(claims)} active | **Legacy Notes:** {len(legacy_memories)}"
+        if qdrant_count is not None:
+            header += f" | **Vector-indexed:** {qdrant_count}"
+        body_parts.append(header + "\n")
 
         if claims:
             body_parts.append("### 📌 Active Ground-Truth Claims\n")
@@ -4612,6 +4628,150 @@ async def inspect_memory(ctx: commands.Context):
         )
     except Exception as exc:
         await _send_error_embed(ctx, "Memory Inspection Failed", exc, user_id=user_id)
+
+@bot.command(name="vectordb", aliases=["vectorstatus", "vdb"])
+async def vectordb_command(ctx: commands.Context):
+    """Deep-dive diagnostics: Qdrant collection health, embedding pipeline, SQLite drift."""
+    user_id = str(ctx.author.id)
+    loading = await ctx.send(embed=discord.Embed(
+        title="🔍 Probing vector database…",
+        description="Checking collection, embedding pipeline, and SQLite drift.",
+        color=discord.Color.blurple(),
+    ))
+    try:
+        from src.services.qdrant_client import collection_status, embedding_status, user_vector_drift, VECTOR_SIZE
+        col = await collection_status()
+        emb = await embedding_status()
+        drift = await user_vector_drift(user_id)
+    except Exception as exc:
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        await _send_error_embed(ctx, "Vector DB Probe Failed", exc, user_id=user_id)
+        return
+
+    color = discord.Color.green()
+    warnings = []
+
+    pipeline = f"Backend `{emb['backend']}` • model `{emb['local_model']}`"
+    if emb.get("ok"):
+        pipeline += f"\nProbe OK: dim {emb['returned_size']}/{emb['expected_size']} • {emb['latency_ms']}ms"
+        if emb.get("zero_vector"):
+            pipeline += "\n⚠️ Probe returned a ZERO vector"
+            warnings.append("Embedding produced a zero vector — search quality is broken.")
+            color = discord.Color.orange()
+        if emb["returned_size"] != emb["expected_size"]:
+            pipeline += f"\n⚠️ Dimension mismatch (expected {VECTOR_SIZE})"
+            warnings.append("Embedding dimension does not match EMBEDDING_VECTOR_SIZE — upserts may fail.")
+            color = discord.Color.orange()
+    else:
+        pipeline += f"\nProbe FAILED: `{emb.get('error', 'unknown')[:300]}`"
+        warnings.append("Embedding pipeline is down — new claims are NOT being vector-indexed.")
+        color = discord.Color.red()
+
+    if col.get("exists"):
+        collection = (
+            f"`{col['points_count']}` total points • "
+            f"dim {col['vector_size']} • {col['distance']}"
+        )
+        if col.get("vector_size") not in (None, VECTOR_SIZE):
+            warnings.append(f"Collection dim {col['vector_size']} != configured {VECTOR_SIZE} — recreate the collection or fix EMBEDDING_VECTOR_SIZE.")
+            color = discord.Color.orange()
+    else:
+        collection = f"❌ Not reachable: `{col.get('error', 'unknown')[:300]}`"
+        warnings.append("Qdrant collection missing/unreachable — indexing will fail until restored.")
+        color = discord.Color.red()
+
+    drift_val = (
+        f"Active claims (SQLite): **{drift['active_claims']}** | Indexed: **{drift['indexed_claims']}**"
+        f" | Other points (snapshots etc.): **{drift['other_points']}**"
+    )
+    if drift["missing"]:
+        sample = ", ".join(f"`{m}`" for m in drift["missing"][:4])
+        drift_val += f"\n🟠 Missing ({len(drift['missing'])}): {sample}{' …' if len(drift['missing']) > 4 else ''}"
+    if drift["stale"]:
+        sample = ", ".join(f"`{s}`" for s in drift["stale"][:4])
+        drift_val += f"\n🟠 Stale ({len(drift['stale'])}): {sample}{' …' if len(drift['stale']) > 4 else ''}"
+    if drift["missing"] or drift["stale"]:
+        drift_val += "\nRun `!reindexmemory` to converge."
+    else:
+        drift_val += "\n✅ In sync"
+
+    embed = discord.Embed(
+        title="🧭 Vector DB Status",
+        color=color,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Embedding Pipeline", value=pipeline, inline=False)
+    embed.add_field(name="Collection", value=collection, inline=False)
+    embed.add_field(name="Your Index Drift", value=drift_val, inline=False)
+    if warnings:
+        embed.add_field(name="⚠️ Warnings", value="\n".join(f"• {w}" for w in warnings), inline=False)
+    embed.set_footer(text=f"User {user_id}")
+
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+    await ctx.send(embed=embed)
+
+@bot.command(name="reindexmemory", aliases=["reindex", "resyncvectors"])
+async def reindexmemory_command(ctx: commands.Context):
+    """Force a vector-store reconciliation: delete stale points, re-index missed claims, refresh snapshot."""
+    user_id = str(ctx.author.id)
+    loading = await ctx.send(embed=discord.Embed(
+        title="♻️ Re-indexing vector store…",
+        description="Converging Qdrant against SQLite ground truth. This embeds any missed claims — hang tight.",
+        color=discord.Color.blurple(),
+    ))
+    try:
+        from src.services.qdrant_client import reconcile_user_vectors, index_user_financial_profile, user_vector_drift
+        rec = await reconcile_user_vectors(user_id)
+        snap = await index_user_financial_profile(user_id)
+        drift = await user_vector_drift(user_id)
+    except Exception as exc:
+        try:
+            await loading.delete()
+        except Exception:
+            pass
+        await _send_error_embed(ctx, "Vector Re-index Failed", exc, user_id=user_id)
+        return
+
+    in_sync = not drift["missing"] and not drift["stale"]
+    embed = discord.Embed(
+        title="♻️ Vector Re-index Complete",
+        color=discord.Color.green() if in_sync else discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(
+        name="Reconcile",
+        value=(
+            f"Stale points deleted: **{rec['stale_deleted']}**\n"
+            f"Claims re-indexed: **{rec['reindexed']}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Snapshot Refresh",
+        value=f"Points upserted: **{snap.get('points_indexed', '?')}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="Post-Run Drift",
+        value=(
+            f"Active: **{drift['active_claims']}** | Indexed: **{drift['indexed_claims']}**\n"
+            + ("✅ In sync" if in_sync else f"Missing: {len(drift['missing'])} • Stale: {len(drift['stale'])}")
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"User {user_id}")
+
+    try:
+        await loading.delete()
+    except Exception:
+        pass
+    await ctx.send(embed=embed)
 
 @bot.command(name="wipememory")
 async def wipe_memory(ctx: commands.Context):
@@ -4742,6 +4902,17 @@ async def on_ready():
         print(" [MONITOR] Persistent financial monitor started.")
     except Exception as exc:
         print(f" [MONITOR] Monitor watchdog failed to start: {type(exc).__name__}: {exc}")
+
+    # Converge Qdrant with SQLite ground truth: delete stale claim points,
+    # re-index claims missed while embed/Qdrant was down.
+    try:
+        from src.services.qdrant_client import vector_reconcile_loop
+        t_reconcile = bot.loop.create_task(vector_reconcile_loop())
+        _PERSISTENT_TASKS.add(t_reconcile)
+        t_reconcile.add_done_callback(_PERSISTENT_TASKS.discard)
+        print(" [VECTOR] Qdrant reconciliation loop started.")
+    except Exception as exc:
+        print(f" [VECTOR] Reconcile loop failed to start: {type(exc).__name__}: {exc}")
 
     if os.getenv("ENABLE_PLAID_AUTOSYNC", "true").lower() not in ("0", "false", "no"):
         import plaid_sync

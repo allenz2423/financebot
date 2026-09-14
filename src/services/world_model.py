@@ -146,6 +146,74 @@ def re_words(text: str) -> List[str]:
 # 2. BI-TEMPORAL CLAIM ASSERTION & RETRACTION
 # ============================================================
 
+# Predicate cardinality governs how a second assertion on the same
+# (subject, predicate) interacts with the first:
+#
+#   "one"  — single-slot. A new assertion SUPERSEDES the previous one by
+#            closing its validity window (valid_to = now). The old claim
+#            stays in the DB as history; only the newest is current.
+#   "many" — multi-value. A new assertion with a DIFFERENT value coexists
+#            with the previous one; both stay current. Re-asserting the
+#            SAME value is idempotent (handled by the duplicate check below).
+#
+# Unknown predicates default to "one": letting an unmapped predicate
+# accumulate contradictory claims is more dangerous than superseding one.
+PREDICATE_CARDINALITY: Dict[str, str] = {
+    # Multi-value: a subject can hold several at once.
+    "owns": "many",
+    "allergic_to": "many",
+    "favorite_fragrance": "many",
+    "medical_conditions": "many",
+    "fact": "many",
+    # Single-slot: every predicate not listed here is "one".
+    "amex_autopay_confirmed_funded": "one",
+    "amex_autopay_next_payment": "one",
+    "cap_exhaustion_date": "one",
+    "career_goal": "one",
+    "cuny_refund_landed": "one",
+    "daily_commute_cost": "one",
+    "daily_food_cost": "one",
+    "date_integrity": "one",
+    "employed_by": "one",
+    "enrolled_at": "one",
+    "evaluating_contract": "one",
+    "fall_2026_academic_calendar": "one",
+    "fall_2026_class_schedule": "one",
+    "fragrance_freeze_active": "one",
+    "fragrance_freeze_end_date": "one",
+    "gpa": "one",
+    "has_side_income": "one",
+    "hourly_wage": "one",
+    "interest_apr": "one",
+    "job_search_status": "one",
+    "major": "one",
+    "max_weekly_hours": "one",
+    "medication_farxiga_non_insurance_cost": "one",
+    "medication_tarpeyo_non_insurance_cost": "one",
+    "medication_voyxact_non_insurance_cost": "one",
+    "monitored_event": "one",
+    "owes_debt_to": "one",
+    "primary_financial_goal": "one",
+    "promo_apr": "one",
+    "promo_expiry": "one",
+    "purchase_timing": "one",
+    "quicksilver_statement_cycle": "one",
+    "rent_obligation": "one",
+    "sales_tax_rate_nyc": "one",
+    "savor_next_payment_due": "one",
+    "secondary_financial_goal": "one",
+    "semester_cap": "one",
+    "sign_convention": "one",
+    "subscription_active": "one",
+    "target_graduation": "one",
+}
+
+
+def get_predicate_cardinality(predicate: str) -> str:
+    """Return 'one' or 'many' for a predicate; unknown predicates default to 'one'."""
+    return PREDICATE_CARDINALITY.get(predicate, "one")
+
+
 def assert_claim(
     subject_id: str,
     predicate: str,
@@ -161,10 +229,14 @@ def assert_claim(
 ) -> str:
     """
     Assert an epistemic claim into the Active World Model.
-    If an existing active claim on the same (subject, predicate) exists:
-    - Retracts the previous claim by setting tx_retracted_at = now.
-    - Inserts the new claim with updated values and provenance.
-    Preserves full bi-temporal auditability.
+
+    Behavior on a conflicting prior claim depends on predicate cardinality
+    (see PREDICATE_CARDINALITY / get_predicate_cardinality):
+      - "one":  the previous claim is SUPERSEDED — its valid_to is closed.
+      - "many": a different value COEXISTS with the previous claim; the
+                same value is a no-op (idempotent).
+    Either way history is preserved; tx_retracted_at stays reserved for
+    explicit retraction via retract_world_model_claim().
     """
     cid = claim_id or f"claim_{uuid.uuid4().hex[:12]}"
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -175,22 +247,40 @@ def assert_claim(
 
     with _get_connection() as conn:
         c = conn.cursor()
-        
-        # Retract previous active claim on same subject and predicate.
-        # Multi-value predicates (like 'allergic_to') allow multiple distinct claims unless the scalar_value matches.
-        multi_value_predicates = {"allergic_to", "allergy", "medical_conditions", "medication", "goal", "liability"}
-        if predicate in multi_value_predicates:
+
+        # Idempotency: re-asserting the same (subject, predicate, value) that is
+        # already current is a no-op — don't create a duplicate claim.
+        effective_value = scalar_str or (str(object_id) if object_id else None)
+        if effective_value is not None:
+            c.execute("""
+                SELECT claim_id FROM kg_claims
+                WHERE subject_id = ? AND predicate = ? 
+                  AND COALESCE(scalar_value, object_id) = COALESCE(?, ?)
+                  AND tx_retracted_at IS NULL AND valid_from <= ?
+                  AND (valid_to IS NULL OR valid_to > ?)
+            """, (subject_id, predicate, effective_value, effective_value, now_utc, now_utc))
+            existing = c.fetchone()
+            if existing:
+                return existing[0]
+
+        # Handle a conflicting prior claim on the same (subject, predicate).
+        # The idempotency check above already returned if the same value is
+        # being re-asserted, so at this point the new value differs.
+        #
+        #   "one"  — SUPERSEDE: close the validity window of every prior
+        #            claim on this (subject, predicate). History is preserved
+        #            (valid_to is set, tx_retracted_at stays NULL); only the
+        #            newest claim is current.
+        #   "many" — COEXIST: do nothing. Different values accumulate; both
+        #            stay current. This is what makes 'owns' reusable across
+        #            multiple possessions without eating the earlier ones.
+        if get_predicate_cardinality(predicate) == "one":
             c.execute("""
                 UPDATE kg_claims
-                SET tx_retracted_at = ?
-                WHERE subject_id = ? AND predicate = ? AND scalar_value = ? AND tx_retracted_at IS NULL
-            """, (now_utc, subject_id, predicate, scalar_str))
-        else:
-            c.execute("""
-                UPDATE kg_claims
-                SET tx_retracted_at = ?
+                SET valid_to = ?
                 WHERE subject_id = ? AND predicate = ? AND tx_retracted_at IS NULL
-            """, (now_utc, subject_id, predicate))
+                  AND (valid_to IS NULL OR valid_to > ?)
+            """, (now_utc, subject_id, predicate, now_utc))
 
         # Insert new claim
         c.execute("""
@@ -214,15 +304,18 @@ def assert_claim(
         """, (cid, f"{subject_id} -> {predicate}", claim_content, f"claim {predicate}"))
         conn.commit()
 
-    # Incremental vector index sync for real-time semantic search
+    # Incremental vector index sync for real-time semantic search.
+    # NOTE: superseded claims are NOT deleted from Qdrant — they remain valid
+    # history, just not current. Only explicit retraction (retract_world_model_claim)
+    # removes a vector point. Stale points are filtered at retrieval time instead.
     try:
         import asyncio
         from src.services.qdrant_client import index_single_claim
         loop = asyncio.get_running_loop()
         u_id = subject_id.replace("user:", "") if subject_id.startswith("user:") else ""
         loop.create_task(index_single_claim(cid, subject_id, predicate, str(object_id or scalar_value or ""), source_authority, u_id))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f" [VECTOR SYNC FAILED] claim={cid}: {type(e).__name__}: {e}")
 
     return cid
 
@@ -413,9 +506,26 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     # 2. Semantic vector search via Qdrant for relevant claims/dossiers
     vector_claims = []
     vector_dossiers = []
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     try:
         from src.services.qdrant_client import search_vectors
         hits = await search_vectors(query, limit=6, user_id=target_user_id)
+
+        # Vector points can lag SQLite (supersessions, missed indexing) — only
+        # trust hits whose claim is still CURRENT in the knowledge graph.
+        active_claim_ids = set()
+        hit_claim_ids = [h.get("payload", {}).get("claim_id") for h in hits if h.get("payload", {}).get("domain") == "world_model_claim" and h.get("payload", {}).get("claim_id")]
+        if hit_claim_ids:
+            with _get_connection() as conn:
+                placeholders = ",".join("?" for _ in hit_claim_ids)
+                rows = conn.execute(
+                    f"SELECT claim_id FROM kg_claims WHERE claim_id IN ({placeholders}) "
+                    "AND tx_retracted_at IS NULL AND valid_from <= ? "
+                    "AND (valid_to IS NULL OR valid_to > ?)",
+                    hit_claim_ids + [now_utc, now_utc],
+                ).fetchall()
+                active_claim_ids = {r[0] for r in rows}
+
         for h in hits:
             score = h.get("score", 0.0)
             payload = h.get("payload", {})
@@ -423,6 +533,8 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
             # Filter for semantic relevance (score >= 0.44)
             if score >= 0.44:
                 if domain == "world_model_claim":
+                    if payload.get("claim_id") and payload["claim_id"] not in active_claim_ids:
+                        continue
                     vector_claims.append({
                         "subject_id": payload.get("subject_id", user_anchor),
                         "predicate": payload.get("predicate", "fact"),
@@ -695,6 +807,15 @@ def retract_world_model_claim(claim_id: str, user_id: Optional[str] = None) -> D
         c.execute("UPDATE kg_claims SET tx_retracted_at = ? WHERE claim_id = ?", (now_utc, claim_id))
         c.execute("DELETE FROM kg_search_fts WHERE target_id = ?", (claim_id,))
         conn.commit()
+
+    # Keep the vector index consistent: a retracted claim must not stay searchable.
+    try:
+        import asyncio
+        from src.services.qdrant_client import delete_claim_point
+        loop = asyncio.get_running_loop()
+        loop.create_task(delete_claim_point(claim_id))
+    except Exception as e:
+        print(f" [VECTOR DELETE FAILED] claim={claim_id}: {type(e).__name__}: {e}")
 
     return {
         "status": "RETRACTED",

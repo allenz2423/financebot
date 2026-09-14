@@ -7,9 +7,13 @@ and user goals.
 
 import os
 import json
+import time
 import logging
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 import httpx
+
+logger = logging.getLogger(__name__)
 
 def _get_embedding_backend() -> str:
     from dotenv import load_dotenv
@@ -364,4 +368,267 @@ async def index_single_claim(claim_id: str, subject_id: str, predicate: str, val
         }])
     except Exception as e:
         logger.warning(f"Failed to index single claim into Qdrant: {e}")
+
+
+def _claim_point_id(claim_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claim_{claim_id}"))
+
+
+async def delete_claim_point(claim_id: str, collection_name: str = COLLECTION_NAME) -> bool:
+    """Remove a retracted claim's vector point so it stays consistent with SQLite."""
+    point_id = _claim_point_id(claim_id)
+    base_url = _get_qdrant_url()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.delete(
+            f"{base_url}/collections/{collection_name}/points/{point_id}?wait=true"
+        )
+        if resp.status_code not in (200, 404):
+            raise RuntimeError(f"Qdrant point delete failed ({resp.status_code}): {resp.text}")
+        return resp.status_code == 200
+
+
+async def _scroll_user_point_ids(user_id: str, collection_name: str = COLLECTION_NAME) -> List[Dict[str, Any]]:
+    """Scroll all points for a user, returning [{id, claim_id, domain}]."""
+    base_url = _get_qdrant_url()
+    points: List[Dict[str, Any]] = []
+    offset: Optional[str] = None
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            payload: Dict[str, Any] = {
+                "limit": 256,
+                "with_payload": True,
+                "with_vector": False,
+                "filter": {"must": [{"key": "user_id", "match": {"value": str(user_id)}}]},
+            }
+            if offset:
+                payload["offset"] = offset
+            resp = await client.post(f"{base_url}/collections/{collection_name}/points/scroll", json=payload)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Qdrant scroll failed ({resp.status_code}): {resp.text}")
+            data = resp.json().get("result", {})
+            for p in data.get("points", []):
+                pl = p.get("payload") or {}
+                points.append({
+                    "id": p.get("id"),
+                    "claim_id": pl.get("claim_id"),
+                    "domain": pl.get("domain"),
+                })
+            offset = data.get("next_page_offset")
+            if offset is None:
+                break
+    return points
+
+
+async def count_user_points(user_id: str, collection_name: str = COLLECTION_NAME) -> int:
+    """Count Qdrant points indexed for a user (for drift diagnostics)."""
+    base_url = _get_qdrant_url()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{base_url}/collections/{collection_name}/points/count",
+            json={
+                "exact": True,
+                "filter": {"must": [{"key": "user_id", "match": {"value": str(user_id)}}]},
+            },
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Qdrant count failed ({resp.status_code}): {resp.text}")
+        return int(resp.json().get("result", {}).get("count", 0))
+
+
+async def collection_status(collection_name: str = COLLECTION_NAME) -> Dict[str, Any]:
+    """Collection health snapshot: exists, point count, vector size, distance."""
+    base_url = _get_qdrant_url()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{base_url}/collections/{collection_name}")
+        if resp.status_code != 200:
+            return {"exists": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        data = resp.json().get("result", {})
+        vectors = (data.get("config", {}).get("params", {}) or {}).get("vectors", {}) or {}
+        return {
+            "exists": True,
+            "points_count": data.get("points_count"),
+            "vector_size": vectors.get("size"),
+            "distance": vectors.get("distance"),
+        }
+
+
+async def embedding_status(probe_text: str = "delilah vector probe") -> Dict[str, Any]:
+    """Probe the embedding pipeline end to end: backend, model, latency, dimension sanity."""
+    backend = _get_embedding_backend()
+    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", "nomic-embed-text-cpu").strip()
+    started = time.monotonic()
+    try:
+        vec = await get_embedding(probe_text)
+        latency_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "ok": True,
+            "backend": backend,
+            "local_model": local_model,
+            "expected_size": VECTOR_SIZE,
+            "returned_size": len(vec),
+            "zero_vector": all(v == 0.0 for v in vec),
+            "latency_ms": latency_ms,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "backend": backend,
+            "local_model": local_model,
+            "expected_size": VECTOR_SIZE,
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+async def user_vector_drift(user_id: str, collection_name: str = COLLECTION_NAME) -> Dict[str, Any]:
+    """
+    Compare SQLite active claims against Qdrant indexed points for one user.
+    missing = active in SQLite but not vector-indexed; stale = indexed but retracted.
+    """
+    import sqlite3
+    from src.core.state import DB_PATH
+
+    uid = str(user_id).strip()
+    indexed_points = await _scroll_user_point_ids(uid, collection_name)
+    indexed_map = {
+        p["claim_id"]: p["id"]
+        for p in indexed_points
+        if p.get("domain") == "world_model_claim" and p.get("claim_id")
+    }
+
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    c = conn.cursor()
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "SELECT claim_id FROM kg_claims "
+        "WHERE tx_retracted_at IS NULL AND valid_from <= ? "
+        "AND (valid_to IS NULL OR valid_to > ?) "
+        "AND (subject_id = ? OR subject_id LIKE ?)",
+        (now_utc, now_utc, f"user:{uid}", f"%{uid}%"),
+    )
+    active_rows = c.fetchall()
+    conn.close()
+
+    active_ids = {row[0] for row in active_rows}
+    return {
+        "user_id": uid,
+        "active_claims": len(active_ids),
+        "indexed_claims": len(indexed_map),
+        "other_points": sum(1 for p in indexed_points if p.get("domain") != "world_model_claim"),
+        "missing": sorted(active_ids - set(indexed_map)),
+        "stale": sorted(set(indexed_map) - active_ids),
+    }
+
+
+async def _delete_point_ids(point_ids: List[str], collection_name: str = COLLECTION_NAME) -> int:
+    """Batch-delete point ids; returns how many were requested."""
+    if not point_ids:
+        return 0
+    base_url = _get_qdrant_url()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{base_url}/collections/{collection_name}/points/delete?wait=true",
+            json={"points": point_ids},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Qdrant batch delete failed ({resp.status_code}): {resp.text}")
+    return len(point_ids)
+
+
+async def reconcile_user_vectors(user_id: str, collection_name: str = COLLECTION_NAME) -> Dict[str, Any]:
+    """
+    Converge Qdrant with SQLite ground truth for one user:
+    - Delete vector points for claims that are no longer active.
+    - Re-index active claims that are missing from the vector store.
+    The financial snapshot point is left alone; index_user_financial_profile
+    refreshes it deterministically on demand.
+    """
+    import sqlite3
+    from src.core.state import DB_PATH
+
+    uid = str(user_id).strip()
+    indexed_points = await _scroll_user_point_ids(uid, collection_name)
+    indexed_claims = {p["claim_id"] for p in indexed_points if p.get("domain") == "world_model_claim" and p.get("claim_id")}
+
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    c = conn.cursor()
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority "
+        "FROM kg_claims WHERE tx_retracted_at IS NULL AND valid_from <= ? "
+        "AND (valid_to IS NULL OR valid_to > ?) "
+        "AND (subject_id = ? OR subject_id LIKE ?)",
+        (now_utc, now_utc, f"user:{uid}", f"%{uid}%")
+    )
+    active_rows = c.fetchall()
+    conn.close()
+
+    active_ids = {row[0] for row in active_rows}
+    stale_ids = [p["id"] for p in indexed_points if p.get("domain") == "world_model_claim" and p.get("claim_id") not in active_ids]
+
+    deleted = 0
+    if stale_ids:
+        deleted = await _delete_point_ids(stale_ids, collection_name)
+
+    reindexed = 0
+    for claim_id, subj, pred, obj_id, s_val, auth in active_rows:
+        if claim_id in indexed_claims:
+            continue
+        await index_single_claim(claim_id, subj, pred, str(obj_id or s_val or ""), auth, uid)
+        reindexed += 1
+
+    return {
+        "status": "RECONCILED",
+        "user_id": uid,
+        "active_claims": len(active_ids),
+        "indexed_before": len(indexed_claims),
+        "stale_deleted": deleted,
+        "reindexed": reindexed,
+    }
+
+
+async def vector_reconcile_loop(interval_seconds: Optional[int] = None):
+    """
+    Periodic reconciliation across every user with active claims.
+    Runs once immediately, then on VECTOR_RECONCILE_INTERVAL_SECONDS (default 6h).
+    """
+    import asyncio
+    import sqlite3
+    from src.core.state import DB_PATH
+
+    if interval_seconds is None:
+        try:
+            interval_seconds = int(os.getenv("VECTOR_RECONCILE_INTERVAL_SECONDS", "21600"))
+        except ValueError:
+            interval_seconds = 21600
+
+    # Give Ollama/Qdrant time to finish booting before the first pass.
+    await asyncio.sleep(45)
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            conn = sqlite3.connect(DB_PATH, timeout=10.0)
+            c = conn.cursor()
+            c.execute(
+                "SELECT DISTINCT subject_id FROM kg_claims "
+                "WHERE tx_retracted_at IS NULL AND valid_from <= ? "
+                "AND (valid_to IS NULL OR valid_to > ?) "
+                "AND subject_id LIKE 'user:%'",
+                (now_utc, now_utc),
+            )
+            users = [row[0].replace("user:", "", 1) for row in c.fetchall()]
+            conn.close()
+            for uid in users:
+                try:
+                    result = await reconcile_user_vectors(uid)
+                    if result.get("stale_deleted") or result.get("reindexed"):
+                        print(
+                            f" [VECTOR RECONCILE] uid={uid} deleted={result['stale_deleted']} "
+                            f"reindexed={result['reindexed']} active={result['active_claims']}"
+                        )
+                except Exception as e:
+                    print(f" [VECTOR RECONCILE FAILED] uid={uid}: {type(e).__name__}: {e}")
+        except Exception as e:
+            print(f" [VECTOR RECONCILE FAILED] user discovery error: {type(e).__name__}: {e}")
+        await asyncio.sleep(interval_seconds)
 

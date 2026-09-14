@@ -337,3 +337,76 @@ def test_zero_interest_and_debt_rollover_logic(test_db):
 
     r3 = ADVISOR_TOOLS_DISPATCH["calculate_mortgage_refinance_breakeven"](user_id, {"current_balance": 100000.0, "current_rate_pct": 0.0, "new_rate_pct": 0.0, "remaining_years": 15}, test_db)
     assert r3["monthly_savings"] == 0.0
+
+
+# ============================================================
+# Tool alias resolution — LLMs hallucinate tool names; the resolver
+# maps them to canonical names before the unknown-tool ValueError fires.
+# ============================================================
+
+def test_tool_alias_resolution_passes_through_known_names():
+    from src.services.llm import _resolve_tool_alias, KNOWN_TOOLS
+
+    # Every canonical tool name resolves to itself.
+    for name in KNOWN_TOOLS:
+        assert _resolve_tool_alias(name) == name, f"canonical name {name!r} should pass through"
+
+
+def test_tool_alias_resolution_subscriptions():
+    """The three subscription aliases the LLM was hallucinating in production."""
+    from src.services.llm import _resolve_tool_alias
+
+    # These are real schema tools now, so they pass through unchanged.
+    assert _resolve_tool_alias("cancel_subscription") == "cancel_subscription"
+    assert _resolve_tool_alias("delete_subscription") == "delete_subscription"
+    assert _resolve_tool_alias("remove_subscription") == "remove_subscription"
+    # And the canonical tool they alias is also real.
+    assert _resolve_tool_alias("manage_subscription") == "manage_subscription"
+
+
+def test_tool_alias_resolution_other_mutations():
+    """Aliases for other mutation tools the LLM might guess as verb+noun."""
+    from src.services.llm import _resolve_tool_alias
+
+    assert _resolve_tool_alias("delete_recurring_bill") == "remove_recurring_bill"
+    assert _resolve_tool_alias("cancel_recurring_bill") == "remove_recurring_bill"
+    assert _resolve_tool_alias("delete_bill") == "remove_recurring_bill"
+    assert _resolve_tool_alias("cancel_transaction") == "delete_transaction"
+    assert _resolve_tool_alias("unlock_transaction") == "lock_transaction"
+    assert _resolve_tool_alias("delete_expected_income") == "cancel_expected_income"
+    # These are real schema tools (delete_* variants of set_*), so they pass through.
+    assert _resolve_tool_alias("delete_savings_goal") == "delete_savings_goal"
+    assert _resolve_tool_alias("delete_savings_bucket") == "delete_savings_bucket"
+    assert _resolve_tool_alias("delete_category_budget") == "delete_category_budget"
+    assert _resolve_tool_alias("delete_portfolio_holding") == "set_portfolio_holding"
+    assert _resolve_tool_alias("delete_merchant_alias") == "add_merchant_alias"
+    assert _resolve_tool_alias("delete_merchant_alias_mapping") == "add_merchant_alias_mapping"
+    assert _resolve_tool_alias("delete_user_timezone") == "set_user_timezone"
+
+
+def test_tool_alias_resolution_unknown_passes_through():
+    """Genuinely unknown names must pass through unchanged so the
+    unknown-tool ValueError still fires — aliases are not a safety net
+    for arbitrary tool discovery."""
+    from src.services.llm import _resolve_tool_alias
+
+    assert _resolve_tool_alias("totally_fake_tool_xyz") == "totally_fake_tool_xyz"
+    assert _resolve_tool_alias("cancel_entire_portfolio") == "cancel_entire_portfolio"
+
+
+def test_tool_alias_map_does_not_shadow_real_tools():
+    """No alias entry may point at a name that isn't a real tool —
+    that would silently turn a hallucination into a broken dispatch."""
+    from src.services.llm import TOOL_ALIASES, KNOWN_TOOLS
+
+    for alias, canonical in TOOL_ALIASES.items():
+        assert canonical in KNOWN_TOOLS, f"alias {alias!r} -> {canonical!r} which is not a real tool"
+        assert alias not in KNOWN_TOOLS, f"alias {alias!r} is itself a real tool; remove from TOOL_ALIASES"
+
+
+def test_schema_drift_still_zero():
+    """Adding alias tools to the schema must not create drift against
+    EXPECTED_TOOL_NAMES."""
+    from src.services.llm import SCHEMA_TOOL_NAMES, EXPECTED_TOOL_NAMES
+
+    assert SCHEMA_TOOL_NAMES == EXPECTED_TOOL_NAMES

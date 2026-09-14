@@ -2936,7 +2936,9 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "manage_subscription",
-            "description": "Adds, updates, or cancels a recurring subscription or bill.",
+            "description": "Adds, updates, or cancels a recurring subscription or bill. "
+                           "Examples: {\"action\":\"set\",\"merchant\":\"Netflix\",\"amount\":15.99,\"cadence\":\"monthly\"} "
+                           "to add or update a sub; {\"action\":\"cancel\",\"merchant\":\"Netflix\"} to cancel one.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2968,6 +2970,63 @@ BOT_TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["action", "merchant"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_subscription",
+            "description": "Cancels a recurring subscription or bill by merchant name. "
+                           "Equivalent to manage_subscription with action='cancel'. "
+                           "Example: {\"merchant\":\"Netflix\"}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "merchant": {
+                        "type": "string",
+                        "description": "Name of the subscription service or merchant to cancel."
+                    }
+                },
+                "required": ["merchant"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_subscription",
+            "description": "Cancels a recurring subscription or bill by merchant name. "
+                           "Equivalent to manage_subscription with action='cancel'. "
+                           "Example: {\"merchant\":\"Netflix\"}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "merchant": {
+                        "type": "string",
+                        "description": "Name of the subscription service or merchant to delete."
+                    }
+                },
+                "required": ["merchant"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_subscription",
+            "description": "Cancels a recurring subscription or bill by merchant name. "
+                           "Equivalent to manage_subscription with action='cancel'. "
+                           "Example: {\"merchant\":\"Netflix\"}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "merchant": {
+                        "type": "string",
+                        "description": "Name of the subscription service or merchant to remove."
+                    }
+                },
+                "required": ["merchant"]
             }
         }
     },
@@ -3161,6 +3220,9 @@ EXPECTED_TOOL_NAMES = {
     "add_merchant_alias",
     "get_upcoming_bills_calendar",
     "manage_subscription",
+    "cancel_subscription",
+    "delete_subscription",
+    "remove_subscription",
     "scan_and_auto_tag_deductions",
     "explore_domain",
 
@@ -3190,6 +3252,51 @@ if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
         f"Tool schema drift detected. Missing={EXPECTED_TOOL_NAMES - SCHEMA_TOOL_NAMES}, "
         f"extra={SCHEMA_TOOL_NAMES - EXPECTED_TOOL_NAMES}"
     )
+
+# Canonical set of tool names exposed by the schema. Used both for validation
+# and as the lookup base for hallucinated-name alias resolution below.
+KNOWN_TOOLS = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
+
+# Aliases for tool names LLMs commonly hallucinate. When a model calls a name
+# not in KNOWN_TOOLS, we resolve against this map before rejecting it —
+# otherwise the model burns a tool call (and a round-trip) on a guess.
+TOOL_ALIASES = {
+    # Subscription mutations — the canonical tool is manage_subscription,
+    # which takes an "action" argument. Models naturally guess verb+noun.
+    # (cancel_subscription / delete_subscription / remove_subscription are
+    # also exposed as real schema tools, so they need no alias entry.)
+    "delete_recurring_bill": "remove_recurring_bill",
+    "cancel_recurring_bill": "remove_recurring_bill",
+    "delete_bill": "remove_recurring_bill",
+    "cancel_bill": "remove_recurring_bill",
+    "remove_bill": "remove_recurring_bill",
+    "delete_planned_transaction": "cancel_planned_transaction",
+    "cancel_transaction": "delete_transaction",
+    "unlock_transaction": "lock_transaction",
+    "uncorrect_transaction": "clear_transaction_correction",
+    "delete_expected_income": "cancel_expected_income",
+    "remove_expected_income": "cancel_expected_income",
+    "cancel_savings_goal": "set_savings_goal",
+    "cancel_savings_bucket": "adjust_savings_bucket",
+    "cancel_category_budget": "set_category_budget",
+    "delete_portfolio_holding": "set_portfolio_holding",
+    "remove_portfolio_holding": "set_portfolio_holding",
+    "delete_merchant_alias": "add_merchant_alias",
+    "remove_merchant_alias": "add_merchant_alias",
+    "delete_merchant_alias_mapping": "add_merchant_alias_mapping",
+    "remove_merchant_alias_mapping": "add_merchant_alias_mapping",
+    "remove_scheduled_reminder": "delete_scheduled_reminder",
+    "cancel_scheduled_reminder": "delete_scheduled_reminder",
+    "delete_user_timezone": "set_user_timezone",
+}
+
+
+def _resolve_tool_alias(func_name: str) -> str:
+    """Return the canonical tool name, or the input unchanged if no alias matches."""
+    if func_name in KNOWN_TOOLS:
+        return func_name
+    return TOOL_ALIASES.get(func_name, func_name)
+
 
 # Set of all mutation tools that should always commit to the database
 MUTATION_TOOLS = {
@@ -3470,7 +3577,6 @@ async def _chat_with_delilah_impl(
         f"prompt={prompt_for_domain!r}"
     )
 
-    KNOWN_TOOLS = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
     if uid not in SESSION_HISTORY:
         SESSION_HISTORY[uid] = []
     recent_text = prompt_text or ""
@@ -5826,7 +5932,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     func_name = func_name.strip()
 
                     if func_name not in KNOWN_TOOLS:
-                        raise ValueError(f"unknown tool '{func_name}'")
+                        resolved = _resolve_tool_alias(func_name)
+                        if resolved != func_name:
+                            logger.info(
+                                "tool alias resolved: '%s' -> '%s' (uid=%s)",
+                                func_name, resolved, uid,
+                            )
+                            func_name = resolved
+                        else:
+                            raise ValueError(f"unknown tool '{func_name}'")
 
                     # Dynamic audit activation: a worklist/getter tool can activate
                     # the audit controller even when the original user prompt was
@@ -6643,20 +6757,24 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             user_id=uid,
                             days_ahead=args.get("days_ahead", 30),
                         )
-                    elif func_name == "manage_subscription":
+                    elif func_name in ("manage_subscription", "cancel_subscription", "delete_subscription", "remove_subscription"):
                         from src.services.subscriptions import set_subscription, cancel_subscription
-                        action = str(args.get("action", "set")).lower()
-                        if action == "cancel":
+                        if func_name in ("cancel_subscription", "delete_subscription", "remove_subscription"):
+                            # Aliases: both cancel the subscription by merchant name.
                             db_result = cancel_subscription(user_id=uid, merchant=args.get("merchant", ""))
                         else:
-                            db_result = set_subscription(
-                                user_id=uid,
-                                merchant=args.get("merchant", ""),
-                                amount=args.get("amount", 0.0),
-                                cadence=args.get("cadence", "monthly"),
-                                next_due_date=args.get("next_due_date"),
-                                category=args.get("category", "Subscriptions"),
-                            )
+                            action = str(args.get("action", "set")).lower()
+                            if action == "cancel":
+                                db_result = cancel_subscription(user_id=uid, merchant=args.get("merchant", ""))
+                            else:
+                                db_result = set_subscription(
+                                    user_id=uid,
+                                    merchant=args.get("merchant", ""),
+                                    amount=args.get("amount", 0.0),
+                                    cadence=args.get("cadence", "monthly"),
+                                    next_due_date=args.get("next_due_date"),
+                                    category=args.get("category", "Subscriptions"),
+                                )
                     elif func_name == "scan_and_auto_tag_deductions":
                         from src.services.tax_deductions import scan_and_discover_deductions
                         db_result = scan_and_discover_deductions(
