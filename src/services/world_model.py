@@ -214,6 +214,16 @@ def assert_claim(
         """, (cid, f"{subject_id} -> {predicate}", claim_content, f"claim {predicate}"))
         conn.commit()
 
+    # Incremental vector index sync for real-time semantic search
+    try:
+        import asyncio
+        from src.services.qdrant_client import index_single_claim
+        loop = asyncio.get_running_loop()
+        u_id = subject_id.replace("user:", "") if subject_id.startswith("user:") else ""
+        loop.create_task(index_single_claim(cid, subject_id, predicate, str(object_id or scalar_value or ""), source_authority, u_id))
+    except Exception:
+        pass
+
     return cid
 
 # ============================================================
@@ -379,6 +389,131 @@ def build_world_model_context(query: str, max_tokens: int = 180, user_id: Option
     
     context_str = "\n".join(lines)
     return context_str
+
+
+async def build_semantic_world_model_context(query: str, max_tokens: int = 250, user_id: Optional[str] = None) -> str:
+    """
+    Semantic Memory RAG: Uses vector search (Qdrant) + entity resolution to inject
+    ONLY semantically relevant claims and dossiers into Delilah's prompt context.
+    Prevents brute-force context stuffing (e.g. asking about fragrance won't dump CUNY classes or debts).
+    """
+    target_user_id = str(user_id or get_primary_user_id()).strip()
+    user_anchor = f"user:{target_user_id}"
+
+    # 1. Resolve explicit entity mentions in the query (e.g., 'Apple Card', 'CUNY')
+    explicit_matched_eids = resolve_entities(query, user_id=target_user_id)
+    named_entity_ids = [eid for eid in explicit_matched_eids if eid != user_anchor]
+
+    lines = [
+        "==================================================",
+        "ACTIVE WORLD MODEL CONTEXT (SEMANTIC GROUND TRUTH)",
+        "==================================================",
+    ]
+
+    # 2. Semantic vector search via Qdrant for relevant claims/dossiers
+    vector_claims = []
+    vector_dossiers = []
+    try:
+        from src.services.qdrant_client import search_vectors
+        hits = await search_vectors(query, limit=6, user_id=target_user_id)
+        for h in hits:
+            score = h.get("score", 0.0)
+            payload = h.get("payload", {})
+            domain = payload.get("domain", "")
+            # Filter for semantic relevance (score >= 0.44)
+            if score >= 0.44:
+                if domain == "world_model_claim":
+                    vector_claims.append({
+                        "subject_id": payload.get("subject_id", user_anchor),
+                        "predicate": payload.get("predicate", "fact"),
+                        "scalar_value": payload.get("value", ""),
+                        "source_authority": payload.get("authority", 5),
+                        "score": score
+                    })
+                elif domain == "world_model_dossier":
+                    vector_dossiers.append({
+                        "title": payload.get("title", ""),
+                        "text": payload.get("text", "")[:300],
+                        "score": score
+                    })
+        vector_claims.sort(key=lambda x: x["score"], reverse=True)
+        vector_claims = vector_claims[:3]
+        vector_dossiers.sort(key=lambda x: x["score"], reverse=True)
+        vector_dossiers = vector_dossiers[:2]
+    except Exception as e:
+        logger.debug(f"Semantic vector search in world model context failed: {e}")
+
+    # 3. If explicit named entities were mentioned, pull their direct claims too
+    entity_claims = []
+    entities_map = {}
+    if named_entity_ids:
+        subgraph = get_entity_subgraph(named_entity_ids[:2], depth=1)
+        entities_map = subgraph.get("entities", {})
+        entity_claims = subgraph.get("claims", [])
+
+    # If no semantic hits, no dossiers, and no named entities matched:
+    # Do NOT stuff the prompt with random user facts. Return empty or clean fallback.
+    if not vector_claims and not vector_dossiers and not entity_claims:
+        # If query is a general financial health or dashboard check, fallback to standard build_world_model_context
+        general_keywords = {"overview", "dashboard", "how am i doing", "status", "profile", "summary", "everything", "all"}
+        if any(w in query.lower() for w in general_keywords):
+            return build_world_model_context(query, max_tokens=max_tokens, user_id=target_user_id)
+        return ""
+
+    target_max_words = int(max_tokens * 0.75) if max_tokens else 200
+    current_words = 15
+
+    # Display entities if relevant
+    if entities_map:
+        lines.append("[ACTIVE ENTITIES]")
+        for eid, e in list(entities_map.items())[:2]:
+            line = f"• {eid} ({e.get('name', eid)})"
+            lines.append(line)
+            current_words += len(line.split())
+        lines.append("")
+
+    # Display relevant dossiers (e.g. Fragrance Freeze or specific policy)
+    if vector_dossiers:
+        lines.append("[RELEVANT DIRECTIVES & DOSSIERS]")
+        for d in vector_dossiers[:2]:
+            d_line = f"• [{d['title']}]: {d['text']}"
+            lines.append(d_line)
+            current_words += len(d_line.split())
+            if current_words >= target_max_words:
+                break
+        lines.append("")
+
+    # Display verified claims (combining vector hits and explicit entity claims)
+    all_claims = vector_claims + [
+        {
+            "subject_id": c.get("subject_id"),
+            "predicate": c.get("predicate"),
+            "scalar_value": c.get("scalar_value") or c.get("object_id"),
+            "source_authority": c.get("source_authority", 4),
+        }
+        for c in entity_claims
+    ]
+
+    # Deduplicate claims by (subject_id, predicate)
+    seen = set()
+    deduped_claims = []
+    for c in all_claims:
+        k = (c.get("subject_id"), c.get("predicate"))
+        if k not in seen:
+            seen.add(k)
+            deduped_claims.append(c)
+
+    if deduped_claims:
+        lines.append("[RELEVANT GROUND TRUTH CLAIMS]")
+        for c in deduped_claims:
+            claim_line = f"• {c['subject_id']} -> {c['predicate']}: {c['scalar_value']} (Auth: {c.get('source_authority', 5)}/5)"
+            lines.append(claim_line)
+            current_words += len(claim_line.split())
+            if current_words >= target_max_words:
+                break
+
+    lines.append("==================================================")
+    return "\n".join(lines)
 
 # ============================================================
 # 5. EXPLAINABILITY & PROVENANCE AUDIT

@@ -24,6 +24,7 @@ from src.services.budgeting import predict_next_paydays, calculate_locked_liabil
 from src.services.advisor_tools import NEW_50_TOOLS_SCHEMA, ADVISOR_TOOLS_DISPATCH
 from src.services.world_model import (
     build_world_model_context,
+    build_semantic_world_model_context,
     explain_claim,
     upsert_entity,
     assert_claim,
@@ -3529,9 +3530,11 @@ MERCHANT RESEARCH & AMBIGUITY:
 - UNKNOWN_MERCHANT: search_web exact merchant name before categorizing. Persist via save_known_merchant or assert_world_model_claim.
 - AMBIGUOUS MERCHANTS: Marketplaces (Amazon, Walmart), shipping, and payment processors (PayPal, Square, Venmo) are presumptively ambiguous. Do not categorize without context or receipts; leave as Uncategorized Purchase if unresolved.
 
-ACTIVE WORLD MODEL & PERSISTENCE:
+ACTIVE WORLD MODEL & AGGRESSIVE MEMORY PERSISTENCE:
 - Ground all schedules, courses, work commitments, and life constraints in the Active World Model (get_world_model_entity, search_world_model).
-- Persist durable facts immediately with assert_world_model_claim (set authority 1-5 and provenance_type). Retract stale facts with retract_world_model_claim.
+- AGGRESSIVE MEMORY RETENTION: Whenever the user discloses or mentions ANY personal fact, possession, asset, subscription, preference, habit, plan, life context, or constraint—even if casually dropped in passing or embedded within a research question (e.g. "I already have X", "I work at Y", "I prefer Z", "I bought W")—you MUST call assert_world_model_claim in your very first tool batch before or alongside answering.
+- Example: assert_world_model_claim(subject_id='user:current', predicate='owns', scalar_value='Clive Christian 1872 Masculine', provenance_type='USER_STATED', source_authority=5).
+- Never ignore user self-disclosures. Persist them immediately. Retract stale facts with retract_world_model_claim.
 
 MONITOR & AUTOMATION:
 - Background monitor rules evaluated via monitor_list_rules, monitor_add_rule, monitor_run_pass, monitor_list_alerts, monitor_ack_alert.
@@ -3568,9 +3571,12 @@ RUNTIME CONTRACT:
     awm_context = ""
     if context_policy["include_session_history"]:
         try:
-            awm_context = build_world_model_context(prompt_text, max_tokens=300, user_id=uid)
+            awm_context = await build_semantic_world_model_context(prompt_text, max_tokens=300, user_id=uid)
         except Exception as e:
-            awm_context = ""
+            try:
+                awm_context = build_world_model_context(prompt_text, max_tokens=300, user_id=uid)
+            except Exception:
+                awm_context = ""
 
     volatile_context = f"""
 {awm_context}
@@ -4826,6 +4832,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
         "get_current_financial_position",
         "get_financial_dashboard",
         "get_safe_to_spend_metrics",
+        "assert_world_model_claim",
         "end_turn",
     }
 
@@ -4833,9 +4840,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Each entry: (keywords_tuple, tools_set)
     # First matching entry wins; fallback stays empty (pure discovery mode).
     _INTENT_TOOL_MAP: list[tuple[tuple[str, ...], set[str]]] = [
+        # Personal profile, memories, possessions, life facts, preferences
+        (
+            ("remember", "memory", "memories", "i have", "i own", "own", "owns", "prefer", "preference", "bought", "fyi", "note that", "keep in mind", "have had", "already have"),
+            _CORE_READ_TOOLS | {
+                "assert_world_model_claim",
+                "retract_world_model_claim",
+                "search_world_model",
+                "get_world_model_dossier",
+                "get_world_model_entity",
+            },
+        ),
         # Web search / news / research / internships / jobs / trackers (evaluated first)
         (
-            ("search", "internship", "internships", "swe", "job", "career", "tracker", "news", "scrape", "briefing", "article"),
+            ("search", "internship", "internships", "swe", "job", "career", "tracker", "news", "scrape", "briefing", "article", "research"),
             _CORE_READ_TOOLS | {
                 "search_web",
                 "fetch_webpage",
@@ -4956,7 +4974,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Pre-seed dynamically loaded tools from intent mapping
     dynamically_loaded_tools: set[str] = set()
     for kw_tuple, tool_set in _INTENT_TOOL_MAP:
-        if any(kw in _prompt_lower for kw in kw_tuple):
+        if any(re.search(rf"\b{re.escape(kw)}\b", _prompt_lower) for kw in kw_tuple):
             dynamically_loaded_tools.update(tool_set)
             break
 
@@ -8058,7 +8076,101 @@ CURRENT DATABASE FINANCIAL CONTEXT
     )
     conn.commit()
 
+    # Aggressive memory retention safety net:
+    # If the user disclosed personal facts or possessions and the model did not execute assert_world_model_claim,
+    # extract and persist claims in the background so no ground truth is lost.
+    executed_tool_names = {entry.get("name") for entry in (turn_tool_trace or [])}
+    if "assert_world_model_claim" not in executed_tool_names:
+        asyncio.create_task(auto_extract_and_persist_claims(prompt_text, uid))
+
     return final_content
+
+async def auto_extract_and_persist_claims(prompt_text: str, user_id: str):
+    """
+    Background safety net for aggressive memory retention.
+    If the user explicitly self-discloses personal facts, possessions, habits,
+    preferences, employment, or constraints, and the model did not execute
+    assert_world_model_claim during the turn, extract and persist them
+    directly into the Active World Model.
+    """
+    if not prompt_text or not user_id:
+        return
+
+    # Check for self-disclosure markers
+    pattern = r"\b(?:i(?:'ve| have| had| already have| own| bought| drive| live| work| prefer| love| hate| want| am)|my (?:car|job|salary|dog|cat|house|apartment|degree|school|class|schedule|wife|husband|partner|budget))\b"
+    if not re.search(pattern, prompt_text, re.IGNORECASE):
+        return
+
+    extract_sys = (
+        "You are Delilah's Epistemic Ground-Truth Extraction Engine.\n"
+        "Identify any durable personal facts, possessions, preferences, habits, employment, or constraints "
+        "explicitly stated by the user about themselves in their message.\n"
+        "Return ONLY a valid JSON object formatted as:\n"
+        '{"claims": [{"predicate": "owns|preference|employed_by|habit|plan|fact", "value": "concise description"}]}\n'
+        "If no durable personal facts about the user are stated, return {\"claims\": []}.\n"
+        "Do not extract transient feelings or research questions. Only extract facts the user states about themselves."
+    )
+    user_msg = f"User message: {prompt_text}"
+
+    try:
+        provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        extracted_claims = []
+
+        if provider == "openai":
+            openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
+            openai_model = os.getenv("OPENAI_MODEL", "openrouter/auto-beta")
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": openai_model,
+                "messages": [
+                    {"role": "system", "content": extract_sys},
+                    {"role": "user", "content": user_msg}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.0,
+                "max_tokens": 400
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.post(openai_url, json=payload, headers=headers)
+                if res.status_code == 200:
+                    raw = res.json()["choices"][0]["message"]["content"]
+                    parsed = json.loads(raw)
+                    extracted_claims = parsed.get("claims", [])
+        else:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                res = await client.post(
+                    OLLAMA_URL,
+                    json={
+                        "model": src.core.state.ADVISOR_MODEL,
+                        "messages": [
+                            {"role": "system", "content": extract_sys},
+                            {"role": "user", "content": user_msg}
+                        ],
+                        "format": "json",
+                        "stream": False,
+                        "options": {"temperature": 0.0, "num_predict": 400}
+                    }
+                )
+                if res.status_code == 200:
+                    raw = res.json().get("message", {}).get("content", "")
+                    parsed = json.loads(raw)
+                    extracted_claims = parsed.get("claims", [])
+
+        for cl in extracted_claims:
+            val = str(cl.get("value", "")).strip()
+            pred = str(cl.get("predicate", "fact")).strip()
+            if val:
+                cid = assert_claim(
+                    subject_id=f"user:{user_id}",
+                    predicate=pred,
+                    scalar_value=val,
+                    provenance_type="USER_STATED",
+                    source_authority=5
+                )
+                print(f" [BACKGROUND MEMORY PERSISTED] uid={user_id} claim={cid} {pred}: {val}")
+    except Exception as e:
+        print(f" [BACKGROUND MEMORY EXTRACTOR ERROR]: {e}")
 
 async def chat_with_delilah(
     prompt_text: str,

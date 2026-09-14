@@ -341,3 +341,27 @@ async def index_user_financial_profile(user_id: str) -> Dict[str, Any]:
         "points_indexed": len(points),
         "user_id": uid,
     }
+
+async def index_single_claim(claim_id: str, subject_id: str, predicate: str, value: str, authority: int, user_id: str):
+    """Real-time incremental vector indexing of a newly asserted claim."""
+    try:
+        claim_text = f"{subject_id} {predicate}: {value} (Authority {authority}/5)"
+        emb = await get_embedding(claim_text)
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claim_{claim_id}"))
+        await upsert_points([{
+            "id": point_id,
+            "vector": emb,
+            "payload": {
+                "user_id": str(user_id),
+                "claim_id": str(claim_id),
+                "subject_id": str(subject_id),
+                "predicate": str(predicate),
+                "value": str(value),
+                "authority": authority,
+                "domain": "world_model_claim",
+                "text": claim_text,
+            }
+        }])
+    except Exception as e:
+        logger.warning(f"Failed to index single claim into Qdrant: {e}")
+
