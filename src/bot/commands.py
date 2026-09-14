@@ -4547,6 +4547,72 @@ async def reclassify_all_error(ctx: commands.Context, error: commands.CommandErr
     else:
         await ctx.send(f" Command error: {error}")
 
+@bot.command(name="inspectmemory", aliases=["inspectmemories", "memories", "viewmemory"])
+async def inspect_memory(ctx: commands.Context):
+    """View all active memories and verified world model claims in an interactive paginated report."""
+    user_id = str(ctx.author.id)
+    uid = user_id
+
+    try:
+        from src.core.state import get_db
+        with get_db() as db:
+            cur = db.cursor()
+            cur.execute("""
+                SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority, provenance_type, tx_asserted_at
+                FROM kg_claims
+                WHERE tx_retracted_at IS NULL AND (subject_id = ? OR subject_id LIKE ?)
+                ORDER BY tx_asserted_at DESC
+            """, (f"user:{uid}", f"%{uid}%"))
+            claims = cur.fetchall()
+
+            cur.execute("""
+                SELECT id, category, content, importance, created_at
+                FROM delilah_memories
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+            """, (uid,))
+            legacy_memories = cur.fetchall()
+
+        if not claims and not legacy_memories:
+            embed = discord.Embed(
+                title="🧠 Memory Inspection",
+                description="No active memories or world model claims found for your profile.",
+                color=discord.Color.blue(),
+            )
+            await ctx.send(embed=embed)
+            return
+
+        body_parts = []
+        body_parts.append(f"**Verified World Model Claims:** {len(claims)} active | **Legacy Notes:** {len(legacy_memories)}\n")
+
+        if claims:
+            body_parts.append("### 📌 Active Ground-Truth Claims\n")
+            for row in claims:
+                cid, subj, pred, obj_id, s_val, auth, prov, ts = row
+                val = obj_id or s_val
+                date_str = str(ts or "").split()[0] if ts else "N/A"
+                body_parts.append(f"• **`{pred}`**: {val}\n  *(Auth: {auth}/5 • {prov} • {date_str} • `{cid}`)_")
+                body_parts.append("")
+
+        if legacy_memories:
+            body_parts.append("\n### 📜 Notes & Insights\n")
+            for row in legacy_memories:
+                mid, cat, content, imp, dt = row
+                date_str = str(dt or "").split()[0] if dt else "N/A"
+                body_parts.append(f"• `[{cat}]`: {content}\n  *(Importance: {imp} • {date_str} • #{mid})_")
+                body_parts.append("")
+
+        report_body = "\n".join(body_parts)
+        await _send_command_report(
+            ctx,
+            title="🧠 Active Memory & World Model Ground Truth",
+            body=report_body,
+            user_id=user_id,
+            max_chars=900,
+        )
+    except Exception as exc:
+        await _send_error_embed(ctx, "Memory Inspection Failed", exc, user_id=user_id)
+
 @bot.command(name="wipememory")
 async def wipe_memory(ctx: commands.Context):
     user_id = str(ctx.author.id)
