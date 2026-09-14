@@ -24,6 +24,7 @@ from src.services.budgeting import predict_next_paydays, calculate_locked_liabil
 from src.services.advisor_tools import NEW_50_TOOLS_SCHEMA, ADVISOR_TOOLS_DISPATCH
 from src.services.world_model import (
     build_world_model_context,
+    build_semantic_world_model_context,
     explain_claim,
     upsert_entity,
     assert_claim,
@@ -2935,7 +2936,9 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "manage_subscription",
-            "description": "Adds, updates, or cancels a recurring subscription or bill.",
+            "description": "Adds, updates, or cancels a recurring subscription or bill. "
+                           "Examples: {\"action\":\"set\",\"merchant\":\"Netflix\",\"amount\":15.99,\"cadence\":\"monthly\"} "
+                           "to add or update a sub; {\"action\":\"cancel\",\"merchant\":\"Netflix\"} to cancel one.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2967,6 +2970,63 @@ BOT_TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["action", "merchant"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_subscription",
+            "description": "Cancels a recurring subscription or bill by merchant name. "
+                           "Equivalent to manage_subscription with action='cancel'. "
+                           "Example: {\"merchant\":\"Netflix\"}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "merchant": {
+                        "type": "string",
+                        "description": "Name of the subscription service or merchant to cancel."
+                    }
+                },
+                "required": ["merchant"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_subscription",
+            "description": "Cancels a recurring subscription or bill by merchant name. "
+                           "Equivalent to manage_subscription with action='cancel'. "
+                           "Example: {\"merchant\":\"Netflix\"}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "merchant": {
+                        "type": "string",
+                        "description": "Name of the subscription service or merchant to delete."
+                    }
+                },
+                "required": ["merchant"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_subscription",
+            "description": "Cancels a recurring subscription or bill by merchant name. "
+                           "Equivalent to manage_subscription with action='cancel'. "
+                           "Example: {\"merchant\":\"Netflix\"}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "merchant": {
+                        "type": "string",
+                        "description": "Name of the subscription service or merchant to remove."
+                    }
+                },
+                "required": ["merchant"]
             }
         }
     },
@@ -3160,6 +3220,9 @@ EXPECTED_TOOL_NAMES = {
     "add_merchant_alias",
     "get_upcoming_bills_calendar",
     "manage_subscription",
+    "cancel_subscription",
+    "delete_subscription",
+    "remove_subscription",
     "scan_and_auto_tag_deductions",
     "explore_domain",
 
@@ -3189,6 +3252,51 @@ if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
         f"Tool schema drift detected. Missing={EXPECTED_TOOL_NAMES - SCHEMA_TOOL_NAMES}, "
         f"extra={SCHEMA_TOOL_NAMES - EXPECTED_TOOL_NAMES}"
     )
+
+# Canonical set of tool names exposed by the schema. Used both for validation
+# and as the lookup base for hallucinated-name alias resolution below.
+KNOWN_TOOLS = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
+
+# Aliases for tool names LLMs commonly hallucinate. When a model calls a name
+# not in KNOWN_TOOLS, we resolve against this map before rejecting it —
+# otherwise the model burns a tool call (and a round-trip) on a guess.
+TOOL_ALIASES = {
+    # Subscription mutations — the canonical tool is manage_subscription,
+    # which takes an "action" argument. Models naturally guess verb+noun.
+    # (cancel_subscription / delete_subscription / remove_subscription are
+    # also exposed as real schema tools, so they need no alias entry.)
+    "delete_recurring_bill": "remove_recurring_bill",
+    "cancel_recurring_bill": "remove_recurring_bill",
+    "delete_bill": "remove_recurring_bill",
+    "cancel_bill": "remove_recurring_bill",
+    "remove_bill": "remove_recurring_bill",
+    "delete_planned_transaction": "cancel_planned_transaction",
+    "cancel_transaction": "delete_transaction",
+    "unlock_transaction": "lock_transaction",
+    "uncorrect_transaction": "clear_transaction_correction",
+    "delete_expected_income": "cancel_expected_income",
+    "remove_expected_income": "cancel_expected_income",
+    "cancel_savings_goal": "set_savings_goal",
+    "cancel_savings_bucket": "adjust_savings_bucket",
+    "cancel_category_budget": "set_category_budget",
+    "delete_portfolio_holding": "set_portfolio_holding",
+    "remove_portfolio_holding": "set_portfolio_holding",
+    "delete_merchant_alias": "add_merchant_alias",
+    "remove_merchant_alias": "add_merchant_alias",
+    "delete_merchant_alias_mapping": "add_merchant_alias_mapping",
+    "remove_merchant_alias_mapping": "add_merchant_alias_mapping",
+    "remove_scheduled_reminder": "delete_scheduled_reminder",
+    "cancel_scheduled_reminder": "delete_scheduled_reminder",
+    "delete_user_timezone": "set_user_timezone",
+}
+
+
+def _resolve_tool_alias(func_name: str) -> str:
+    """Return the canonical tool name, or the input unchanged if no alias matches."""
+    if func_name in KNOWN_TOOLS:
+        return func_name
+    return TOOL_ALIASES.get(func_name, func_name)
+
 
 # Set of all mutation tools that should always commit to the database
 MUTATION_TOOLS = {
@@ -3469,7 +3577,6 @@ async def _chat_with_delilah_impl(
         f"prompt={prompt_for_domain!r}"
     )
 
-    KNOWN_TOOLS = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
     if uid not in SESSION_HISTORY:
         SESSION_HISTORY[uid] = []
     recent_text = prompt_text or ""
@@ -3529,9 +3636,11 @@ MERCHANT RESEARCH & AMBIGUITY:
 - UNKNOWN_MERCHANT: search_web exact merchant name before categorizing. Persist via save_known_merchant or assert_world_model_claim.
 - AMBIGUOUS MERCHANTS: Marketplaces (Amazon, Walmart), shipping, and payment processors (PayPal, Square, Venmo) are presumptively ambiguous. Do not categorize without context or receipts; leave as Uncategorized Purchase if unresolved.
 
-ACTIVE WORLD MODEL & PERSISTENCE:
-- Ground all schedules, courses, work commitments, and life constraints in the Active World Model (get_world_model_entity, search_world_model).
-- Persist durable facts immediately with assert_world_model_claim (set authority 1-5 and provenance_type). Retract stale facts with retract_world_model_claim.
+ACTIVE WORLD MODEL & AGGRESSIVE MEMORY PERSISTENCE:
+- AGGRESSIVE MEMORY RETENTION (ZERO EXTRA TOOL CALLS NEEDED):
+  Whenever the user discloses or mentions ANY personal fact, possession, preference, habit, plan, life context, or constraint (e.g. "I already have X", "I work at Y", "I prefer Z"), you do NOT need an extra tool call round! Simply emit an inline memory tag at the start or end of your reply:
+  <memory>[{"predicate": "owns", "value": "Clive Christian 1872 Masculine"}]</memory>
+  This tag is automatically stripped before the user sees your message and saves straight to the knowledge graph and vector DB. You can also still call assert_world_model_claim if needed. Never ignore user self-disclosures!
 
 MONITOR & AUTOMATION:
 - Background monitor rules evaluated via monitor_list_rules, monitor_add_rule, monitor_run_pass, monitor_list_alerts, monitor_ack_alert.
@@ -3568,9 +3677,12 @@ RUNTIME CONTRACT:
     awm_context = ""
     if context_policy["include_session_history"]:
         try:
-            awm_context = build_world_model_context(prompt_text, max_tokens=300, user_id=uid)
+            awm_context = await build_semantic_world_model_context(prompt_text, max_tokens=300, user_id=uid)
         except Exception as e:
-            awm_context = ""
+            try:
+                awm_context = build_world_model_context(prompt_text, max_tokens=300, user_id=uid)
+            except Exception:
+                awm_context = ""
 
     volatile_context = f"""
 {awm_context}
@@ -4826,6 +4938,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
         "get_current_financial_position",
         "get_financial_dashboard",
         "get_safe_to_spend_metrics",
+        "assert_world_model_claim",
         "end_turn",
     }
 
@@ -4833,9 +4946,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Each entry: (keywords_tuple, tools_set)
     # First matching entry wins; fallback stays empty (pure discovery mode).
     _INTENT_TOOL_MAP: list[tuple[tuple[str, ...], set[str]]] = [
+        # Personal profile, memories, possessions, life facts, preferences
+        (
+            ("remember", "memory", "memories", "i have", "i own", "own", "owns", "prefer", "preference", "bought", "fyi", "note that", "keep in mind", "have had", "already have"),
+            _CORE_READ_TOOLS | {
+                "assert_world_model_claim",
+                "retract_world_model_claim",
+                "search_world_model",
+                "get_world_model_dossier",
+                "get_world_model_entity",
+            },
+        ),
         # Web search / news / research / internships / jobs / trackers (evaluated first)
         (
-            ("search", "internship", "internships", "swe", "job", "career", "tracker", "news", "scrape", "briefing", "article"),
+            ("search", "internship", "internships", "swe", "job", "career", "tracker", "news", "scrape", "briefing", "article", "research"),
             _CORE_READ_TOOLS | {
                 "search_web",
                 "fetch_webpage",
@@ -4956,7 +5080,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Pre-seed dynamically loaded tools from intent mapping
     dynamically_loaded_tools: set[str] = set()
     for kw_tuple, tool_set in _INTENT_TOOL_MAP:
-        if any(kw in _prompt_lower for kw in kw_tuple):
+        if any(re.search(rf"\b{re.escape(kw)}\b", _prompt_lower) for kw in kw_tuple):
             dynamically_loaded_tools.update(tool_set)
             break
 
@@ -5808,7 +5932,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     func_name = func_name.strip()
 
                     if func_name not in KNOWN_TOOLS:
-                        raise ValueError(f"unknown tool '{func_name}'")
+                        resolved = _resolve_tool_alias(func_name)
+                        if resolved != func_name:
+                            logger.info(
+                                "tool alias resolved: '%s' -> '%s' (uid=%s)",
+                                func_name, resolved, uid,
+                            )
+                            func_name = resolved
+                        else:
+                            raise ValueError(f"unknown tool '{func_name}'")
 
                     # Dynamic audit activation: a worklist/getter tool can activate
                     # the audit controller even when the original user prompt was
@@ -6625,20 +6757,24 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             user_id=uid,
                             days_ahead=args.get("days_ahead", 30),
                         )
-                    elif func_name == "manage_subscription":
+                    elif func_name in ("manage_subscription", "cancel_subscription", "delete_subscription", "remove_subscription"):
                         from src.services.subscriptions import set_subscription, cancel_subscription
-                        action = str(args.get("action", "set")).lower()
-                        if action == "cancel":
+                        if func_name in ("cancel_subscription", "delete_subscription", "remove_subscription"):
+                            # Aliases: both cancel the subscription by merchant name.
                             db_result = cancel_subscription(user_id=uid, merchant=args.get("merchant", ""))
                         else:
-                            db_result = set_subscription(
-                                user_id=uid,
-                                merchant=args.get("merchant", ""),
-                                amount=args.get("amount", 0.0),
-                                cadence=args.get("cadence", "monthly"),
-                                next_due_date=args.get("next_due_date"),
-                                category=args.get("category", "Subscriptions"),
-                            )
+                            action = str(args.get("action", "set")).lower()
+                            if action == "cancel":
+                                db_result = cancel_subscription(user_id=uid, merchant=args.get("merchant", ""))
+                            else:
+                                db_result = set_subscription(
+                                    user_id=uid,
+                                    merchant=args.get("merchant", ""),
+                                    amount=args.get("amount", 0.0),
+                                    cadence=args.get("cadence", "monthly"),
+                                    next_due_date=args.get("next_due_date"),
+                                    category=args.get("category", "Subscriptions"),
+                                )
                     elif func_name == "scan_and_auto_tag_deductions":
                         from src.services.tax_deductions import scan_and_discover_deductions
                         db_result = scan_and_discover_deductions(
@@ -7936,6 +8072,31 @@ CURRENT DATABASE FINANCIAL CONTEXT
         r"<thought>.*?</thought>|<think>.*?</think>", "", final_content, flags=re.DOTALL
     ).strip()
 
+    # Inline Memory Extraction (Zero Tool Calls):
+    memory_matches = re.findall(r"<memory>(.*?)</memory>", final_content, flags=re.DOTALL | re.IGNORECASE)
+    for mem_text in memory_matches:
+        mem_text = mem_text.strip()
+        try:
+            mem_data = json.loads(mem_text)
+            claims_to_add = mem_data if isinstance(mem_data, list) else [mem_data] if isinstance(mem_data, dict) else []
+            for c_obj in claims_to_add:
+                if isinstance(c_obj, dict):
+                    pred = str(c_obj.get("predicate") or "fact").strip()
+                    val = str(c_obj.get("value") or c_obj.get("scalar_value") or "").strip()
+                    if val:
+                        cid = assert_claim(
+                            subject_id=f"user:{uid}",
+                            predicate=pred,
+                            scalar_value=val,
+                            provenance_type="USER_STATED",
+                            source_authority=5
+                        )
+                        print(f" [INLINE MEMORY PERSISTED] uid={uid} claim={cid} {pred}: {val}")
+        except Exception as mem_err:
+            print(f" [INLINE MEMORY PARSE ERROR] uid={uid}: {mem_err} raw={mem_text[:100]}")
+
+    final_content = re.sub(r"<memory>.*?</memory>", "", final_content, flags=re.DOTALL | re.IGNORECASE).strip()
+
     try:
         await render_stream(final_content)
         print(
@@ -8058,7 +8219,101 @@ CURRENT DATABASE FINANCIAL CONTEXT
     )
     conn.commit()
 
+    # Aggressive memory retention safety net:
+    # If the user disclosed personal facts or possessions and the model did not execute assert_world_model_claim,
+    # extract and persist claims in the background so no ground truth is lost.
+    executed_tool_names = {entry.get("name") for entry in (turn_tool_trace or [])}
+    if "assert_world_model_claim" not in executed_tool_names:
+        asyncio.create_task(auto_extract_and_persist_claims(prompt_text, uid))
+
     return final_content
+
+async def auto_extract_and_persist_claims(prompt_text: str, user_id: str):
+    """
+    Background safety net for aggressive memory retention.
+    If the user explicitly self-discloses personal facts, possessions, habits,
+    preferences, employment, or constraints, and the model did not execute
+    assert_world_model_claim during the turn, extract and persist them
+    directly into the Active World Model.
+    """
+    if not prompt_text or not user_id:
+        return
+
+    # Check for self-disclosure markers
+    pattern = r"\b(?:i(?:'ve| have| had| already have| own| bought| drive| live| work| prefer| love| hate| want| am)|my (?:car|job|salary|dog|cat|house|apartment|degree|school|class|schedule|wife|husband|partner|budget))\b"
+    if not re.search(pattern, prompt_text, re.IGNORECASE):
+        return
+
+    extract_sys = (
+        "You are Delilah's Epistemic Ground-Truth Extraction Engine.\n"
+        "Identify any durable personal facts, possessions, preferences, habits, employment, or constraints "
+        "explicitly stated by the user about themselves in their message.\n"
+        "Return ONLY a valid JSON object formatted as:\n"
+        '{"claims": [{"predicate": "owns|preference|employed_by|habit|plan|fact", "value": "concise description"}]}\n'
+        "If no durable personal facts about the user are stated, return {\"claims\": []}.\n"
+        "Do not extract transient feelings or research questions. Only extract facts the user states about themselves."
+    )
+    user_msg = f"User message: {prompt_text}"
+
+    try:
+        provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        extracted_claims = []
+
+        if provider == "openai":
+            openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
+            openai_model = os.getenv("OPENAI_MODEL", "openrouter/auto-beta")
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": openai_model,
+                "messages": [
+                    {"role": "system", "content": extract_sys},
+                    {"role": "user", "content": user_msg}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.0,
+                "max_tokens": 400
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.post(openai_url, json=payload, headers=headers)
+                if res.status_code == 200:
+                    raw = res.json()["choices"][0]["message"]["content"]
+                    parsed = json.loads(raw)
+                    extracted_claims = parsed.get("claims", [])
+        else:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                res = await client.post(
+                    OLLAMA_URL,
+                    json={
+                        "model": src.core.state.ADVISOR_MODEL,
+                        "messages": [
+                            {"role": "system", "content": extract_sys},
+                            {"role": "user", "content": user_msg}
+                        ],
+                        "format": "json",
+                        "stream": False,
+                        "options": {"temperature": 0.0, "num_predict": 400}
+                    }
+                )
+                if res.status_code == 200:
+                    raw = res.json().get("message", {}).get("content", "")
+                    parsed = json.loads(raw)
+                    extracted_claims = parsed.get("claims", [])
+
+        for cl in extracted_claims:
+            val = str(cl.get("value", "")).strip()
+            pred = str(cl.get("predicate", "fact")).strip()
+            if val:
+                cid = assert_claim(
+                    subject_id=f"user:{user_id}",
+                    predicate=pred,
+                    scalar_value=val,
+                    provenance_type="USER_STATED",
+                    source_authority=5
+                )
+                print(f" [BACKGROUND MEMORY PERSISTED] uid={user_id} claim={cid} {pred}: {val}")
+    except Exception as e:
+        print(f" [BACKGROUND MEMORY EXTRACTOR ERROR]: {e}")
 
 async def chat_with_delilah(
     prompt_text: str,
