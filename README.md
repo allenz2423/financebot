@@ -1,5 +1,4 @@
-# Delilah Financial OS
-
+# Delilah Finance Bot
 A personal finance operating system for Discord. Delilah connects your live bank data, local/cloud LLMs, web search, Stirling PDF form engines, headless Chromium browsers via MCP, and an isolated code execution sandbox to provide **deterministic financial verification alongside proactive, conversational advisory**.
 
 ---
