@@ -1,4 +1,4 @@
-# Delilah Financial OS
+# Delilah Finance Bot
 
 > **⚠️ This thing was vibecoded and hacked together.**
 >
