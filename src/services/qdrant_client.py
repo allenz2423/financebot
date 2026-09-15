@@ -34,6 +34,35 @@ def _get_embedding_vector_size() -> int:
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "delilah_financial_memory")
 VECTOR_SIZE = _get_embedding_vector_size()
 
+# Candidate-universe filter applied at the search boundary. The vector index
+# is heterogeneous by design (claims, dossiers, financial snapshots, free-form
+# memory text); live adversarial-battery runs showed non-renderable domains
+# crowd claims out of the top-K window and pollute the relevance band anchor
+# (MRR@10 0.280 -> 0.681 and 29.3 -> 0.0 distractors in band when filtered,
+# with zero recall cost vs claim-only). Env-overridable for experiments;
+# set to "none" (or empty) to search the mixed universe.
+_raw_retrieval_domains = os.getenv(
+    "SEMANTIC_RETRIEVAL_DOMAINS",
+    "world_model_claim,world_model_dossier",
+).strip()
+RENDERABLE_DOMAINS = (
+    [] if _raw_retrieval_domains.lower() in ("", "none", "off", "mixed")
+    else [d.strip() for d in _raw_retrieval_domains.split(",") if d.strip()]
+)
+
+# Query-side task instruction for instruction-tuned embedding models
+# (Qwen3-Embedding). Applied ONLY to search queries, never to indexed
+# documents, per the model's asymmetric training. Measured on this corpus
+# (see /tmp/embed_bench.py): improves domain-content queries sharply while
+# keeping possession-cluster retrieval usable. Env-overridable; set empty
+# to disable.
+QUERY_INSTRUCTION = os.getenv(
+    "EMBEDDING_QUERY_INSTRUCTION",
+    "Instruct: Given a user question about their life, possessions, finances "
+    "and memories, retrieve the stored claims that answer it\nQuery: {q}",
+).strip()
+
+
 def _get_qdrant_url() -> str:
     candidates = [
         os.getenv("QDRANT_URL", "").rstrip("/"),
@@ -88,13 +117,16 @@ def _get_embeddings_endpoint() -> str:
     return "https://openrouter.ai/api/v1/embeddings"
 
 
-async def get_embedding(text: str) -> List[float]:
+async def get_embedding(text: str, instruction: Optional[str] = None) -> List[float]:
     """
     Generate dense embedding for text.
     Controlled by EMBEDDING_BACKEND in .env:
       - 'local': Uses Ollama (EMBEDDING_LOCAL_MODEL, default: nomic-embed-text-cpu)
       - 'cloud': Uses OpenRouter/OpenAI (EMBEDDING_CLOUD_MODEL, default: text-embedding-3-small)
       - 'auto': Attempts local first; falls back to cloud if local is unreachable
+
+    `instruction` is the query-side task instruction for instruction-tuned
+    models (Qwen3-Embedding): queries carry it, documents never do.
     """
     vector_size = _get_embedding_vector_size()
     if not text or not text.strip():
@@ -125,6 +157,7 @@ async def get_embedding(text: str) -> List[float]:
 
     # Local Ollama requested (or auto fallback)
     ollama_url = _get_ollama_embed_url()
+    embed_input = f"{instruction.format(q=text.strip()[:8000])}" if instruction else text.strip()[:8000]
     candidate_models = [local_model]
     if local_model == "nomic-embed-text-cpu":
         candidate_models.append("nomic-embed-text")
@@ -134,7 +167,7 @@ async def get_embedding(text: str) -> List[float]:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     ollama_url,
-                    json={"model": model_name, "input": text.strip()[:8000], "keep_alive": -1},
+                    json={"model": model_name, "input": embed_input, "keep_alive": -1},
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -192,6 +225,28 @@ async def ensure_collection(collection_name: str = COLLECTION_NAME) -> bool:
         return True
 
 
+def _claim_embed_text(subject_id: str, predicate: str, value: Any) -> str:
+    """
+    Content-first embedding text for a KG claim. The old format embedded the
+    schema string verbatim ("user:342385... owns: X (Authority 4/5)"), so every
+    claim vector was dominated by the internal user-ID prefix and authority
+    boilerplate and all predicates clustered together. Embed the semantic
+    content instead: subject (namespace word kept — it is part of the data),
+    predicate in plain words, then the value.
+    """
+    subj = str(subject_id or "")
+    if subj.startswith("user:"):
+        subj_part = ""  # internal anchor: the raw user ID carries no semantics
+    else:
+        subj_part = subj.replace(":", " ")
+    parts = [
+        p.strip()
+        for p in (subj_part, str(predicate or "").replace("_", " "), str(value or ""))
+        if p.strip()
+    ]
+    return " ".join(parts) if parts else str(value or "")
+
+
 async def upsert_points(points: List[Dict[str, Any]], collection_name: str = COLLECTION_NAME) -> Dict[str, Any]:
     """Upsert vectors and payload into Qdrant."""
     await ensure_collection(collection_name)
@@ -215,19 +270,20 @@ async def search_vectors(
     """Search Qdrant for semantic neighbors of query_text."""
     await ensure_collection(collection_name)
     base_url = _get_qdrant_url()
-    query_vector = await get_embedding(query_text)
+    query_vector = await get_embedding(query_text, instruction=QUERY_INSTRUCTION or None)
 
     search_payload: Dict[str, Any] = {
         "vector": query_vector,
         "limit": limit,
         "with_payload": True,
     }
+    must_filters: List[Dict[str, Any]] = []
     if user_id:
-        search_payload["filter"] = {
-            "must": [
-                {"key": "user_id", "match": {"value": str(user_id)}}
-            ]
-        }
+        must_filters.append({"key": "user_id", "match": {"value": str(user_id)}})
+    if RENDERABLE_DOMAINS:
+        must_filters.append({"key": "domain", "match": {"any": RENDERABLE_DOMAINS}})
+    if must_filters:
+        search_payload["filter"] = {"must": must_filters}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
@@ -295,8 +351,8 @@ async def index_user_financial_profile(user_id: str) -> Dict[str, Any]:
 
     for row in claims:
         cid, subj, pred, obj_id, s_val, auth = row
-        val = obj_id or s_val
-        claim_text = f"{subj} {pred}: {val} (Authority {auth}/5)"
+        val = s_val or obj_id
+        claim_text = _claim_embed_text(subj, pred, val)
         emb = await get_embedding(claim_text)
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claim_{cid}"))
         points.append({
@@ -355,7 +411,7 @@ async def index_user_financial_profile(user_id: str) -> Dict[str, Any]:
 async def index_single_claim(claim_id: str, subject_id: str, predicate: str, value: str, authority: int, user_id: str):
     """Real-time incremental vector indexing of a newly asserted claim."""
     try:
-        claim_text = f"{subject_id} {predicate}: {value} (Authority {authority}/5)"
+        claim_text = _claim_embed_text(subject_id, predicate, value)
         emb = await get_embedding(claim_text)
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claim_{claim_id}"))
         await upsert_points([{
@@ -404,7 +460,20 @@ async def _scroll_user_point_ids(user_id: str, collection_name: str = COLLECTION
                 "limit": 256,
                 "with_payload": True,
                 "with_vector": False,
-                "filter": {"must": [{"key": "user_id", "match": {"value": str(user_id)}}]},
+                # Second branch picks up orphan claim points (empty payload.user_id)
+                # left by the pre-owner-attribution indexing bug, so drift/reconcile
+                # can repair or delete them instead of ignoring them forever.
+                "filter": {
+                    "should": [
+                        {"key": "user_id", "match": {"value": str(user_id)}},
+                        {
+                            "must": [
+                                {"key": "user_id", "match": {"value": ""}},
+                                {"key": "domain", "match": {"value": "world_model_claim"}},
+                            ]
+                        },
+                    ],
+                },
             }
             if offset:
                 payload["offset"] = offset
@@ -418,6 +487,7 @@ async def _scroll_user_point_ids(user_id: str, collection_name: str = COLLECTION
                     "id": p.get("id"),
                     "claim_id": pl.get("claim_id"),
                     "domain": pl.get("domain"),
+                    "user_id": pl.get("user_id"),
                 })
             offset = data.get("next_page_offset")
             if offset is None:
@@ -489,17 +559,30 @@ async def user_vector_drift(user_id: str, collection_name: str = COLLECTION_NAME
     """
     Compare SQLite active claims against Qdrant indexed points for one user.
     missing = active in SQLite but not vector-indexed; stale = indexed but retracted.
+    Claims whose subject_id does not reference the user (e.g. "perfume:X...")
+    are attributed via the indexed point's payload.user_id (set by assert_claim's
+    owner_user_id), so they count as active for the owning user.
     """
     import sqlite3
     from src.core.state import DB_PATH
 
     uid = str(user_id).strip()
     indexed_points = await _scroll_user_point_ids(uid, collection_name)
+    # Only properly attributed points count as "indexed"; orphan points
+    # (empty payload.user_id from the pre-owner-attribution bug) are invisible
+    # to user-scoped search, so their claims must surface as missing.
     indexed_map = {
         p["claim_id"]: p["id"]
         for p in indexed_points
         if p.get("domain") == "world_model_claim" and p.get("claim_id")
+        and (p.get("user_id") or "").strip() == uid
     }
+    # Points with an empty payload.user_id are orphaned (pre-owner-attribution
+    # indexing bug); they are invisible to user-scoped search — treat them as missing.
+    orphan_point_ids = [
+        p["id"] for p in indexed_points
+        if p.get("domain") == "world_model_claim" and p.get("claim_id") and not (p.get("user_id") or "").strip()
+    ]
 
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     c = conn.cursor()
@@ -511,17 +594,24 @@ async def user_vector_drift(user_id: str, collection_name: str = COLLECTION_NAME
         "AND (subject_id = ? OR subject_id LIKE ?)",
         (now_utc, now_utc, f"user:{uid}", f"%{uid}%"),
     )
-    active_rows = c.fetchall()
+    active_ids = {row[0] for row in c.fetchall()}
+
+    # Claims attributed to this user via their point payload (non-user subjects).
+    attributed_ids = {
+        p["claim_id"] for p in indexed_points
+        if p.get("domain") == "world_model_claim" and p.get("claim_id")
+        and (p.get("user_id") or "").strip() == uid
+    }
     conn.close()
 
-    active_ids = {row[0] for row in active_rows}
     return {
         "user_id": uid,
         "active_claims": len(active_ids),
         "indexed_claims": len(indexed_map),
         "other_points": sum(1 for p in indexed_points if p.get("domain") != "world_model_claim"),
+        "orphaned_points": orphan_point_ids,
         "missing": sorted(active_ids - set(indexed_map)),
-        "stale": sorted(set(indexed_map) - active_ids),
+        "stale": sorted(set(indexed_map) - active_ids - attributed_ids),
     }
 
 
@@ -553,7 +643,23 @@ async def reconcile_user_vectors(user_id: str, collection_name: str = COLLECTION
 
     uid = str(user_id).strip()
     indexed_points = await _scroll_user_point_ids(uid, collection_name)
-    indexed_claims = {p["claim_id"] for p in indexed_points if p.get("domain") == "world_model_claim" and p.get("claim_id")}
+    indexed_claims = {
+        p["claim_id"] for p in indexed_points
+        if p.get("domain") == "world_model_claim" and p.get("claim_id")
+    }
+    orphan_claim_ids = {
+        p["claim_id"] for p in indexed_points
+        if p.get("domain") == "world_model_claim" and p.get("claim_id")
+        and not (p.get("user_id") or "").strip()
+    }
+    # Claims attributed to this user via point payload (non-user subjects like
+    # "perfume:X"); they are not in the user-subject active query but must not
+    # be treated as stale.
+    attributed_ids = {
+        p["claim_id"] for p in indexed_points
+        if p.get("domain") == "world_model_claim" and p.get("claim_id")
+        and (p.get("user_id") or "").strip() == uid
+    }
 
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     c = conn.cursor()
@@ -566,10 +672,34 @@ async def reconcile_user_vectors(user_id: str, collection_name: str = COLLECTION
         (now_utc, now_utc, f"user:{uid}", f"%{uid}%")
     )
     active_rows = c.fetchall()
+
+    # Claims behind orphan points: re-index them with proper attribution if
+    # they are active and not owned by a different user; otherwise delete.
+    orphan_active: Dict[str, tuple] = {}
+    if orphan_claim_ids:
+        placeholders = ",".join("?" for _ in orphan_claim_ids)
+        c.execute(
+            f"SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority "
+            f"FROM kg_claims WHERE claim_id IN ({placeholders}) "
+            f"AND tx_retracted_at IS NULL AND valid_from <= ? "
+            f"AND (valid_to IS NULL OR valid_to > ?)",
+            (*orphan_claim_ids, now_utc, now_utc),
+        )
+        for row in c.fetchall():
+            subj = row[1]
+            if subj.startswith("user:") and uid not in subj:
+                continue  # another user's claim — that user's reconcile owns it
+            orphan_active[row[0]] = row
     conn.close()
 
     active_ids = {row[0] for row in active_rows}
-    stale_ids = [p["id"] for p in indexed_points if p.get("domain") == "world_model_claim" and p.get("claim_id") not in active_ids]
+    stale_ids = [
+        p["id"] for p in indexed_points
+        if p.get("domain") == "world_model_claim" and p.get("claim_id")
+        and p["claim_id"] not in active_ids
+        and p["claim_id"] not in attributed_ids
+        and p["claim_id"] not in orphan_active
+    ]
 
     deleted = 0
     if stale_ids:
@@ -577,9 +707,17 @@ async def reconcile_user_vectors(user_id: str, collection_name: str = COLLECTION
 
     reindexed = 0
     for claim_id, subj, pred, obj_id, s_val, auth in active_rows:
-        if claim_id in indexed_claims:
+        if claim_id in indexed_claims and claim_id not in orphan_claim_ids:
             continue
-        await index_single_claim(claim_id, subj, pred, str(obj_id or s_val or ""), auth, uid)
+        await index_single_claim(claim_id, subj, pred, str(s_val or obj_id or ""), auth, uid)
+        reindexed += 1
+
+    # Orphan points on active non-user-subject claims: overwrite with correct
+    # owner attribution and content-first embedding text.
+    for claim_id, (cid, subj, pred, obj_id, s_val, auth) in orphan_active.items():
+        if cid in active_ids:
+            continue  # already re-indexed by the user-subject loop above
+        await index_single_claim(cid, subj, pred, str(s_val or obj_id or ""), auth, uid)
         reindexed += 1
 
     return {

@@ -225,7 +225,8 @@ def assert_claim(
     valid_to: Optional[str] = None,
     evidence_refs: Optional[List[str]] = None,
     parent_claim_ids: Optional[List[str]] = None,
-    claim_id: Optional[str] = None
+    claim_id: Optional[str] = None,
+    owner_user_id: Optional[str] = None
 ) -> str:
     """
     Assert an epistemic claim into the Active World Model.
@@ -312,8 +313,9 @@ def assert_claim(
         import asyncio
         from src.services.qdrant_client import index_single_claim
         loop = asyncio.get_running_loop()
-        u_id = subject_id.replace("user:", "") if subject_id.startswith("user:") else ""
-        loop.create_task(index_single_claim(cid, subject_id, predicate, str(object_id or scalar_value or ""), source_authority, u_id))
+        u_id = owner_user_id or (subject_id.replace("user:", "") if subject_id.startswith("user:") else "")
+        embed_value = scalar_str if scalar_str is not None else (str(object_id) if object_id else "")
+        loop.create_task(index_single_claim(cid, subject_id, predicate, embed_value, source_authority, u_id))
     except Exception as e:
         print(f" [VECTOR SYNC FAILED] claim={cid}: {type(e).__name__}: {e}")
 
@@ -484,6 +486,11 @@ def build_world_model_context(query: str, max_tokens: int = 180, user_id: Option
     return context_str
 
 
+# Diagnostics from the most recent build_semantic_world_model_context call.
+# Not part of the API — consumed by tests/harnesses to explain gate decisions.
+_LAST_RETRIEVAL_DIAG: Dict[str, Any] = {}
+
+
 async def build_semantic_world_model_context(query: str, max_tokens: int = 250, user_id: Optional[str] = None) -> str:
     """
     Semantic Memory RAG: Uses vector search (Qdrant) + entity resolution to inject
@@ -507,9 +514,14 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     vector_claims = []
     vector_dossiers = []
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # No intent detection of any kind — the embedding model is the sole
+    # relevance gate. Fetch a wide candidate pool and keep only what clears
+    # the score floor: broad queries naturally surface many hits, narrow
+    # ones few.
+    hits = []
     try:
         from src.services.qdrant_client import search_vectors
-        hits = await search_vectors(query, limit=6, user_id=target_user_id)
+        hits = await search_vectors(query, limit=100, user_id=target_user_id)
 
         # Vector points can lag SQLite (supersessions, missed indexing) — only
         # trust hits whose claim is still CURRENT in the knowledge graph.
@@ -526,12 +538,34 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                 ).fetchall()
                 active_claim_ids = {r[0] for r in rows}
 
+        # The relevance gate is score-relative and outlier-robust: the band is
+        # anchored ONLY on scores of results that are eligible to render
+        # (claims/dossiers). Non-claim domains (background knowledge, cached
+        # text, snapshots) never render, so letting them set the anchor lets
+        # adversarial prose drag the floor up and erase genuine claims. With
+        # fewer than three claim hits, fall back to the best claim score
+        # explicitly instead of silently anchoring on noise.
+        renderable_domains = ("world_model_claim", "world_model_dossier")
+        claim_scores_sorted = sorted(
+            (h.get("score", 0.0) for h in hits
+             if h.get("payload", {}).get("domain") in renderable_domains),
+            reverse=True,
+        )
+        non_claim_scores = sorted(
+            (h.get("score", 0.0) for h in hits
+             if h.get("payload", {}).get("domain") not in renderable_domains),
+            reverse=True,
+        )
+        if claim_scores_sorted:
+            anchor = claim_scores_sorted[2] if len(claim_scores_sorted) >= 3 else claim_scores_sorted[0]
+        else:
+            anchor = 0.0
+        relevance_floor = max(0.33, anchor - 0.10)
         for h in hits:
             score = h.get("score", 0.0)
             payload = h.get("payload", {})
             domain = payload.get("domain", "")
-            # Filter for semantic relevance (score >= 0.44)
-            if score >= 0.44:
+            if score >= relevance_floor:
                 if domain == "world_model_claim":
                     if payload.get("claim_id") and payload["claim_id"] not in active_claim_ids:
                         continue
@@ -545,17 +579,181 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                 elif domain == "world_model_dossier":
                     vector_dossiers.append({
                         "title": payload.get("title", ""),
-                        "text": payload.get("text", "")[:300],
+                        "text": payload.get("text", ""),
                         "score": score
                     })
         vector_claims.sort(key=lambda x: x["score"], reverse=True)
-        # No hard cap — let the token budget naturally limit how many
-        # claims appear in the prompt. Fragrance/allergy queries can
-        # have many relevant hits and all should be surfaced.
         vector_dossiers.sort(key=lambda x: x["score"], reverse=True)
-        vector_dossiers = vector_dossiers[:2]
     except Exception as e:
         logger.debug(f"Semantic vector search in world model context failed: {e}")
+
+    # 2b. Collection completeness from SQLite, gated purely by the embedding
+    # model's scores. Terse claims ("owns X") rank below rich dossiers in
+    # vector space, so a collection surfaces only a top-N slice of itself.
+    # When the same predicate survives the relevance band repeatedly, the
+    # query is about that whole cluster — pull every active claim for the
+    # predicates the search surfaced, from the authoritative KG. Whether a
+    # surfaced predicate cluster really is a collection is decided below by
+    # plateau shape on raw hits, not by count alone.
+    # Band-side predicate stats (kept for diagnostics; the plateau gate below
+    # works on raw hits instead).
+    pred_scores: Dict[str, List[float]] = {}
+    for c in vector_claims:
+        p = str(c.get("predicate", ""))
+        if p:
+            pred_scores.setdefault(p, []).append(float(c.get("score", 0.0)))
+
+    # Plateau detection over RAW top-100 claim hits (not band survivors).
+    # The band is a rendering filter; deciding expansion from band survivors
+    # is circular — a strong co-occurring cluster (e.g. dossiers on perfume
+    # queries) raises the floor and hides the very cluster expansion exists
+    # to recover. Instead, judge each predicate's own score distribution in
+    # the raw candidate pool:
+    #   enough claims   (>= MIN_CLUSTER_HITS in the raw top-100)
+    #   tight spread    (cluster max-min <= 0.15: one coherent plateau)
+    #   live cluster    (cluster bottom >= best claim score - 0.15: the cluster
+    #                    is topically engaged with this query, not incidental)
+    #   top-2 presence  (the cluster is one of the two largest raw claim
+    #                    groups: the query is about these, not a long tail)
+    # The "live cluster" check also kills the narrow-query false positive:
+    # when one specific claim towers over everything (e.g. a payment-due hit
+    # at 0.69 above an owns cluster at 0.38), the owns mass is background
+    # similarity, not a collection the query is asking for.
+    MIN_CLUSTER_HITS = 10
+    raw_pred_scores: Dict[str, List[float]] = {}
+    for h in hits:
+        payload = h.get("payload", {})
+        if payload.get("domain") == "world_model_claim" and payload.get("predicate"):
+            raw_pred_scores.setdefault(str(payload["predicate"]), []).append(float(h.get("score", 0.0)))
+    best_claim_score = claim_scores_sorted[0] if claim_scores_sorted else 0.0
+    raw_counts_ranked = sorted(
+        ((p, len(ss)) for p, ss in raw_pred_scores.items()), key=lambda kv: -kv[1]
+    )
+    cluster_eval = []
+    target_preds: set = set()
+    expansion_reason = "insufficient_claim_evidence"
+    if raw_counts_ranked:
+        for rank_i, (p, raw_count) in enumerate(raw_counts_ranked):
+            ss = raw_pred_scores[p]
+            if raw_count < MIN_CLUSTER_HITS:
+                continue
+            s_sorted = sorted(ss, reverse=True)
+            spread = s_sorted[0] - s_sorted[-1]
+            gap_ok = s_sorted[-1] >= best_claim_score - 0.15
+            top2 = rank_i < 2
+            is_plateau = spread <= 0.15 and gap_ok and top2
+            cluster_eval.append({
+                "predicate": p, "raw_count": raw_count,
+                "top": round(s_sorted[0], 3), "bottom": round(s_sorted[-1], 3),
+                "spread": round(spread, 3), "gap_ok": gap_ok, "top2": top2,
+                "plateau": is_plateau,
+            })
+            if is_plateau:
+                target_preds.add(p)
+        if target_preds:
+            expansion_reason = "broad_plateau"
+        elif cluster_eval:
+            expansion_reason = "no_plateau"
+        else:
+            expansion_reason = "narrow_query"
+
+    pre_expansion_count = len(vector_claims)
+
+    if target_preds:
+        with _get_connection() as conn:
+            user_rows = conn.execute(
+                "SELECT predicate, COALESCE(scalar_value, object_id), source_authority "
+                "FROM kg_claims WHERE subject_id = ? AND tx_retracted_at IS NULL "
+                "AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)",
+                (user_anchor, now_utc, now_utc),
+            ).fetchall()
+            other_rows = conn.execute(
+                "SELECT subject_id, predicate, COALESCE(scalar_value, object_id), source_authority "
+                "FROM kg_claims WHERE subject_id != ? AND tx_retracted_at IS NULL "
+                "AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)",
+                (user_anchor, now_utc, now_utc),
+            ).fetchall()
+
+        already = {str(c.get("scalar_value", "")).strip().lower() for c in vector_claims}
+
+        def _add_claim(subj: str, pred: str, val: str, auth, score: float):
+            if not val or val.lower() in already:
+                return False
+            already.add(val.lower())
+            vector_claims.append({
+                "subject_id": subj,
+                "predicate": pred,
+                "scalar_value": val,
+                "source_authority": auth or 4,
+                "score": score,
+            })
+            return True
+
+        # (a) the user's own claims for the predicates the search surfaced.
+        for pred, val, auth in user_rows:
+            if pred not in target_preds:
+                continue
+            _add_claim(user_anchor, pred, str(val or "").strip(), auth, 0.76)
+
+        # (b) claims about items the user possesses: match claim subjects
+        # against the possession list the search surfaced.
+        owned_names = [
+            str(r[1] or "").strip().lower()
+            for r in user_rows if r[0] == "owns" and str(r[1] or "").strip()
+        ]
+        item_claims: Dict[str, tuple] = {}  # (item, subject, predicate) -> shortest value wins
+        for subj, pred, val, auth in other_rows:
+            if pred not in target_preds:
+                continue
+            hay = f"{subj} {str(val or '')[:120]}".lower()
+            item = next((n for n in owned_names if n and n in hay), None)
+            if not item:
+                continue
+            key = (item, str(subj), str(pred))
+            cur = item_claims.get(key)
+            val_s = str(val or "").strip()
+            if cur is None or len(val_s) < len(cur[2]):
+                item_claims[key] = (subj, pred, val_s, auth)
+        for (item, subj, pred), (_s, pred, val, auth) in item_claims.items():
+            _add_claim(subj, pred, val, auth, 0.78)
+        vector_claims.sort(key=lambda x: x["score"], reverse=True)
+
+    expanded_claim_count = len(vector_claims) - pre_expansion_count
+    owns_scores = pred_scores.get("owns", [])
+    owns_spread = (max(owns_scores) - min(owns_scores)) if len(owns_scores) >= 2 else 0.0
+    owns_others_max = max(
+        (s for p, ss in pred_scores.items() if p != "owns" for s in ss),
+        default=0.0,
+    )
+    _LAST_RETRIEVAL_DIAG.clear()
+    _LAST_RETRIEVAL_DIAG.update({
+        "query": query,
+        "n_hits": len(hits),
+        "claim_domain_scores_top20": [round(s, 3) for s in claim_scores_sorted[:20]],
+        "non_claim_scores_top20": [round(s, 3) for s in non_claim_scores[:20]],
+        "non_claim_in_band": sum(1 for s in non_claim_scores if s >= relevance_floor),
+        "anchor": round(anchor, 3),
+        "band_floor": round(relevance_floor, 3),
+        "in_band_claims": pre_expansion_count,
+        "pred_in_band_counts": {p: len(ss) for p, ss in pred_scores.items()},
+        "pred_raw_counts": {e["predicate"]: e["raw_count"] for e in cluster_eval},
+        "owns_in_band": len(owns_scores),
+        "owns_score_spread": round(owns_spread, 3),
+        "owns_cluster_gap": round((min(owns_scores) - owns_others_max) if owns_scores else 0.0, 3),
+        "cluster_eval": cluster_eval,
+        "expansion_triggered": bool(target_preds),
+        "expansion_reason": expansion_reason,
+        "expanded_claim_count": expanded_claim_count,
+    })
+    # The budget follows the retrieval: everything the embedding model kept
+    # above the score floor gets room in the prompt. A narrow query injects
+    # a few lines; a collection-wide query injects the whole set.
+    retrieval_words = sum(
+        len(str(c.get("scalar_value", "")).split()) + 8
+        for c in vector_claims
+    ) + sum(len(d.get("text", "").split()) + 10 for d in vector_dossiers)
+    if retrieval_words:
+        max_tokens = max(max_tokens or 0, int(retrieval_words / 0.75) + 30)
 
     # 3. If explicit named entities were mentioned, pull their direct claims too
     entity_claims = []
@@ -566,12 +764,9 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
         entity_claims = subgraph.get("claims", [])
 
     # If no semantic hits, no dossiers, and no named entities matched:
-    # Do NOT stuff the prompt with random user facts. Return empty or clean fallback.
+    # Do NOT stuff the prompt with random user facts. The embedding model
+    # said nothing in memory is relevant — inject nothing.
     if not vector_claims and not vector_dossiers and not entity_claims:
-        # If query is a general financial health or dashboard check, fallback to standard build_world_model_context
-        general_keywords = {"overview", "dashboard", "how am i doing", "status", "profile", "summary", "everything", "all"}
-        if any(w in query.lower() for w in general_keywords):
-            return build_world_model_context(query, max_tokens=max_tokens, user_id=target_user_id)
         return ""
 
     target_max_words = int(max_tokens * 0.75) if max_tokens else 200
@@ -589,7 +784,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     # Display relevant dossiers (e.g. Fragrance Freeze or specific policy)
     if vector_dossiers:
         lines.append("[RELEVANT DIRECTIVES & DOSSIERS]")
-        for d in vector_dossiers[:2]:
+        for d in vector_dossiers:
             d_line = f"• [{d['title']}]: {d['text']}"
             lines.append(d_line)
             current_words += len(d_line.split())
@@ -608,11 +803,18 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
         for c in entity_claims
     ]
 
-    # Deduplicate claims by (subject_id, predicate)
+    # Deduplicate claims by (subject_id, predicate, value). Multi-value
+    # predicates like "owns" hold many distinct claims on the same
+    # (subject, predicate) pair — deduping on the pair alone collapses a
+    # 64-bottle fragrance collection into a single line.
     seen = set()
     deduped_claims = []
     for c in all_claims:
-        k = (c.get("subject_id"), c.get("predicate"))
+        k = (
+            c.get("subject_id"),
+            c.get("predicate"),
+            str(c.get("scalar_value", "")).strip().lower(),
+        )
         if k not in seen:
             seen.add(k)
             deduped_claims.append(c)
@@ -758,6 +960,96 @@ def search_world_model(query: str, limit: int = 5, user_id: Optional[str] = None
             return [{"error": f"FTS search error: {err}"}]
 
     return results
+
+async def search_world_model_semantic(query: str, limit: int = 5, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Vector-first world model search: Qdrant semantic hits merged with FTS5 BM25.
+    Falls back to pure FTS when the embedding/vector pipeline is unavailable.
+    """
+    results: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    target_user_id = str(user_id or get_primary_user_id()).strip()
+    user_prefix = f"user:{target_user_id}"
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        from src.services.qdrant_client import search_vectors
+        hits = await search_vectors(query, limit=max(limit * 2, 8), user_id=target_user_id)
+
+        # Only trust claim hits that are still CURRENT in SQLite (vectors lag
+        # supersessions/retractions).
+        hit_claim_ids = [
+            h.get("payload", {}).get("claim_id") for h in hits
+            if h.get("payload", {}).get("domain") == "world_model_claim"
+            and h.get("payload", {}).get("claim_id")
+        ]
+        active_claim_ids = set()
+        if hit_claim_ids:
+            with _get_connection() as conn:
+                placeholders = ",".join("?" for _ in hit_claim_ids)
+                rows = conn.execute(
+                    f"SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority "
+                    f"FROM kg_claims WHERE claim_id IN ({placeholders}) "
+                    "AND tx_retracted_at IS NULL AND valid_from <= ? "
+                    "AND (valid_to IS NULL OR valid_to > ?)",
+                    hit_claim_ids + [now_utc, now_utc],
+                ).fetchall()
+                active_claim_ids = {r[0] for r in rows}
+                active_rows = {r[0]: dict(r) for r in rows}
+
+        for h in hits:
+            payload = h.get("payload", {})
+            domain = payload.get("domain", "")
+            score = h.get("score", 0.0)
+            if score < 0.44:
+                continue
+            if domain == "world_model_claim":
+                cid = payload.get("claim_id")
+                if not cid or cid not in active_claim_ids:
+                    continue
+                row = active_rows[cid]
+                results.append({
+                    "target_id": cid,
+                    "target_type": "claim",
+                    "title": f"{row['subject_id']} -> {row['predicate']}",
+                    "content": str(row["object_id"] or row["scalar_value"] or ""),
+                    "predicate": row["predicate"],
+                    "source_authority": row["source_authority"],
+                    "score": round(score, 4),
+                    "retrieval": "vector",
+                })
+                seen_ids.add(cid)
+            elif domain == "world_model_dossier":
+                doc_id = payload.get("doc_id")
+                if not doc_id or doc_id in seen_ids:
+                    continue
+                results.append({
+                    "target_id": doc_id,
+                    "target_type": "dossier",
+                    "title": payload.get("title", ""),
+                    "content": str(payload.get("text", ""))[:300],
+                    "tags": payload.get("tags", ""),
+                    "score": round(score, 4),
+                    "retrieval": "vector",
+                })
+                seen_ids.add(doc_id)
+    except Exception as e:
+        logger.debug(f"Semantic world model search failed, falling back to FTS: {e}")
+
+    # Merge FTS results (exact/keyword matches the vector index may miss),
+    # skipping anything already surfaced by the vector pass.
+    for res in search_world_model(query, limit=limit, user_id=user_id):
+        tid = res.get("target_id")
+        if tid and tid in seen_ids:
+            continue
+        res["retrieval"] = "fts"
+        results.append(res)
+        if tid:
+            seen_ids.add(tid)
+
+    results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+    return results[:limit]
+
 
 def get_world_model_dossier(doc_id_or_title: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
