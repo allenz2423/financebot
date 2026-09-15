@@ -47,6 +47,12 @@ class StartFormView(discord.ui.View):
 
     @discord.ui.button(label="Start Form", style=discord.ButtonStyle.primary, emoji="📋")
     async def _start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(
+            f" [FORM] StartFormView._start interaction={interaction.id} "
+            f"user={interaction.user.id} channel={interaction.channel_id} "
+            f"session={self.session_id} owner={self.owner_uid}",
+            flush=True,
+        )
         if not self._is_owner(interaction):
             await interaction.response.send_message(
                 "Only the person who requested this form can fill it out.", ephemeral=True
@@ -91,7 +97,18 @@ class FormModal(discord.ui.Modal):
         return None
 
     async def on_submit(self, interaction: discord.Interaction):
+        print(
+            f" [FORM] on_submit interaction={interaction.id} "
+            f"user={interaction.user.id} channel={interaction.channel_id} "
+            f"session={self.session_id} page={self.page_index}",
+            flush=True,
+        )
         if interaction.user.id != self.owner_uid:
+            print(
+                f" [FORM] on_submit rejected: user={interaction.user.id} "
+                f"owner={self.owner_uid}",
+                flush=True,
+            )
             await interaction.response.send_message(
                 "Only the form owner can submit this form.", ephemeral=True
             )
@@ -99,27 +116,44 @@ class FormModal(discord.ui.Modal):
 
         sess = get_session(self.session_id)
         if sess is None:
+            print(
+                f" [FORM] on_submit rejected: session {self.session_id} "
+                f"not found",
+                flush=True,
+            )
             await interaction.response.send_message(
                 "This form session is no longer available.", ephemeral=True
             )
             return
+
+        await interaction.response.defer(ephemeral=True)
+        print(
+            f" [FORM] on_submit deferred interaction={interaction.id} "
+            f"session={self.session_id} page={self.page_index}",
+            flush=True,
+        )
 
         page = sess.pages[self.page_index]
         answers = {}
         for q in page["questions"]:
             text_input = self._find_input(q["key"])
             answers[q["key"]] = text_input.value if text_input else ""
+        print(
+            f" [FORM] answers recorded session={self.session_id} "
+            f"answers={list(answers.keys())}",
+            flush=True,
+        )
         record_answers(self.session_id, answers)
 
         total = len(sess.pages)
         if self.page_index < total - 1:
             view = PageAdvanceView(self.session_id, self.page_index + 1, self.owner_uid)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "✅ Answers recorded. Click below to continue.", view=view, ephemeral=True
             )
         else:
             summary = await svc_finalize_form(self.session_id)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ Form **{summary['form_title']}** complete — "
                 f"{len(summary['claims'])} answer(s) saved to your world model.",
                 ephemeral=True,
@@ -137,6 +171,12 @@ class PageAdvanceView(discord.ui.View):
 
     @discord.ui.button(label="Continue", style=discord.ButtonStyle.success, emoji="▶️")
     async def _continue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(
+            f" [FORM] PageAdvanceView._continue interaction={interaction.id} "
+            f"user={interaction.user.id} channel={interaction.channel_id} "
+            f"session={self.session_id} page={self.page_index}",
+            flush=True,
+        )
         if interaction.user.id != self.owner_uid:
             await interaction.response.send_message(
                 "Only the form owner can continue.", ephemeral=True
@@ -147,6 +187,11 @@ class PageAdvanceView(discord.ui.View):
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="✕")
     async def _close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(
+            f" [FORM] PageAdvanceView._close interaction={interaction.id} "
+            f"user={interaction.user.id} channel={interaction.channel_id}",
+            flush=True,
+        )
         await interaction.response.edit_message(view=None)
 
 

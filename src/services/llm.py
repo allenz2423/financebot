@@ -3632,7 +3632,7 @@ DECISION PROTOCOLS:
 - DEBT & LEAKAGE: Quantify Avalanche vs Snowball savings (calculate_debt_snowball_vs_avalanche), extra payment impacts (calculate_extra_payment_impact), score tier gains (simulate_credit_paydown_impact), checking cash drag (get_cash_drag_analysis), bank fees (detect_bank_fee_leakage), and bill increases (detect_unusual_bill_increases).
 
 CORE REASONING CYCLE:
-1. RECALL: Query Active World Model (get_world_model_entity, search_world_model, get_world_model_dossier).
+1. RECALL: The Active World Model context (entities, claims, dossiers) has ALREADY been auto-injected into this prompt by build_semantic_world_model_context. Do NOT re-issue get_world_model_entity/search_world_model/get_world_model_dossier calls to re-fetch what is already provided — only call them if the injected context is missing specific information you actually need.
 2. HYPOTHESIZE & REFUTE: Formulate 2-3 hypotheses; actively seek falsifying evidence.
 3. VERIFY: Query authoritative database/tool before asserting numbers or states.
 4. RESEARCH: Use search_web/fetch_webpage for external facts; prefer first-party sources.
@@ -5071,6 +5071,19 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 "get_sinking_funds_overview",
                 "adjust_savings_bucket",
             },
+        ),
+        # Schedule / classes / routine / commitments / calendar
+        (
+            ("schedule", "class", "classes", "routine", "commitment", "commitments", "calendar", "conversion", "holiday", "holidays", "term", "semester", "break"),
+            _CORE_READ_TOOLS | {
+                "get_world_model_entity",
+                "get_world_model_dossier",
+            },
+        ),
+        # Form questionnaire / interactive form feature
+        (
+            ("form", "questionnaire", "survey", "fill out", "fill in"),
+            _CORE_READ_TOOLS | {"request_user_form"},
         ),
         # Schedule / classes / routine / commitments / calendar
         (
@@ -7337,7 +7350,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         # Auto-map empty, user, me, self, or profile to current tenant user node
                         if not target or target.lower() in ("user", "me", "myself", "self", "user_profile", "profile"):
                             target = f"user:{uid}"
-                        res = get_world_model_entity(target)
+                        res = get_world_model_entity(target, user_id=uid)
                         db_result = json.dumps(res, separators=(',', ':'))
                     elif func_name == "search_world_model":
                         query_str = str(args.get("query", "")).strip()

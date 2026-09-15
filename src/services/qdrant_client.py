@@ -9,6 +9,7 @@ import os
 import json
 import time
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 import httpx
@@ -313,8 +314,13 @@ async def index_user_financial_profile(user_id: str) -> Dict[str, Any]:
             }
         })
 
-    # 3. Dossiers
-    c.execute("SELECT doc_id, primary_entity_id, title, content, tags FROM kg_dossiers")
+    # 3. Dossiers (user-scoped: only index dossiers where primary_entity_id
+    #    references the current user, to prevent cross-user data leakage)
+    c.execute(
+        "SELECT doc_id, primary_entity_id, title, content, tags FROM kg_dossiers "
+        "WHERE primary_entity_id = ? OR primary_entity_id LIKE ?",
+        (f"user:{uid}", f"%{uid}%")
+    )
     dossiers = c.fetchall()
     for row in dossiers:
         doc_id, ent_id, title, content, tags = row

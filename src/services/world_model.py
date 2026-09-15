@@ -95,7 +95,7 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
 
     with _get_connection() as conn:
         c = conn.cursor()
-        
+
         # 1. Direct scan against aliases and canonical names
         c.execute("SELECT entity_id, canonical_name, aliases FROM kg_entities")
         for row in c.fetchall():
@@ -108,7 +108,7 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
             if re.search(r"\b" + re.escape(name) + r"\b", normalized_q) or eid.lower() in normalized_q:
                 matched_ids.add(eid)
                 continue
-            
+
             try:
                 aliases = json.loads(row["aliases"]) if row["aliases"] else []
                 for alias in aliases:
@@ -549,7 +549,9 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                         "score": score
                     })
         vector_claims.sort(key=lambda x: x["score"], reverse=True)
-        vector_claims = vector_claims[:3]
+        # No hard cap — let the token budget naturally limit how many
+        # claims appear in the prompt. Fragrance/allergy queries can
+        # have many relevant hits and all should be surfaced.
         vector_dossiers.sort(key=lambda x: x["score"], reverse=True)
         vector_dossiers = vector_dossiers[:2]
     except Exception as e:
@@ -664,12 +666,20 @@ def explain_claim(claim_id: str) -> Dict[str, Any]:
 # 5b. COMPREHENSIVE QUERY & MANAGEMENT FUNCTIONS
 # ============================================================
 
-def get_world_model_entity(entity_id_or_name: str) -> Dict[str, Any]:
+def get_world_model_entity(entity_id_or_name: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Retrieve full profile and active claims for an entity by ID or name/alias.
+    Multi-tenant safe: entities belonging to other users are excluded.
     """
-    resolved = resolve_entities(entity_id_or_name)
+    resolved = resolve_entities(entity_id_or_name, user_id=user_id)
     target_id = resolved[0] if resolved else entity_id_or_name.strip().lower()
+    # If resolution found nothing and the input isn't a valid entity ID,
+    # fall back to the user anchor so the current user's profile is always reachable.
+    if not target_id or not resolved:
+        if user_id:
+            target_id = f"user:{user_id}"
+        else:
+            target_id = "primary_user"
 
     with _get_connection() as conn:
         c = conn.cursor()
@@ -679,15 +689,7 @@ def get_world_model_entity(entity_id_or_name: str) -> Dict[str, Any]:
         """, (target_id,))
         ent_row = c.fetchone()
         if not ent_row:
-            # Fallback exact canonical_name search
-            c.execute("""
-                SELECT entity_id, entity_type, canonical_name, aliases, attributes, created_at
-                FROM kg_entities WHERE lower(canonical_name) = ?
-            """, (entity_id_or_name.strip().lower(),))
-            ent_row = c.fetchone()
-            if not ent_row:
-                return {"error": f"Entity '{entity_id_or_name}' not found in Active World Model."}
-            target_id = ent_row["entity_id"]
+            return {"error": f"Entity '{entity_id_or_name}' not found or unauthorized."}
 
         subgraph = get_entity_subgraph([target_id], depth=1)
         entity_info = dict(ent_row)

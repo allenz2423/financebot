@@ -4988,7 +4988,9 @@ async def on_message(message: discord.Message):
     attachment_count = len(message.attachments or [])
     print(
         f" [MESSAGE] received id={message_id} author={message.author.id} "
-        f"content_chars={len(message.content or '')} attachments={attachment_count}",
+        f"channel={message.channel.id} guild={message.guild.id if message.guild else None} "
+        f"content_chars={len(message.content or '')} attachments={attachment_count} "
+        f"content={message.content!r}",
         flush=True,
     )
 
