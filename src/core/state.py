@@ -850,7 +850,24 @@ c.execute(
 conn.commit()
 
 SESSION_HISTORY: dict[str, list[dict]] = {}
-SESSION_HISTORY_MAX_TURNS = 200
+SESSION_HISTORY_MAX_TURNS = int(os.getenv("SESSION_HISTORY_MAX_TURNS", "1000"))
+
+# Rolling background context compression for SESSION_HISTORY. Old turns are
+# folded into small dense LLM digests (kept here) and their raw entries are
+# dropped from the live list; digests are injected ahead of the recent window
+# so deep context stays referenceable without blowing the prompt budget.
+# chat_history remains the authoritative raw store and is unaffected.
+SESSION_COMPRESSED: dict[str, list[dict]] = {}
+SESSION_COMPRESSION_INFLIGHT: set[str] = set()
+SESSION_COMPRESSION_ENABLED = os.getenv(
+    "SESSION_COMPRESSION_ENABLED", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+SESSION_COMPRESSION_MIN_ENTRIES = int(os.getenv("SESSION_COMPRESSION_MIN_ENTRIES", "80"))
+SESSION_COMPRESSION_BLOCK_ENTRIES = int(os.getenv("SESSION_COMPRESSION_BLOCK_ENTRIES", "40"))
+SESSION_COMPRESSION_KEEP_ENTRIES = int(os.getenv("SESSION_COMPRESSION_KEEP_ENTRIES", "60"))
+SESSION_COMPRESSION_MAX_DIGESTS = int(os.getenv("SESSION_COMPRESSION_MAX_DIGESTS", "6"))
+SESSION_COMPRESSION_DIGEST_MAX_CHARS = int(os.getenv("SESSION_COMPRESSION_DIGEST_MAX_CHARS", "1400"))
+SESSION_COMPRESSION_INJECT_MAX_CHARS = int(os.getenv("SESSION_COMPRESSION_INJECT_MAX_CHARS", "3500"))
 
 # Per-user audit state persists across "continue" turns.
 AUDIT_SESSION_STATE: dict[str, dict] = {}
@@ -891,8 +908,14 @@ def _decode_b64_arg(args: dict, key: str, legacy_key: str) -> str:
         # If it fails to decode, just return it as raw code.
         return raw
 
-def load_history_on_boot(limit: int = 20):
+# chat_history persists ~4 rows per advisor turn (user prompt, final reply,
+# tool trace, mutation trace), but SESSION_HISTORY keeps only the user and
+# final assistant entries per turn. Fetch 4x the turn budget so the requested
+# history depth survives a restart after the trace rows are filtered out.
+def load_history_on_boot(limit: int = 0):
     global SESSION_HISTORY
+    if limit <= 0:
+        limit = SESSION_HISTORY_MAX_TURNS * 4
     c.execute("SELECT DISTINCT user_id FROM chat_history")
     user_ids = [row[0] for row in c.fetchall()]
     for uid in user_ids:
@@ -901,9 +924,17 @@ def load_history_on_boot(limit: int = 20):
             (str(uid), limit),
         )
         rows = c.fetchall()[::-1]
-        SESSION_HISTORY[str(uid)] = [
-            {"role": role, "content": content} for role, content in rows
-        ]
+        history = []
+        for role, content in rows:
+            # Internal tool/mutation traces live in chat_history for audit but
+            # are deliberately excluded from conversational SESSION_HISTORY at
+            # append time (see llm.py). Keep boot restoration consistent.
+            if isinstance(content, str) and content.startswith(
+                ("AUTHORITATIVE TOOL ACTIVITY", "AUTHORITATIVE MUTATION RESULTS")
+            ):
+                continue
+            history.append({"role": role, "content": content})
+        SESSION_HISTORY[str(uid)] = history[-SESSION_HISTORY_MAX_TURNS:]
     print(f" [BOOT] Preloaded context into RAM for {len(user_ids)} user(s).")
 
 # ============================================================
@@ -1180,7 +1211,7 @@ conn.commit()
 
 
 
-__all__ = ['get_db', 'DB_PATH', 'SEARCH_CONCURRENCY', 'SEARCH_SCRAPE_MAX_CHARS', 'ACTIVE_ADVISOR_TASKS', 'MAX_SEARCH_ENGINES_PER_QUERY', 'STATUS_UPDATE_TASKS', 'SESSION_HISTORY_MAX_TURNS', 'DISCORD_TOKEN', 'DISCORD_CHANNEL_ID', '_ensure_column', 'MAX_SEARCH_RESULTS_PER_ENGINE', 'USER_INTERRUPTS', 'ADVISOR_FINAL_NUM_PREDICT', 'tx_queue', 'health_check', 'conn', 'SEARXNG_URL', 'app', 'PLAYWRIGHT_WAIT_MS', 'AUDIT_SESSION_STATE', '_decode_b64_arg', '_resolve_known_merchant', 'PDF_RENDER_SCALE', 'MAX_RESEARCH_LINKS_PER_PAGE', '_advisor_status_snapshot', 'load_history_on_boot', 'MAX_RESEARCH_FETCHES_PER_SEARCH', 'SUPPORTED_PDF_CONTENT_TYPES', 'ADVISOR_TASK_REGISTRATION_LOCK', 'CHAT_HISTORY_TURNS', 'MAX_TOTAL_TOOL_CALLS', 'ADVISOR_STATUS_LOCK', '_RESEARCHED_MERCHANTS', 'MAX_SEARCH_ATTEMPTS_PER_ITEM', 'ADVISOR_TOOL_NUM_PREDICT', 'ADVISOR_STATUS', 'MAX_TOOL_ROUNDS', 'ADVISOR_NUM_PREDICT', 'SEARCH_CACHE_TTL_SECONDS', 'ADVISOR_MODEL', 'OLLAMA_URL', '_merchant_key', 'DELILAH_BUILD', 'PLAYWRIGHT_ENABLED', 'JINA_API_KEY', 'MAX_TOOL_CALLS_PER_ROUND', 'bot', 'PLAID_SYNC_STATE', 'SESSION_HISTORY', 'MODEL_KEEP_ALIVE', 'PLAYWRIGHT_CONCURRENCY', 'c', 'MAX_RESEARCH_LEDGER_ITEMS', '_research_set', 'SEARCH_HTTP_TIMEOUT', 'PDF_MAX_PAGES', 'ADVISOR_NUM_CTX', 'RESEARCH_PAGE_CACHE_TTL_SECONDS', 'MAX_RESEARCH_CRAWL_PAGES_PER_ITEM', 'MAX_SEARCH_UNIQUE_RESULTS', 'SEARCH_SCRAPE_TOP_N', 'intents', '_set_advisor_status', 'MAX_RESEARCH_QUEUE_SIZE', 'PLAYWRIGHT_TIMEOUT_MS', 'STATUS_MESSAGES', 'MAX_RESEARCH_CRAWL_DEPTH', '_audit_remaining_from_result', '_original_count', 'PLAYWRIGHT_HEADLESS', 'SEARCH_TIME_RANGE']
+__all__ = ['get_db', 'DB_PATH', 'SEARCH_CONCURRENCY', 'SEARCH_SCRAPE_MAX_CHARS', 'ACTIVE_ADVISOR_TASKS', 'MAX_SEARCH_ENGINES_PER_QUERY', 'STATUS_UPDATE_TASKS', 'SESSION_HISTORY_MAX_TURNS', 'SESSION_COMPRESSED', 'SESSION_COMPRESSION_ENABLED', 'SESSION_COMPRESSION_MIN_ENTRIES', 'SESSION_COMPRESSION_BLOCK_ENTRIES', 'SESSION_COMPRESSION_KEEP_ENTRIES', 'SESSION_COMPRESSION_MAX_DIGESTS', 'SESSION_COMPRESSION_DIGEST_MAX_CHARS', 'SESSION_COMPRESSION_INJECT_MAX_CHARS', 'SESSION_COMPRESSION_INFLIGHT', 'DISCORD_TOKEN', 'DISCORD_CHANNEL_ID', '_ensure_column', 'MAX_SEARCH_RESULTS_PER_ENGINE', 'USER_INTERRUPTS', 'ADVISOR_FINAL_NUM_PREDICT', 'tx_queue', 'health_check', 'conn', 'SEARXNG_URL', 'app', 'PLAYWRIGHT_WAIT_MS', 'AUDIT_SESSION_STATE', '_decode_b64_arg', '_resolve_known_merchant', 'PDF_RENDER_SCALE', 'MAX_RESEARCH_LINKS_PER_PAGE', '_advisor_status_snapshot', 'load_history_on_boot', 'MAX_RESEARCH_FETCHES_PER_SEARCH', 'SUPPORTED_PDF_CONTENT_TYPES', 'ADVISOR_TASK_REGISTRATION_LOCK', 'CHAT_HISTORY_TURNS', 'MAX_TOTAL_TOOL_CALLS', 'ADVISOR_STATUS_LOCK', '_RESEARCHED_MERCHANTS', 'MAX_SEARCH_ATTEMPTS_PER_ITEM', 'ADVISOR_TOOL_NUM_PREDICT', 'ADVISOR_STATUS', 'MAX_TOOL_ROUNDS', 'ADVISOR_NUM_PREDICT', 'SEARCH_CACHE_TTL_SECONDS', 'ADVISOR_MODEL', 'OLLAMA_URL', '_merchant_key', 'DELILAH_BUILD', 'PLAYWRIGHT_ENABLED', 'JINA_API_KEY', 'MAX_TOOL_CALLS_PER_ROUND', 'bot', 'PLAID_SYNC_STATE', 'SESSION_HISTORY', 'MODEL_KEEP_ALIVE', 'PLAYWRIGHT_CONCURRENCY', 'c', 'MAX_RESEARCH_LEDGER_ITEMS', '_research_set', 'SEARCH_HTTP_TIMEOUT', 'PDF_MAX_PAGES', 'ADVISOR_NUM_CTX', 'RESEARCH_PAGE_CACHE_TTL_SECONDS', 'MAX_RESEARCH_CRAWL_PAGES_PER_ITEM', 'MAX_SEARCH_UNIQUE_RESULTS', 'SEARCH_SCRAPE_TOP_N', 'intents', '_set_advisor_status', 'MAX_RESEARCH_QUEUE_SIZE', 'PLAYWRIGHT_TIMEOUT_MS', 'STATUS_MESSAGES', 'MAX_RESEARCH_CRAWL_DEPTH', '_audit_remaining_from_result', '_original_count', 'PLAYWRIGHT_HEADLESS', 'SEARCH_TIME_RANGE']
 
 import contextvars
 CURRENT_USER_ID = contextvars.ContextVar('current_user_id', default='1')

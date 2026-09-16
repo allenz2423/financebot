@@ -5015,6 +5015,11 @@ async def wipe_memory(ctx: commands.Context):
     except Exception:
         pass
     try:
+        SESSION_COMPRESSED.pop(uid, None)
+        SESSION_COMPRESSION_INFLIGHT.discard(uid)
+    except Exception:
+        pass
+    try:
         c.execute("DELETE FROM chat_history WHERE user_id = ?", (uid,))
         conn.commit()
     except Exception as e:
@@ -5090,7 +5095,7 @@ async def on_ready():
     print("Advisor controls: !cancel / !status")
     print("==========================================")
 
-    load_history_on_boot(limit=100)
+    load_history_on_boot()
 
     print(f" [DEBUG] on_ready: BACKGROUND_TASKS_STARTED={BACKGROUND_TASKS_STARTED}", flush=True)
     if BACKGROUND_TASKS_STARTED:

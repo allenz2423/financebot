@@ -3845,11 +3845,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # merchants, budgets, etc. and therefore must not be exposed merely
     # because SESSION_HISTORY is normally reused across advisor turns.
     # We maintain a clean, high-signal recent turn window to avoid context pollution.
-    history = (
-        SESSION_HISTORY[uid][-14:]
-        if context_policy["include_session_history"]
-        else []
-    )
+    if context_policy["include_session_history"]:
+        # Compressed digests of folded-away turns come first, then the recent
+        # raw window. Digests carry deep context economically so the 1000-turn
+        # history stays referenceable without paying full token cost.
+        history = _compressed_digest_messages(uid) + SESSION_HISTORY[uid][-14:]
+    else:
+        history = []
 
     # Strict chat templates require exactly one system message first.
     messages: list[dict] = [
@@ -8521,6 +8523,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Internal tool/mutation traces are intentionally NOT persisted into
     # conversational model history. They must never be exposed as assistant speech.
     SESSION_HISTORY[uid] = SESSION_HISTORY[uid][-SESSION_HISTORY_MAX_TURNS:]
+    _maybe_schedule_compression(uid)
 
     c.execute(
         "INSERT INTO chat_history (user_id, role, content, created_at) VALUES (?, 'user', ?, datetime('now'))",
@@ -8651,6 +8654,185 @@ async def auto_extract_and_persist_claims(prompt_text: str, user_id: str):
                 print(f" [BACKGROUND MEMORY PERSISTED] uid={user_id} claim={cid} {pred}: {val}")
     except Exception as e:
         print(f" [BACKGROUND MEMORY EXTRACTOR ERROR]: {e}")
+
+# ============================================================
+# Session history compression
+# ============================================================
+def _turn_text_for_digest(entry: dict) -> str:
+    """Render one SESSION_HISTORY entry compactly for the summarizer input."""
+    try:
+        role = str(entry.get("role") or "user")
+        content = str(entry.get("content") or "")
+        if not content.strip():
+            return ""
+        content = content.strip()[:1200]
+        return f"{role.upper()}: {content}"
+    except Exception:
+        return ""
+
+
+def _maybe_schedule_compression(uid: str):
+    """If history is deep enough, spawn one background digest fold per uid.
+
+    Only the oldest expendable block (everything past the keep-window) is
+    folded; a failed or empty digest leaves the raw entries untouched, so
+    compression can never lose data.
+    """
+    try:
+        uid = str(uid)
+        if not SESSION_COMPRESSION_ENABLED:
+            return
+        if uid in SESSION_COMPRESSION_INFLIGHT:
+            return
+        entries = SESSION_HISTORY.get(uid) or []
+        foldable = len(entries) - SESSION_COMPRESSION_KEEP_ENTRIES
+        if foldable < SESSION_COMPRESSION_BLOCK_ENTRIES:
+            return
+        if len(entries) < SESSION_COMPRESSION_MIN_ENTRIES:
+            return
+        SESSION_COMPRESSION_INFLIGHT.add(uid)
+        asyncio.create_task(_compress_session_history(uid))
+    except Exception as e:
+        print(f" [COMPRESSION QUEUE ERROR] uid={uid} {e}")
+
+
+async def _compress_session_history(uid: str):
+    """Background task: sumarize the oldest block, then drop its raw entries."""
+    try:
+        entries = SESSION_HISTORY.get(uid) or []
+        block = entries[:SESSION_COMPRESSION_BLOCK_ENTRIES]
+        if not block:
+            return
+
+        block_text = "\n\n".join(
+            t for t in (_turn_text_for_digest(m) for m in block) if t
+        )
+        if not block_text:
+            return
+
+        digest = await _summarize_history_block(block_text)
+        if not digest or not digest.strip():
+            print(f" [COMPRESSION] uid={uid} digest empty, keeping raw block")
+            return
+
+        digests = SESSION_COMPRESSED.setdefault(uid, [])
+        digests.append(
+            {"content": digest.strip()[:SESSION_COMPRESSION_DIGEST_MAX_CHARS], "entries_covered": len(block)}
+        )
+        del digests[:-SESSION_COMPRESSION_MAX_DIGESTS]
+
+        # Drop only the exact block we summarized (chat_history still has it).
+        current = SESSION_HISTORY.get(uid) or []
+        if current and current[: len(block)] == block:
+            SESSION_HISTORY[uid] = current[len(block):][-SESSION_HISTORY_MAX_TURNS:]
+        print(
+            f" [COMPRESSION] uid={uid} folded {len(block)} entries into digest"
+            f" ({len(SESSION_COMPRESSED.get(uid, []))} digest(s),"
+            f" {len(SESSION_HISTORY.get(uid) or [])} raw entries live)"
+        )
+    except Exception as e:
+        print(f" [COMPRESSION ERROR] uid={uid} {e}")
+    finally:
+        SESSION_COMPRESSION_INFLIGHT.discard(uid)
+
+
+async def _summarize_history_block(block_text: str) -> str:
+    """One dense digest for a folded block. Mirrors the background claim extractor."""
+    summarize_sys = (
+        "You are Delilah's Session History Compactor.\n"
+        "Convert the conversation block below into a dense factual digest that "
+        "preserves every concrete fact, decision, number, preference, plan, "
+        "commitment, and open item that a future advisor turn would need — but "
+        "discards pleasantries and repetition.\n"
+        "Output ONLY the digest as plain text, 100-250 words."
+    )
+    user_msg = f"Conversation block:\n{block_text}"
+    try:
+        provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        if provider == "openai":
+            openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
+            openai_model = os.getenv("OPENAI_MODEL", "openrouter/auto-beta")
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": openai_model,
+                "messages": [
+                    {"role": "system", "content": summarize_sys},
+                    {"role": "user", "content": user_msg}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 400
+            }
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                res = await client.post(openai_url, json=payload, headers=headers)
+                if res.status_code == 200:
+                    return res.json()["choices"][0]["message"]["content"]
+        else:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                res = await client.post(
+                    OLLAMA_URL,
+                    json={
+                        "model": src.core.state.ADVISOR_MODEL,
+                        "messages": [
+                            {"role": "system", "content": summarize_sys},
+                            {"role": "user", "content": user_msg}
+                        ],
+                        "stream": False,
+                        "options": {"temperature": 0.2, "num_predict": 400}
+                    }
+                )
+                if res.status_code == 200:
+                    return res.json().get("message", {}).get("content", "")
+        return ""
+    except Exception as e:
+        print(f" [COMPRESSION SUMMARIZE ERROR] {e}")
+        return ""
+
+
+def _compressed_digest_messages(uid: str) -> list[dict]:
+    """Build the injectable digest messages (oldest digest first).
+
+    Newest digests are prioritized under the character budget: older digests
+    are dropped whole (never sliced mid-digest) until the newest fit, and
+    chronology is preserved among the survivors. The block is labeled as
+    contextual memory so the model knows the verbatim recent window that
+    follows takes precedence over any summary.
+    """
+    digests = SESSION_COMPRESSED.get(str(uid)) or []
+    if not digests:
+        return []
+    parts = [d.get("content", "") for d in digests if d.get("content")]
+    if not parts:
+        return []
+
+    budget = max(1, int(SESSION_COMPRESSION_INJECT_MAX_CHARS) or 3500)
+    kept: list[str] = []
+    used = 0
+    for content in reversed(parts):
+        add = len(content) + (len("\n\n---\n\n") if kept else 0)
+        if kept and used + add > budget:
+            break
+        kept.append(content)
+        used += add
+    if not kept:
+        kept = [parts[-1]]
+    kept.reverse()  # restore chronological order (oldest → newest)
+
+    omitted = len(parts) - len(kept)
+    body = "\n\n---\n\n".join(kept)
+    header = (
+        "[COMPRESSED PRIOR CONVERSATION — contextual memory, not verbatim]\n"
+        "The compressed block below summarizes earlier conversation and may "
+        "omit or compress details. Treat it as background context: the "
+        "verbatim recent messages that follow take precedence wherever they "
+        "conflict with this summary."
+    )
+    if omitted > 0:
+        header += (
+            f"\n({omitted} older digest(s) omitted to fit the context budget.)"
+        )
+    return [{"role": "assistant", "content": header + "\n\n" + body}]
+
 
 async def chat_with_delilah(
     prompt_text: str,
