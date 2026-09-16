@@ -513,6 +513,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     # 2. Semantic vector search via Qdrant for relevant claims/dossiers
     vector_claims = []
     vector_dossiers = []
+    vector_web = []
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     # No intent detection of any kind — the embedding model is the sole
     # relevance gate. Fetch a wide candidate pool and keep only what clears
@@ -573,6 +574,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                         "subject_id": payload.get("subject_id", user_anchor),
                         "predicate": payload.get("predicate", "fact"),
                         "scalar_value": payload.get("value", ""),
+                        "claim_id": payload.get("claim_id"),
                         "source_authority": payload.get("authority", 5),
                         "score": score
                     })
@@ -582,8 +584,19 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                         "text": payload.get("text", ""),
                         "score": score
                     })
+                elif domain == "web_search_result":
+                    vector_web.append({
+                        "url": str(payload.get("url", "") or ""),
+                        "title": str(payload.get("title", "") or ""),
+                        "section_name": str(payload.get("section_name", "") or ""),
+                        "query": str(payload.get("query", "") or ""),
+                        "fetched_at": str(payload.get("fetched_at", "") or ""),
+                        "text": str(payload.get("text", "") or ""),
+                        "score": score
+                    })
         vector_claims.sort(key=lambda x: x["score"], reverse=True)
         vector_dossiers.sort(key=lambda x: x["score"], reverse=True)
+        vector_web.sort(key=lambda x: x["score"], reverse=True)
     except Exception as e:
         logger.debug(f"Semantic vector search in world model context failed: {e}")
 
@@ -747,13 +760,42 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     })
     # The budget follows the retrieval: everything the embedding model kept
     # above the score floor gets room in the prompt. A narrow query injects
-    # a few lines; a collection-wide query injects the whole set.
+    # a few lines; a collection-wide query injects the whole set. Web findings
+    # are capped at two entries and contribute a small title+summary share.
     retrieval_words = sum(
         len(str(c.get("scalar_value", "")).split()) + 8
         for c in vector_claims
     ) + sum(len(d.get("text", "").split()) + 10 for d in vector_dossiers)
+    retrieval_words += sum(40 + len(w.get("text", "").split()) // 8 for w in vector_web)
     if retrieval_words:
         max_tokens = max(max_tokens or 0, int(retrieval_words / 0.75) + 30)
+
+    # Pinned (immutable) knowledge: user-confirmed claims and URLs render with
+    # a (PINNED) marker so the model treats them as authoritative without
+    # re-verification. Pins are user-scoped; the table may not exist yet on
+    # older DBs, so degrade to an empty set rather than failing retrieval.
+    pinned_urls = set()
+    immutable_claim_keys = set()
+    try:
+        with _get_connection() as conn:
+            pin_rows = conn.execute(
+                "SELECT url FROM web_knowledge_pins WHERE user_id = ?",
+                (target_user_id,),
+            ).fetchall()
+            for r in pin_rows:
+                u = str(r["url"] or "").strip().rstrip("/")
+                if u:
+                    pinned_urls.add(u)
+            imm_rows = conn.execute(
+                "SELECT predicate, scalar_value FROM kg_claims WHERE immutable = 1"
+            ).fetchall()
+            for r in imm_rows:
+                val = str(r["scalar_value"] or "").strip()
+                if val:
+                    immutable_claim_keys.add((str(r["predicate"] or ""), val.lower()))
+    except Exception:
+        pinned_urls = set()
+        immutable_claim_keys = set()
 
     # 3. If explicit named entities were mentioned, pull their direct claims too
     entity_claims = []
@@ -765,8 +807,9 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
 
     # If no semantic hits, no dossiers, and no named entities matched:
     # Do NOT stuff the prompt with random user facts. The embedding model
-    # said nothing in memory is relevant — inject nothing.
-    if not vector_claims and not vector_dossiers and not entity_claims:
+    # said nothing in memory is relevant — inject nothing. A lone web finding
+    # above the floor is still injected: surfacing past research is the point.
+    if not vector_claims and not vector_dossiers and not vector_web and not entity_claims:
         return ""
 
     target_max_words = int(max_tokens * 0.75) if max_tokens else 200
@@ -798,6 +841,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
             "subject_id": c.get("subject_id"),
             "predicate": c.get("predicate"),
             "scalar_value": c.get("scalar_value") or c.get("object_id"),
+            "claim_id": c.get("claim_id") or c.get("id"),
             "source_authority": c.get("source_authority", 4),
         }
         for c in entity_claims
@@ -822,14 +866,92 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     if deduped_claims:
         lines.append("[RELEVANT GROUND TRUTH CLAIMS]")
         for c in deduped_claims:
-            claim_line = f"• {c['subject_id']} -> {c['predicate']}: {c['scalar_value']} (Auth: {c.get('source_authority', 5)}/5)"
+            pinned_mark = " (PINNED)" if (
+                str(c["predicate"] or "").strip() and
+                str(c.get("scalar_value", "") or "").strip().lower() in {
+                    v for p, v in immutable_claim_keys if p == str(c["predicate"] or "").strip()
+                }
+            ) else ""
+            claim_id_mark = f" (claim: {c['claim_id']})" if c.get("claim_id") else ""
+            claim_line = f"• {c['subject_id']} -> {c['predicate']}: {c['scalar_value']} (Auth: {c.get('source_authority', 5)}/5){claim_id_mark}{pinned_mark}"
             lines.append(claim_line)
             current_words += len(claim_line.split())
             if current_words >= target_max_words:
                 break
 
+    # Prior web research: past search/fetch results that cleared the relevance
+    # floor. Rendering these lets the model answer from stored research
+    # instead of re-running search_web/fetch_webpage. Entries carry the URL
+    # (so a still-open question can be re-verified deliberately) and either a
+    # (PINNED) marker for user-confirmed authority or an age marker.
+    if vector_web:
+        lines.append("[PRIOR WEB RESEARCH]")
+        for w in vector_web[:2]:
+            if not w.get("url"):
+                continue
+            age_mark = ""
+            if w.get("fetched_at"):
+                try:
+                    fd = datetime.strptime(w["fetched_at"], "%Y-%m-%d %H:%M:%S")
+                    age_days = max(0, (datetime.now(timezone.utc) - fd.replace(tzinfo=timezone.utc)).days)
+                    age_mark = f" (age: {age_days}d)"
+                except Exception:
+                    age_mark = ""
+            url_norm = w["url"].strip().rstrip("/")
+            trust_mark = " (PINNED)" if url_norm in pinned_urls else age_mark
+            w_title = w.get("title") or w.get("url")
+            if w.get("section_name"):
+                w_title = f"{w_title} [{w['section_name']}]"
+            summary = re.sub(r"\s+", " ", w.get("text", "") or " ").strip()
+            if len(summary) > 280:
+                summary = summary[:277].rstrip() + "..."
+            lines.append(f"• [WEB] {w_title} — {w['url']}{trust_mark}: {summary}")
+            current_words += 40 + len(summary.split()) // 4
+            if current_words >= target_max_words:
+                break
+        lines.append("")
+
     lines.append("==================================================")
     return "\n".join(lines)
+
+
+def pin_knowledge_immutable(user_id: str, kind: str, ref: str, reason: str = "") -> str:
+    """Pin a claim or web URL as immutable knowledge for the user.
+
+    Pinned claims get kg_claims.immutable = 1; pinned URLs are recorded in
+    web_knowledge_pins. Both render with a (PINNED) marker in semantic
+    context, which tells the advisor the fact is user-confirmed authority and
+    must not be re-verified or silently contradicted by newer web noise.
+    """
+    user_id = str(user_id or "").strip()
+    kind = str(kind or "").strip().lower()
+    ref = str(ref or "").strip()
+    if not user_id or kind not in ("claim", "web") or not ref:
+        return (
+            "pin_knowledge_immutable requires kind ('claim' | 'web') and ref "
+            "(a claim_id or a URL)."
+        )
+
+    if kind == "claim":
+        with _get_connection() as conn:
+            row = conn.execute(
+                "SELECT claim_id FROM kg_claims WHERE claim_id = ?", (ref,)
+            ).fetchone()
+            if row is None:
+                return f"No claim found with claim_id {ref}; nothing pinned."
+            conn.execute(
+                "UPDATE kg_claims SET immutable = 1 WHERE claim_id = ?", (ref,)
+            )
+            conn.commit()
+        return f"Pinned claim {ref} as immutable. It will render with a (PINNED) marker and not require re-verification."
+
+    with _get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO web_knowledge_pins (user_id, url, reason) VALUES (?, ?, ?)",
+            (user_id, str(ref)[:2048], str(reason or "")[:500]),
+        )
+        conn.commit()
+    return f"Pinned {ref} as immutable web knowledge. It will render with a (PINNED) marker."
 
 # ============================================================
 # 5. EXPLAINABILITY & PROVENANCE AUDIT
@@ -960,6 +1082,53 @@ def search_world_model(query: str, limit: int = 5, user_id: Optional[str] = None
             return [{"error": f"FTS search error: {err}"}]
 
     return results
+
+
+def list_world_model_claims(
+    predicate: Optional[str] = None,
+    subject_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    value_contains: str = "",
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """
+    Deterministic enumeration of claims from SQLite — NOT semantic search.
+    Use for "list all my X" / "how many X do I have" questions: every active
+    claim is returned regardless of embedding similarity.
+    """
+    resolved_subject = subject_id or (f"user:{user_id}" if user_id else None)
+    sql = [
+        "SELECT claim_id, subject_id, predicate, object_id, scalar_value,",
+        "provenance_type, source_authority, valid_from, tx_asserted_at",
+        "FROM kg_claims WHERE tx_retracted_at IS NULL",
+    ]
+    params: List[Any] = []
+    if predicate:
+        sql.append("AND predicate = ?")
+        params.append(predicate.strip())
+    if resolved_subject:
+        sql.append("AND subject_id = ?")
+        params.append(resolved_subject)
+    if value_contains:
+        sql.append("AND LOWER(scalar_value) LIKE ?")
+        params.append(f"%{value_contains.lower()}%")
+    sql.append("ORDER BY tx_asserted_at DESC LIMIT ?")
+    params.append(max(1, min(int(limit), 500)))
+
+    with _get_connection() as conn:
+        c = conn.cursor()
+        c.execute(" ".join(sql), params)
+        rows = [dict(r) for r in c.fetchall()]
+        total_active = c.execute(
+            "SELECT COUNT(*) FROM kg_claims WHERE tx_retracted_at IS NULL"
+        ).fetchone()[0]
+
+    return {
+        "count": len(rows),
+        "total_active_claims_in_model": total_active,
+        "truncated": len(rows) >= max(1, min(int(limit), 500)),
+        "claims": rows,
+    }
 
 async def search_world_model_semantic(query: str, limit: int = 5, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """

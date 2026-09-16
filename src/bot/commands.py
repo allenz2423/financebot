@@ -76,10 +76,12 @@ from src.core.state import *
 from src.utils.helpers import *
 from src.services.search import *
 from src.services.gmail import (
+    backfill_gmail_messages,
     begin_gmail_authorization,
     complete_gmail_authorization,
     disconnect_gmail,
     gmail_status,
+    list_gmail_messages,
 )
 from src.db.queries import *
 from src.services.llm import *
@@ -179,6 +181,117 @@ class _HelpPageView(discord.ui.View):
             pass
 
 
+class _GmailHistoryView(discord.ui.View):
+    """Paginated, closable viewer for the stored mail archive."""
+
+    PAGE_SIZE = 8
+
+    def __init__(self, ctx: commands.Context, rows: list[dict]):
+        super().__init__(timeout=300)
+        self.ctx = ctx
+        self.rows = rows or []
+        self.page = 0
+        self._message: discord.Message | None = None
+        REPORT_CONTROL_VIEWS.setdefault(ctx.author.id, set()).add(self)
+        self._refresh_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+    def _page_rows(self) -> list[dict]:
+        start = self.page * self.PAGE_SIZE
+        return self.rows[start:start + self.PAGE_SIZE]
+
+    def _refresh_buttons(self) -> None:
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.total_pages - 1
+        self.page_indicator.label = f"{self.page + 1} / {self.total_pages}"
+
+    def _embed(self) -> discord.Embed:
+        title = " Gmail archive"
+        if self.total_pages > 1:
+            title = f"{title} · {self.page + 1}/{self.total_pages}"
+        embed = discord.Embed(title=title, color=discord.Color.blurple())
+        if not self.rows:
+            embed.description = (
+                " No stored mail yet. New messages are archived automatically "
+                "when the watcher detects them."
+            )
+        else:
+            lines = []
+            for r in self._page_rows():
+                marker = " ⚠ truncated" if r["body_truncated"] else ""
+                lines.append(
+                    f"**{r['subject'] or '(no subject)'}**{marker}\n"
+                    f"{(r['sender_email'] or '?')} · {r['date'] or '?'} "
+                    f"· seen {r['seen_at']}"
+                )
+                snippet = (r.get("snippet") or "").strip()
+                if snippet:
+                    lines.append(f"*{snippet[:150]}*")
+            embed.description = "\n\n".join(lines) or "No content."
+            embed.set_footer(text=f"{len(self.rows)} stored message(s) · bodies archived")
+        return embed
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(
+                " Only the person who ran this command can use these controls.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _update(self, interaction: discord.Interaction) -> None:
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.primary, disabled=True)
+    async def page_indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.page = min(self.total_pages - 1, self.page + 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label=" Close", style=discord.ButtonStyle.danger)
+    async def close_current(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        REPORT_CONTROL_MESSAGES.get(self.ctx.author.id, set()).discard(self._message)
+        REPORT_CONTROL_VIEWS.get(self.ctx.author.id, set()).discard(self)
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+    @discord.ui.button(label=" Close All", style=discord.ButtonStyle.danger)
+    async def close_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer()
+        await _close_all_control_messages(self.ctx.author.id)
+
+    async def on_timeout(self) -> None:
+        REPORT_CONTROL_VIEWS.get(self.ctx.author.id, set()).discard(self)
+        try:
+            if self._message is not None:
+                for child in self.children:
+                    child.disabled = True
+                await self._message.edit(view=self)
+        except Exception:
+            pass
+
+
 @bot.command(name="help")
 async def help_command(ctx: commands.Context, *, section: str = ""):
     user_id = str(ctx.author.id)
@@ -258,7 +371,12 @@ async def help_command(ctx: commands.Context, *, section: str = ""):
          "`!clear` / `!clearchat` — Clear chat history or context.\n"
          "`!testpush [msg]` — Send a test push notification to your phone via ntfy.\n"
          "`!ntfysetup` — DM yourself secret ntfy topic and instructions.\n"
-         "`!gmail connect|status|disconnect` — Connect Gmail account via read-only OAuth."),
+         "`!gmail connect` — Connect Gmail via read-only OAuth; new mail is DM-digested (~60s poll).\n"
+         "`!gmail status` — Show Gmail connection and watch state.\n"
+         "`!gmail disconnect` — Remove the Gmail connection and stop watching.\n"
+         "`!gmail autoparse on|off` — Opt new mail into LLM triage (off = digest only).\n"
+         "`!gmail history [limit]` — Paginated archived mail (bodies are stored per user).\n"
+         "`!gmail backfill [count|all]` — Archive the last N emails, or ALL mail (default 25)."),
 
         ("Memory & Knowledge Graph",
          "`!inspectmemory` (aliases: `!memories`, `!viewmemory`) — Paginated view of active world model claims and saved notes.\n"
@@ -335,9 +453,12 @@ async def gmail_cmd(ctx: commands.Context):
     if ctx.invoked_subcommand is None:
         await ctx.send(
             "**Gmail controls**\n"
-            "`!gmail connect` — Connect your Gmail account.\n"
+            "`!gmail connect` — Connect your Gmail account (read-only OAuth).\n"
             "`!gmail status` — Show Gmail connection status.\n"
-            "`!gmail disconnect` — Remove the Gmail connection."
+            "`!gmail disconnect` — Remove the Gmail connection.\n"
+            "`!gmail autoparse on|off` — Opt new mail into LLM triage (off = digest only).\n"
+            "`!gmail history [limit]` — Paginated archived mail for your account.\n"
+            "`!gmail backfill [count|all]` — Archive the last N emails, or ALL mail (default 25)."
         )
 
 
@@ -401,6 +522,116 @@ async def gmail_disconnect_cmd(ctx: commands.Context):
         await ctx.send(
             f"Gmail disconnect failed: `{type(exc).__name__}: {exc}`"
         )
+
+
+@gmail_cmd.command(name="autoparse")
+async def gmail_autoparse_cmd(ctx: commands.Context, mode: str = ""):
+    """Opt-in LLM triage of newly watched mail: !gmail autoparse on|off"""
+    user_id = str(ctx.author.id)
+    mode = (mode or "").strip().lower()
+    if mode not in ("on", "off"):
+        await ctx.send(
+            "Usage: `!gmail autoparse on` / `!gmail autoparse off`\n"
+            "When on, every new email the watcher detects is handed to the "
+            "advisor for triage (facts persisted to the knowledge graph, "
+            "2-line summary posted)."
+        )
+        return
+    try:
+        from src.services.gmail_watch import set_autoparse
+        await ctx.send(set_autoparse(user_id, mode == "on"))
+    except Exception as exc:
+        await ctx.send(
+            f"Gmail autoparse failed: `{type(exc).__name__}: {exc}`"
+        )
+
+
+@gmail_cmd.command(name="history")
+async def gmail_history_cmd(ctx: commands.Context, limit: str = "20"):
+    """List stored mail for your account: !gmail history [limit]"""
+    user_id = str(ctx.author.id)
+    try:
+        lim = max(1, min(int(limit or 20), 100))
+    except ValueError:
+        lim = 20
+    try:
+        rows = list_gmail_messages(user_id, limit=lim)
+    except Exception as exc:
+        await ctx.send(
+            f"Gmail history failed: `{type(exc).__name__}: {exc}`"
+        )
+        return
+    view = _GmailHistoryView(ctx, rows)
+    msg = await ctx.send(embed=view._embed(), view=view)
+    view._message = msg
+    REPORT_CONTROL_MESSAGES.setdefault(ctx.author.id, set()).add(msg)
+
+
+@gmail_cmd.command(name="backfill")
+async def gmail_backfill_cmd(ctx: commands.Context, count: str = "25"):
+    """Archive the last N emails, or all: !gmail backfill [count|all]"""
+    user_id = str(ctx.author.id)
+    raw = (count or "25").strip().lower()
+    if raw in ("all", "0", ""):
+        n = 0  # walk the entire mailbox
+    else:
+        try:
+            n = max(1, int(raw))
+        except ValueError:
+            n = 25
+    loop = ctx.bot.loop
+
+    def _progress(processed: int, stored: int, skipped: int, failed: int) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ctx.send(
+                    f" Backfilling... {processed} processed "
+                    f"({stored} new, {skipped} already stored, {failed} failed)."
+                ),
+                loop,
+            )
+        except Exception:
+            pass
+
+    target = "ALL mail" if n == 0 else f"the last {n} email(s)"
+    try:
+        await ctx.send(f" Backfilling {target} into your archive...")
+        result = await asyncio.to_thread(
+            backfill_gmail_messages, user_id, n, _progress
+        )
+    except Exception as exc:
+        await ctx.send(
+            f"Gmail backfill failed: `{type(exc).__name__}: {exc}`"
+        )
+        return
+    if result.get("status") != "ok":
+        error = result.get("error") or "unknown error"
+        if result.get("status") == "busy":
+            await ctx.send(
+                " A backfill is already running. Progress posts here as it "
+                "goes; `!gmail history` shows what's archived so far."
+            )
+        elif "rateLimitExceeded" in str(error):
+            await ctx.send(
+                " Gmail's per-user quota was hit mid-walk. It resets each "
+                "minute and the walk retries automatically; just run "
+                "`!gmail backfill all` again and it resumes where it stopped."
+            )
+        else:
+            await ctx.send(f"Gmail backfill failed: `{error}`")
+        return
+    await ctx.send(
+        f" Backfill complete: **{result['stored']} new** archived, "
+        f"**{result['skipped']}** already stored, **{result['failed']}** failed. "
+        f"`!gmail history` to see them."
+    )
+    # Embed the freshly archived mail into the vector store in the background
+    # (resumable: embedded_at guards are on each row, sweep loop catches stragglers).
+    try:
+        from src.services.gmail_watch import embed_pending_gmail
+        asyncio.create_task(embed_pending_gmail(user_id, 0))
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -4902,6 +5133,34 @@ async def on_ready():
         print(" [MONITOR] Persistent financial monitor started.")
     except Exception as exc:
         print(f" [MONITOR] Monitor watchdog failed to start: {type(exc).__name__}: {exc}")
+
+    # Gmail watcher: history-API polling for new mail. Deterministic digest
+    # to Discord; LLM triage only for users who opted in via !gmail autoparse.
+    try:
+        from src.services.gmail_watch import gmail_watchdog_loop, _connected_users
+        if _connected_users():
+            t_gmail = bot.loop.create_task(gmail_watchdog_loop())
+            _PERSISTENT_TASKS.add(t_gmail)
+            t_gmail.add_done_callback(_PERSISTENT_TASKS.discard)
+            print(" [GMAIL WATCH] started.")
+        else:
+            print(" [GMAIL WATCH] no connected Gmail accounts; loop not started.")
+    except Exception as exc:
+        print(f" [GMAIL WATCH] failed to start: {type(exc).__name__}: {exc}")
+
+    # Gmail vector indexing: sweep archived mail that has not been embedded
+    # yet into Qdrant (domain gmail_message, excluded from retrieval by default).
+    try:
+        from src.services.gmail_watch import gmail_embed_loop, _connected_users
+        if _connected_users():
+            t_gembed = bot.loop.create_task(gmail_embed_loop())
+            _PERSISTENT_TASKS.add(t_gembed)
+            t_gembed.add_done_callback(_PERSISTENT_TASKS.discard)
+            print(" [GMAIL EMBED] loop started.")
+        else:
+            print(" [GMAIL EMBED] no connected Gmail accounts; loop not started.")
+    except Exception as exc:
+        print(f" [GMAIL EMBED] failed to start: {type(exc).__name__}: {exc}")
 
     # Converge Qdrant with SQLite ground truth: delete stale claim points,
     # re-index claims missed while embed/Qdrant was down.

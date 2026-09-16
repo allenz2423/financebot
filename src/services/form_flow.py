@@ -196,6 +196,7 @@ async def finalize_form(session_id: str) -> Dict[str, Any]:
                     scalar_value=str(answer),
                     provenance_type="USER_PROVIDED",
                     source_authority=5,
+                    owner_user_id=session.owner_uid,
                 )
                 claims.append({"key": q["key"], "predicate": predicate, "claim_id": claim_id, "value": str(answer)})
             except Exception as exc:  # noqa: BLE001 — claim persistence must be resilient

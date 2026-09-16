@@ -114,19 +114,51 @@ OPENAI_MODEL=openrouter/auto-beta
 OPENAI_URL=https://openrouter.ai/api/v1/chat/completions
 ```
 
-### 4. Vector Embeddings Configuration (Qdrant)
-Delilah supports both **100% free local CPU embeddings** and **cloud embeddings**:
+### 4. Vector Embeddings Configuration (Qdrant semantic memory)
+
+Delilah's retrieval layer embeds world-model claims, research dossiers, and web
+pages the advisor actually fetched, and searches them with dense cosine
+similarity. The embedder is configurable — **local (Ollama) or cloud
+(OpenRouter / any OpenAI-compatible embeddings API)**:
 
 ```env
-# Choose: "local" (Ollama 100% CPU, 0 MB VRAM) or "cloud" (OpenRouter/OpenAI) or "auto"
+# "local" (Ollama, default) | "cloud" | "openai" | "openrouter" | "auto" (local then cloud)
 EMBEDDING_BACKEND=local
 
-# When local:
-EMBEDDING_LOCAL_MODEL=nomic-embed-text-cpu
+# Local model. Shipped default qwen3-embedding:0.6b (1024-dim, last-token pooled,
+# instruction-tuned). Legacy nomic-embed-text is supported for existing installs.
+EMBEDDING_LOCAL_MODEL=qwen3-embedding:0.6b
 
-# When cloud:
+# Cloud model (OpenRouter / OpenAI-compatible endpoint). Requires OPENAI_API_KEY.
 EMBEDDING_CLOUD_MODEL=text-embedding-3-small
+# [OPTIONAL] Explicit embeddings endpoint; default is derived from OPENAI_URL.
+# EMBEDDING_CLOUD_URL=https://openrouter.ai/api/v1/embeddings
 ```
+
+**Dimension config.** `EMBEDDING_VECTOR_SIZE` sets the Qdrant vector dimension
+and accepts **any positive integer** matching your model's output. When unset it
+is derived from the model (1024 → qwen3-embedding:0.6b, 768 → nomic-embed-text,
+1536 → text-embedding-3-small). It must equal the dimension of any existing
+Qdrant collection — dense vector fields cannot be resized in place, so on a
+mismatch `ensure_collection` raises with a fix hint instead of silently queueing
+broken upserts.
+
+```env
+EMBEDDING_VECTOR_SIZE=1024
+```
+
+**How memory retrieval works.**
+- Search is scoped to `SEMANTIC_RETRIEVAL_DOMAINS` (default
+  `world_model_claim,world_model_dossier,web_search_result`) so claims always
+  dominate the top-K; archived Gmail stays out of the vector index's top-K and
+  is served by on-demand `search_gmail` keyword search instead.
+- Fetched web pages are indexed **section by section** — each heading's content
+  becomes its own vector point, all pointing back to the same source URL. A fact
+  buried deep in a long page (a drug interaction, a spec buried in a review) is
+  now retrievable instead of vanishing into one whole-page embedding "mush".
+- Queries carry a task instruction (`EMBEDDING_QUERY_INSTRUCTION`) for
+  instruction-tuned embedders (Qwen3); it is tuned for personal-memory
+  retrieval of this corpus and is applied to queries only, never to documents.
 
 ### 5. Run the Stack
 ```bash

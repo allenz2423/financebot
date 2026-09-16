@@ -1088,7 +1088,26 @@ CREATE TABLE IF NOT EXISTS kg_claims (
     tx_retracted_at TEXT,
     parent_claim_ids TEXT,
     evidence_refs TEXT,
-    is_scenario INTEGER DEFAULT 0
+    is_scenario INTEGER DEFAULT 0,
+    immutable INTEGER DEFAULT 0
+)
+""")
+
+# Migration guard: pre-existing DBs created kg_claims without the immutable
+# column; CREATE TABLE IF NOT EXISTS never alters an existing table.
+_kg_claim_cols = {r[1] for r in c.execute("PRAGMA table_info(kg_claims)").fetchall()}
+if "immutable" not in _kg_claim_cols:
+    c.execute("ALTER TABLE kg_claims ADD COLUMN immutable INTEGER DEFAULT 0")
+
+# Immutable web knowledge pins: a user (or Delilah, with user sign-off) can
+# pin a researched URL so it is treated as authoritative without re-verification.
+c.execute("""
+CREATE TABLE IF NOT EXISTS web_knowledge_pins (
+    user_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    reason TEXT,
+    pinned_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, url)
 )
 """)
 

@@ -6,6 +6,7 @@ and user goals.
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -16,23 +17,74 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Shipped default for the local (Ollama) embedder. qwen3-embedding:0.6b is a
+# 1024-dim, last-token-pooled instruction-tuned model; the legacy nomic-embed
+# family remains supported for existing installs.
+DEFAULT_LOCAL_EMBED_MODEL = "qwen3-embedding:0.6b"
+
 def _get_embedding_backend() -> str:
     from dotenv import load_dotenv
     load_dotenv()
     return os.getenv("EMBEDDING_BACKEND", "local").strip().lower()
 
+
+def _derived_embedding_vector_size(model: str, backend: str) -> Optional[int]:
+    """Known model -> output dimension; unknown -> None (must be configured)."""
+    if backend in ("cloud", "openai", "openrouter"):
+        return 1536  # text-embedding-3-small (EMBEDDING_CLOUD_MODEL default)
+    m = (model or "").lower()
+    if "qwen3-embedding" in m:
+        return 1024
+    if "nomic-embed-text" in m:
+        return 768
+    return None
+
+
 def _get_embedding_vector_size() -> int:
+    """Embedding dimension, configured via EMBEDDING_VECTOR_SIZE (.env).
+
+    Any positive integer is accepted — Qdrant dense vectors are created at
+    exactly this size, so it must equal the chosen model's output dimension.
+    When unset, the dimension is derived from the configured backend/model; a
+    custom local model with an unknown dimension fails fast instead of
+    silently creating a wrong-sized collection.
+    """
     from dotenv import load_dotenv
     load_dotenv()
     env_size = os.getenv("EMBEDDING_VECTOR_SIZE")
     if env_size:
-        return int(env_size)
-    # Default to 768 for local nomic-embed-text, 1536 for cloud text-embedding-3-small
+        try:
+            size = int(str(env_size).strip())
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"EMBEDDING_VECTOR_SIZE={env_size!r} is not an integer; set it to "
+                "the embedding model's output dimension (e.g. 1024 for "
+                "qwen3-embedding:0.6b, 1536 for text-embedding-3-small)."
+            ) from None
+        if size <= 0:
+            raise ValueError(f"EMBEDDING_VECTOR_SIZE={size} must be positive.")
+        return size
     backend = _get_embedding_backend()
-    return 1536 if backend in ("cloud", "openai", "openrouter") else 768
+    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", DEFAULT_LOCAL_EMBED_MODEL).strip()
+    known = _derived_embedding_vector_size(local_model, backend)
+    if known is not None:
+        return known
+    raise ValueError(
+        f"Cannot infer the embedding dimension for local model {local_model!r}; "
+        "set EMBEDDING_VECTOR_SIZE in .env to match the model's output, and "
+        "ensure any existing Qdrant collection uses the same dimension."
+    )
 
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "delilah_financial_memory")
 VECTOR_SIZE = _get_embedding_vector_size()
+
+# Embeddings are brief bursts (~300 ms per page on GPU); never park the model
+# in VRAM permanently. On an 8 GB card the advisor LLM (25B, partially
+# offloaded) needs the scarce VRAM when an advisor turn runs, so the embedder
+# borrows it for its burst and unloads after EMBED_KEEP_ALIVE. A short TTL
+# means each research block amortizes one model reload across its batched
+# embeds instead of permanently taxing the card.
+EMBED_KEEP_ALIVE = os.getenv("EMBED_KEEP_ALIVE", "5m")
 
 # Candidate-universe filter applied at the search boundary. The vector index
 # is heterogeneous by design (claims, dossiers, financial snapshots, free-form
@@ -41,9 +93,12 @@ VECTOR_SIZE = _get_embedding_vector_size()
 # (MRR@10 0.280 -> 0.681 and 29.3 -> 0.0 distractors in band when filtered,
 # with zero recall cost vs claim-only). Env-overridable for experiments;
 # set to "none" (or empty) to search the mixed universe.
+# web_search_result is retrievable by design: it holds only pages the advisor
+# actually fetched/cited (never raw unused hits), so it complements claims
+# with dated web research instead of crowding them.
 _raw_retrieval_domains = os.getenv(
     "SEMANTIC_RETRIEVAL_DOMAINS",
-    "world_model_claim,world_model_dossier",
+    "world_model_claim,world_model_dossier,web_search_result",
 ).strip()
 RENDERABLE_DOMAINS = (
     [] if _raw_retrieval_domains.lower() in ("", "none", "off", "mixed")
@@ -109,21 +164,41 @@ def _get_openai_api_key() -> str:
     return os.getenv("OPENAI_API_KEY", "").strip()
 
 def _get_embeddings_endpoint() -> str:
-    openai_url = os.getenv("OPENAI_URL", "https://openrouter.ai/api/v1/chat/completions")
-    if "openrouter.ai" in openai_url:
+    """Resolve the cloud embeddings HTTP endpoint.
+
+    EMBEDDING_CLOUD_URL always wins. Otherwise it is derived from OPENAI_URL:
+    OpenRouter and the native OpenAI host are recognized explicitly; any other
+    OpenAI-compatible gateway has /chat/completions swapped for /embeddings (or
+    the path is used as-is when it already ends in /embeddings).
+    """
+    override = os.getenv("EMBEDDING_CLOUD_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    openai_url = os.getenv(
+        "OPENAI_URL", "https://openrouter.ai/api/v1/chat/completions"
+    ).strip()
+    low = openai_url.lower()
+    if "openrouter.ai" in low:
         return "https://openrouter.ai/api/v1/embeddings"
-    if "/chat/completions" in openai_url:
+    if "api.openai.com" in low:
+        return "https://api.openai.com/v1/embeddings"
+    if "/chat/completions" in low:
         return openai_url.replace("/chat/completions", "/embeddings")
-    return "https://openrouter.ai/api/v1/embeddings"
+    return openai_url if low.endswith("/embeddings") else f"{openai_url.rstrip('/')}/embeddings"
 
 
 async def get_embedding(text: str, instruction: Optional[str] = None) -> List[float]:
     """
     Generate dense embedding for text.
     Controlled by EMBEDDING_BACKEND in .env:
-      - 'local': Uses Ollama (EMBEDDING_LOCAL_MODEL, default: nomic-embed-text-cpu)
-      - 'cloud': Uses OpenRouter/OpenAI (EMBEDDING_CLOUD_MODEL, default: text-embedding-3-small)
-      - 'auto': Attempts local first; falls back to cloud if local is unreachable
+      - 'local' | 'ollama': Ollama (EMBEDDING_LOCAL_MODEL, default: qwen3-embedding:0.6b)
+      - 'cloud' | 'openai' | 'openrouter': HTTP embeddings API
+        (EMBEDDING_CLOUD_MODEL, default: text-embedding-3-small; endpoint from
+        OPENAI_URL or EMBEDDING_CLOUD_URL)
+      - 'auto': local first, cloud fallback when local is unreachable
+
+    The vector dimension is EMBEDDING_VECTOR_SIZE (or derived from the model
+    when unset) and must match the Qdrant collection.
 
     `instruction` is the query-side task instruction for instruction-tuned
     models (Qwen3-Embedding): queries carry it, documents never do.
@@ -133,7 +208,7 @@ async def get_embedding(text: str, instruction: Optional[str] = None) -> List[fl
         return [0.0] * vector_size
 
     backend = _get_embedding_backend()
-    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", "nomic-embed-text-cpu").strip()
+    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", DEFAULT_LOCAL_EMBED_MODEL).strip()
     cloud_model = os.getenv("EMBEDDING_CLOUD_MODEL", "text-embedding-3-small").strip()
 
     # Cloud explicitly requested
@@ -167,7 +242,7 @@ async def get_embedding(text: str, instruction: Optional[str] = None) -> List[fl
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     ollama_url,
-                    json={"model": model_name, "input": embed_input, "keep_alive": -1},
+                    json={"model": model_name, "input": embed_input, "keep_alive": EMBED_KEEP_ALIVE},
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -200,15 +275,124 @@ async def get_embedding(text: str, instruction: Optional[str] = None) -> List[fl
     return [0.0] * vector_size
 
 
+# Section-aware indexing sends an array of section texts in ONE embed call
+# (Ollama /api/embed accepts input arrays); measured flat ~35 ms/section on
+# GPU versus ~20 ms + fixed overhead per separate call, and per-page bursts of
+# 10-24 sections amortize the one-time model (re)load within EMBED_KEEP_ALIVE.
+async def get_embeddings(
+    texts: List[str], instruction: Optional[str] = None
+) -> List[List[float]]:
+    """Batch-embed many texts in one provider call; output order matches input.
+
+    Sections are documents, so `instruction` is normally None (the query-side
+    task instruction is never applied to indexed content). Falls back to
+    sequential single embeds if the batch path fails or returns a mismatched
+    count, so indexing never hard-fails on a provider quirk.
+    """
+    vector_size = _get_embedding_vector_size()
+    out: List[List[float]] = [[0.0] * vector_size for _ in texts]
+    todo: List[int] = [i for i, t in enumerate(texts) if t and t.strip()]
+    if not todo:
+        return out
+
+    inputs = [texts[i].strip()[:8000] for i in todo]
+    backend = _get_embedding_backend()
+    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", DEFAULT_LOCAL_EMBED_MODEL).strip()
+    cloud_model = os.getenv("EMBEDDING_CLOUD_MODEL", "text-embedding-3-small").strip()
+
+    if backend in ("cloud", "openai", "openrouter"):
+        try:
+            api_key = _get_openai_api_key()
+            endpoint = _get_embeddings_endpoint()
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    endpoint,
+                    json={"model": cloud_model, "input": inputs},
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    rows = sorted(
+                        resp.json().get("data", []), key=lambda d: d.get("index", 0)
+                    )
+                    if len(rows) == len(inputs):
+                        for i, row in zip(todo, rows):
+                            out[i] = row["embedding"]
+                        return out
+        except Exception as e:
+            logger.debug(f"Batch cloud embedding failed: {e}")
+
+    ollama_url = _get_ollama_embed_url()
+    candidate_models = [local_model]
+    if local_model == "nomic-embed-text-cpu":
+        candidate_models.append("nomic-embed-text")
+    for model_name in candidate_models:
+        try:
+            payload_input = inputs
+            if instruction:
+                payload_input = [instruction.format(q=t) for t in inputs]
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    ollama_url,
+                    json={
+                        "model": model_name,
+                        "input": payload_input,
+                        "keep_alive": EMBED_KEEP_ALIVE,
+                    },
+                )
+                if resp.status_code == 200:
+                    rows = resp.json().get("embeddings", [])
+                    if len(rows) == len(inputs):
+                        for i, row in zip(todo, rows):
+                            out[i] = row
+                        return out
+        except Exception as e:
+            logger.debug(f"Local batch embedding via {model_name} failed: {e}")
+
+    for i in todo:
+        out[i] = await get_embedding(texts[i], instruction=instruction)
+    return out
+
+
 async def ensure_collection(collection_name: str = COLLECTION_NAME) -> bool:
-    """Ensure the target Qdrant collection exists with cosine distance."""
+    """Ensure the target Qdrant collection exists with cosine distance.
+
+    Embeds/upserts/search all funnel through here, so an existing collection
+    whose vector dimension differs from EMBEDDING_VECTOR_SIZE raises a
+    RuntimeError with a fix hint: dense dimensions cannot be resized in place,
+    and upserting wrong-sized vectors only fails later with opaque errors.
+    The collection is created at VECTOR_SIZE when missing.
+    """
     base_url = _get_qdrant_url()
     async with httpx.AsyncClient(timeout=10.0) as client:
         # Check if collection exists
         try:
             check_resp = await client.get(f"{base_url}/collections/{collection_name}")
             if check_resp.status_code == 200:
+                cfg = (
+                    check_resp.json()
+                    .get("result", {})
+                    .get("config", {})
+                    .get("params", {})
+                    or {}
+                )
+                vectors = cfg.get("vectors") or {}
+                existing_size = vectors.get("size") if isinstance(vectors, dict) else None
+                if existing_size is not None and int(existing_size) != VECTOR_SIZE:
+                    raise RuntimeError(
+                        f"Qdrant collection '{collection_name}' already exists with "
+                        f"vector dimension {existing_size}, but "
+                        f"EMBEDDING_VECTOR_SIZE={VECTOR_SIZE}. Dense vector dimensions "
+                        "cannot be resized in place: either align EMBEDDING_VECTOR_SIZE "
+                        "with the collection, or (after backing up) recreate the "
+                        "collection at the intended dimension."
+                    )
                 return True
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
@@ -436,6 +620,196 @@ def _claim_point_id(claim_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claim_{claim_id}"))
 
 
+def _gmail_point_id(user_id: str, message_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"gmail_{user_id}_{message_id}"))
+
+
+async def index_gmail_message(
+    user_id: str,
+    message_id: str,
+    subject: str,
+    sender: str,
+    date: str,
+    body: str,
+) -> bool:
+    """Embed and index one archived email into the vector store.
+
+    Emails get domain "gmail_message", which is NOT in SEMANTIC_RETRIEVAL_DOMAINS
+    by default — they are indexed (searchable, diag-nosed, future-proof) but do
+    not crowd claim retrieval with marketing noise. Extend that env var to fold
+    them into semantic RAG.
+    """
+    try:
+        text = (
+            f"Email from {sender or '?'} on {date or '?'}\n"
+            f"Subject: {subject or '(no subject)'}\n\n"
+            f"{body or ''}"
+        )
+        emb = await get_embedding(text)
+        point_id = _gmail_point_id(str(user_id), str(message_id))
+        await upsert_points([{
+            "id": point_id,
+            "vector": emb,
+            "payload": {
+                "user_id": str(user_id),
+                "domain": "gmail_message",
+                "message_id": str(message_id),
+                "sender_email": (sender or "")[:500],
+                "subject": (subject or "")[:500],
+                "date": date or "",
+                "text": text[:12000],
+            },
+        }])
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to index gmail message into Qdrant: {e}")
+        return False
+
+
+async def index_web_search_result(
+    user_id: str,
+    url: str,
+    title: str = "",
+    text: str = "",
+    query: str = "",
+) -> bool:
+    """Embed a web page the advisor surfaced (search hit or fetched page) into
+    the vector store.
+
+    Domain "web_search_result" IS in SEMANTIC_RETRIEVAL_DOMAINS by default, so
+    past research auto-injects into retrieval alongside world-model claims.
+    Callers feed either top search hits (title+snippet, from search_web) or
+    pages the advisor actually fetched — the point id is URL-keyed so a hit and
+    a later fetch of the same page converge on one point (fetch text is richer
+    and last-write-wins), and repeated searches never stack near-duplicates.
+    """
+    try:
+        text = str(text or "")[:12000]
+        if not text.strip():
+            return False
+        emb = await get_embedding(text)
+        point_id = _web_result_point_id(str(url))
+        await upsert_points([{
+            "id": point_id,
+            "vector": emb,
+            "payload": {
+                "user_id": str(user_id),
+                "domain": "web_search_result",
+                "url": str(url)[:2048],
+                "title": (title or "")[:500],
+                "query": (query or "")[:500],
+                "text": text,
+                "fetched_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }])
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to index web search result into Qdrant: {e}")
+        return False
+
+
+def _web_result_point_id(url: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"web_{url}"))
+
+
+def _web_section_point_id(url: str, idx: int) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"web_{url}_sec_{idx}"))
+
+
+async def _delete_web_points_for_url(
+    user_id: str, url: str, collection_name: str = COLLECTION_NAME
+) -> int:
+    """Delete every indexed point for one URL (a flat whole-page vector and/or
+    a prior section family) so a re-fetch converges instead of stacking."""
+    base_url = _get_qdrant_url()
+    point_ids: List[str] = []
+    offset: Optional[str] = None
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            payload: Dict[str, Any] = {
+                "limit": 256,
+                "with_payload": False,
+                "filter": {
+                    "must": [
+                        {"key": "user_id", "match": {"value": str(user_id)}},
+                        {"key": "url", "match": {"value": str(url)}},
+                    ]
+                },
+            }
+            if offset:
+                payload["offset"] = offset
+            resp = await client.post(
+                f"{base_url}/collections/{collection_name}/points/scroll", json=payload
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Qdrant scroll failed ({resp.status_code}): {resp.text}")
+            data = resp.json().get("result", {})
+            point_ids += [p["id"] for p in data.get("points", [])]
+            offset = data.get("next_page_offset")
+            if offset is None:
+                break
+    return await _delete_point_ids(point_ids, collection_name)
+
+
+async def index_web_sections(
+    user_id: str,
+    url: str,
+    title: str = "",
+    sections: Optional[List[Dict[str, str]]] = None,
+    query: str = "",
+) -> int:
+    """Section-aware index of a fetched web page (doc-side mush fix).
+
+    Replaces the single flat whole-page vector with one vector per section.
+    Every section point carries the same URL payload — all of them "point to
+    the same doc" — and section_name records which meaning matched, so
+    retrieval lands on the exact part of the page (drug Interactions vs
+    Dosage) instead of one pooled mush vector. Any existing points for the
+    URL (flat or stale section family) are deleted first. Embeddings are
+    batched into a single provider call.
+    """
+    try:
+        clean: List[tuple[str, str]] = []
+        for sec in (sections or []):
+            name = re.sub(r"\s+", " ", str(sec.get("name", "") or "")).strip()[:200]
+            text = str(sec.get("text", "") or "").strip()[:12000]
+            if not name or not text:
+                continue
+            clean.append((name, text))
+        if not clean:
+            return 0
+
+        embeds = await get_embeddings([t for _, t in clean])
+        if len(embeds) != len(clean):
+            embeds = [await get_embedding(t) for _, t in clean]
+
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        points: List[Dict[str, Any]] = []
+        for i, ((name, text), vec) in enumerate(zip(clean, embeds)):
+            points.append({
+                "id": _web_section_point_id(str(url), i),
+                "vector": vec,
+                "payload": {
+                    "user_id": str(user_id),
+                    "domain": "web_search_result",
+                    "url": str(url)[:2048],
+                    "title": (title or "")[:500],
+                    "section_name": name,
+                    "query": (query or "")[:500],
+                    "text": text,
+                    "fetched_at": now,
+                },
+            })
+
+        await _delete_web_points_for_url(str(user_id), str(url))
+        await upsert_points(points)
+        logger.info(f"Indexed {len(points)} sections for web page {url}")
+        return len(points)
+    except Exception as e:
+        logger.warning(f"Failed to section-index web page into Qdrant: {e}")
+        return 0
+
+
 async def delete_claim_point(claim_id: str, collection_name: str = COLLECTION_NAME) -> bool:
     """Remove a retracted claim's vector point so it stays consistent with SQLite."""
     point_id = _claim_point_id(claim_id)
@@ -531,7 +905,7 @@ async def collection_status(collection_name: str = COLLECTION_NAME) -> Dict[str,
 async def embedding_status(probe_text: str = "delilah vector probe") -> Dict[str, Any]:
     """Probe the embedding pipeline end to end: backend, model, latency, dimension sanity."""
     backend = _get_embedding_backend()
-    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", "nomic-embed-text-cpu").strip()
+    local_model = os.getenv("EMBEDDING_LOCAL_MODEL", DEFAULT_LOCAL_EMBED_MODEL).strip()
     started = time.monotonic()
     try:
         vec = await get_embedding(probe_text)

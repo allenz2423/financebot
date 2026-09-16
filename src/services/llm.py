@@ -32,6 +32,8 @@ from src.services.world_model import (
     audit_world_model_health,
     get_world_model_entity,
     search_world_model,
+    search_world_model_semantic,
+    list_world_model_claims,
     get_world_model_dossier,
     retract_world_model_claim
 )
@@ -909,7 +911,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "save_to_knowledge_base",
-            "description": "Saves a new verified knowledge chunk into the RAG corpus. Use this after researching something via web search or synthesizing a novel financial insight. The knowledge is immediately indexed and persists across restarts. Only save VERIFIED, FACTUAL information — never save opinions or unverified claims.",
+            "description": "Saves a knowledge chunk into the RAG corpus. Use this EAGERLY after any research or synthesis — this is a single-user system and storage is cheap, so saving too little is always worse than saving too much. Do not gate on perfect verification: save what you learned, and record honestly where it came from in source_context. Lower-confidence saves get refined or retracted later; unsaved research is lost forever. The knowledge is immediately indexed and persists across restarts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2355,7 +2357,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "assert_world_model_claim",
-            "description": "Assert a verified fact or relationship into the Active World Model Knowledge Graph. Automatically manages bi-temporal validity and history.",
+            "description": "Assert a fact or relationship into the Active World Model Knowledge Graph. Assert EAGERLY — single-user system, storage is cheap, and unsaved facts are lost. Do not gate on perfect verification: save what you know now and set source_authority honestly (1-2 for single unverified source, 3 for cross-checked, 4-5 for official/user-direct). Claims are bi-temporal, so a better-sourced claim can supersede or retract this one later; an unsaved fact cannot be improved because it does not exist. Automatically manages validity and history.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2403,6 +2405,30 @@ BOT_TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["claim_id"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_world_model_claims",
+            "description": "Deterministic enumeration of Active World Model claims — this is a direct SQLite query, NOT semantic search. MANDATORY for questions like 'what are ALL my X', 'how many X do I have', 'list my Y': the semantic context snippet is truncated and CANNOT answer enumeration questions. Returns every active claim matching the filter, regardless of similarity.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "predicate": {
+                        "type": "string",
+                        "description": "Claim predicate to enumerate (e.g. 'owns', 'fragrance_notes'). Omit to list all predicates."
+                    },
+                    "value_contains": {
+                        "type": "string",
+                        "description": "Optional case-insensitive substring filter on the claim value (e.g. 'Amouage')."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max claims to return (default 100, cap 500)."
+                    }
+                }
             }
         },
     },
@@ -2491,6 +2517,32 @@ BOT_TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pin_knowledge_immutable",
+            "description": "Pin a claim (by claim_id, shown as '(claim: <id>)' in retrieved context) or a web URL as immutable, user-confirmed knowledge. Pinned items render with a (PINNED) marker and are treated as authoritative without re-verification. Use ONLY when the user explicitly confirms the fact is trustworthy. Kind is 'claim' or 'web'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["claim", "web"],
+                        "description": "'claim' pins a world model claim by claim_id; 'web' pins a researched URL."
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "For kind='claim': the claim_id from retrieved context. For kind='web': the URL."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional short reason the user gave for pinning this as immutable."
+                    }
+                },
+                "required": ["kind", "ref"],
             },
         },
     },
@@ -3202,6 +3254,7 @@ EXPECTED_TOOL_NAMES = {
     "crawl_deeper",
     "index_financial_snapshot_to_qdrant",
     "search_vector_memory",
+    "pin_knowledge_immutable",
     "send_push_alert",
     "schedule_reminder",
     "delete_scheduled_reminder",
@@ -3246,6 +3299,7 @@ EXPECTED_TOOL_NAMES = {
 
     "load_tool_schemas",
     "verify_claim",
+    "list_world_model_claims",
     "get_temporal_projection",
     "save_to_knowledge_base",
     "query_knowledge_base",
@@ -3635,7 +3689,7 @@ CORE REASONING CYCLE:
 1. RECALL: The Active World Model context (entities, claims, dossiers) has ALREADY been auto-injected into this prompt by build_semantic_world_model_context. Do NOT re-issue get_world_model_entity/search_world_model/get_world_model_dossier calls to re-fetch what is already provided — only call them if the injected context is missing specific information you actually need.
 2. HYPOTHESIZE & REFUTE: Formulate 2-3 hypotheses; actively seek falsifying evidence.
 3. VERIFY: Query authoritative database/tool before asserting numbers or states.
-4. RESEARCH: Use search_web/fetch_webpage for external facts; prefer first-party sources.
+4. RESEARCH (MEMORY-FIRST): The prompt already contains auto-injected [RELEVANT GROUND TRUTH CLAIMS] AND [PRIOR WEB RESEARCH] findings. When the injected context answers the question, ANSWER FROM IT and do NOT call search_web/fetch_webpage/scrape_rendered_page/crawl_deeper — every research tool call costs compute, and the store IS the memory. (PINNED) entries are user-confirmed immutable authority: never re-verify or contradict them on newer web noise alone. Unpinned web research older than ~30 days on time-sensitive topics (prices, availability, rumors) may warrant one verifying fetch — fetch ONLY what genuinely requires it. If a topic smells like past research but nothing relevant was injected, call search_vector_memory before falling back to the web. WORST CASE — a stored fact is critical and its trust is genuinely undecidable — present the fact, tell the user it should be pinned immutable, and call pin_knowledge_immutable only after the user confirms.
 5. ACT: Mutate via native tools after parameter validation. Group multi-row updates via batch tools.
 6. REMEMBER: Persist facts, preferences, confirmed hypotheses, and insights via assert_world_model_claim, tag_transaction_context, and log_lifestyle_context.
 7. REVIEW & FINISH: Call end_turn ONLY when all queue items are processed or marked unresolved. Never hallucinate early exits.
@@ -3672,6 +3726,66 @@ EXECUTIVE REPORTING & DISCORD PRESENTATION:
     system_prompt += """
 RUNTIME CONTRACT:
 - Native tool calls only. No markdown execution blocks.
+- PERSIST-IN-PLACE: when research (web or DB) verifies durable facts about the
+  user's possessions, finances, or interests, do not let them evaporate into
+  chat. Write your complete user-facing answer first, then append the save
+  call(s) — assert_world_model_claim for claims about the user's world,
+  save_to_knowledge_base for general verified knowledge — TOGETHER WITH
+  end_turn IN THE SAME RESPONSE. The user sees only your text; the saves
+  execute silently. For simple possession/fact disclosures you may instead
+  inline <memory> tags.
+- NEVER DELEGATE RESEARCH OR PERSISTENCE TO THE USER. If a dossier is partial
+  or unverified, do the web search YOURSELF in this turn and save the result.
+  If you cannot verify, save what you have anyway with a lower
+  source_authority and note the uncertainty in the value — do not suggest the
+  user verify, search, or persist. They asked you because they want it done.
+  ASKING PERMISSION TO RESEARCH IS A VIOLATION. Never end with "Would you
+  like me to research X?" — the answer is always yes; call the search tool
+  in the same turn instead.
+- NEVER CITE SOURCES THAT DID NOT COME THROUGH A TOOL RESULT. Text you
+  generated yourself — including earlier guesses in this conversation's
+  history — is not "external sources" and must never be described with
+  sourcing language ("according to", "sources describe", "verified by").
+  If you are not looking at a tool result that says it, you don't know it.
+- USER STATEMENTS ARE THE HIGHEST AUTHORITY (provenance USER_STATED, authority
+  5). When the user states a fact about themselves — "I also have X", "I don't
+  own Y", "my bill is Z" — that OVERRIDES whatever the retrieved context or
+  database currently shows. The database is a lossy record of what you have
+  been told, not a gatekeeper: wipe, drift, and missing claims are expected
+  states. The correct response to "I also have X" is to assert the ownership
+  claim immediately (same message, end_turn) and confirm it in your text —
+  NEVER to quote the database back at them or ask them to confirm what they
+  just told you. If context contradicts the user, trust the user, assert the
+  correction, and (if appropriate) retract the stale claim.
+  Example — user: "Hm, not right — I also have an account with Cool Awesome
+  Bank" → your response: text confirming "Got it — recorded. You also bank
+  with Cool Awesome Bank." + tool calls [assert_world_model_claim(
+  subject_id="user:current", predicate="owns",
+  scalar_value="Cool Awesome Bank account", provenance_type="USER_STATED",
+  source_authority=5), end_turn].
+- BATCH INDEPENDENT TOOL CALLS. If multiple tool calls do not depend on each
+  other's results — e.g. fetching several known URLs, asserting several
+  claims — issue ALL of them in ONE response as parallel tool calls. One
+  tool call per round-trip is only acceptable when a later call needs an
+  earlier call's output. NEVER interleave empty text turns between tool
+  calls: every round must either carry tool calls, carry your final answer,
+  or both — never blank.
+- ENUMERATION QUESTIONS REQUIRE A REAL QUERY. "What are ALL my X", "how many
+  X do I have", "list my Y" are database enumerations, not similarity
+  searches. The injected semantic context is a truncated sample and CANNOT
+  answer them — call list_world_model_claims (predicate/value_contains) and
+  answer from the result. NEVER enumerate from the context snippet.
+- NEVER FABRICATE RECORD STATE. Do not state counts, collections, authority
+  scores, or provenance that are not literally present in retrieved payloads
+  or tool results. Phrases like "per current records" or "authority 4/5" are
+  only allowed when the data in front of you says so. Real names woven into
+  invented structure is the worst kind of wrong.
+- WHEN CHALLENGED, RE-QUERY — DO NOT IMPROVISE. If the user questions a
+  previous answer ("you sure?", "that's all?"), the only correct move is to
+  call list_world_model_claims (or another read tool) and answer from the
+  fresh result. NEVER respond to a challenge by adding items from memory,
+  "remembering" things you missed, or expanding the previous list — that is
+  confabulation, even when the added items happen to be real.
 - On audits, group corrections with batch_correct_transactions.
 - run_python_sandbox is disposable/read-only for production data. Use native mutation tools.
 - If user provides purchase reason, use tag_transaction_context.
@@ -3694,11 +3808,25 @@ RUNTIME CONTRACT:
     # exclusively via the Active World Model (kg_entities, kg_claims, kg_dossiers).
     awm_context = ""
     if context_policy["include_session_history"]:
+        # The embedder sees only what it is given. Bare follow-ups ("don't
+        # make it a table", "i'd verify those") carry no antecedent, so a
+        # query built from the raw prompt alone retrieves noise and the
+        # model flails with tool rounds. Prepend the recent user turns as
+        # retrieval context — the LLM prompt itself stays untouched.
+        recent_user_turns = [
+            str(m.get("content") or "").strip()
+            for m in SESSION_HISTORY.get(uid, [])[-6:]
+            if isinstance(m, dict) and m.get("role") == "user" and m.get("content")
+        ]
+        retrieval_context = " | ".join(t for t in recent_user_turns if t)[-800:]
+        retrieval_query = (
+            f"{retrieval_context}\n{prompt_text}" if retrieval_context else prompt_text
+        )
         try:
-            awm_context = await build_semantic_world_model_context(prompt_text, max_tokens=300, user_id=uid)
+            awm_context = await build_semantic_world_model_context(retrieval_query, max_tokens=300, user_id=uid)
         except Exception as e:
             try:
-                awm_context = build_world_model_context(prompt_text, max_tokens=300, user_id=uid)
+                awm_context = build_world_model_context(retrieval_query, max_tokens=300, user_id=uid)
             except Exception:
                 awm_context = ""
 
@@ -4073,12 +4201,34 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 if tool["function"]["name"] in allowed
             ]
 
-        core_tools = {"explore_domain", "load_tool_schemas", "verify_claim", "end_turn"}
+        core_tools = {
+            "explore_domain", "load_tool_schemas", "verify_claim", "end_turn",
+            "list_world_model_claims",
+            # Persistence tools stay offered every round: the prompt tells the
+            # model to append them to its final message, and rejecting them at
+            # the schema guard would strand verified facts in chat history.
+            "assert_world_model_claim", "save_to_knowledge_base",
+            # Pinning immutable knowledge must be offered every round: the
+            # user may confirm a fact as immutable in any turn, and the model
+            # needs the tool available at that exact moment.
+            "pin_knowledge_immutable",
+            # Web research tools must be offered every round: the NEVER
+            # DELEGATE clause orders the model to research itself in-turn,
+            # and rejecting search_web at the guard forces it to stall or
+            # invent an answer instead of fetching.
+            "search_web", "fetch_webpage", "scrape_rendered_page", "crawl_deeper",
+        }
         if not _audit_is_active():
             if context_policy["gmail_only"]:
                 gmail_allowed = {"search_gmail", "end_turn"}
                 return [t for t in BOT_TOOLS_SCHEMA if t["function"]["name"] in gmail_allowed]
-            return [t for t in BOT_TOOLS_SCHEMA if t["function"]["name"] in core_tools.union(dynamically_loaded_tools)]
+            allowed = core_tools.union(dynamically_loaded_tools)
+            if awm_context:
+                # Semantic world model context is already injected into this
+                # turn's prompt; re-offering the read tools just burns rounds
+                # re-fetching what the model already has.
+                allowed -= {"get_world_model_entity", "search_world_model", "get_world_model_dossier"}
+            return [t for t in BOT_TOOLS_SCHEMA if t["function"]["name"] in allowed]
 
         audit_state = AUDIT_SESSION_STATE.get(uid, {})
         pending_research = audit_state.get("research_pending") or []
@@ -4233,6 +4383,49 @@ CURRENT DATABASE FINANCIAL CONTEXT
             index = len(code_stream_messages)
             new_msg = await reply_msg.channel.send(content=tail_chunks[index])
             code_stream_messages.append(new_msg)
+
+    # Live streaming preview: one disposable Discord message, edited at most
+    # ~1x/second (well under the 5/s edit bucket). Gives time-to-first-token
+    # UX during long generations. Deleted once the final response renders;
+    # the final send path itself is unchanged.
+    live_preview_message = None
+    _preview_state = {"last_edit": 0.0}
+
+    def _preview_text(raw: str) -> str:
+        t = re.sub(r"<thought>.*?(</thought>|$)", "", raw or "", flags=re.DOTALL)
+        t = re.sub(r"<memory>.*?(</memory>|$)", "", t, flags=re.DOTALL | re.IGNORECASE)
+        t = t.strip()
+        if len(t) > 1900:
+            t = t[:1890].rstrip() + "\n…"
+        return t
+
+    async def update_live_preview(text: str, alt_text: str = "", force: bool = False):
+        nonlocal live_preview_message
+        preview = _preview_text(text) or (alt_text or "").strip()
+        if not preview:
+            return
+        now = time.monotonic()
+        if not force and (now - _preview_state["last_edit"]) < 1.1:
+            return
+        _preview_state["last_edit"] = now
+        try:
+            if live_preview_message is None:
+                live_preview_message = await reply_msg.channel.send(preview)
+            else:
+                await live_preview_message.edit(content=preview)
+        except Exception as exc:
+            print(f" [STREAM PREVIEW] {type(exc).__name__}: {exc}")
+
+    async def delete_live_preview():
+        nonlocal live_preview_message
+        if live_preview_message is None:
+            return
+        msg = live_preview_message
+        live_preview_message = None
+        try:
+            await msg.delete()
+        except Exception as delete_err:
+            print(f" [STREAM PREVIEW DELETE FAILED] {type(delete_err).__name__}: {delete_err}")
 
     # OpenRouter routing configuration.
     OPENROUTER_FREE_FIRST = os.getenv("OPENROUTER_FREE_FIRST", "0").strip().lower() in {
@@ -4451,6 +4644,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
             request_success = False
             stall_abort = False
             was_interrupted = False
+            round_started_at = time.monotonic()
+            first_content_at = None
+            reasoning_text = ""
 
             try:
                 async with httpx.AsyncClient(timeout=600.0) as client:
@@ -4488,11 +4684,28 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 delta = {"content": msg.get("content") or "", "tool_calls": msg.get("tool_calls") or []}
 
                             chunk = delta.get("content") or ""
+                            d_reasoning = (
+                                delta.get("reasoning")
+                                or delta.get("reasoning_content")
+                                or ""
+                            )
+                            if d_reasoning:
+                                reasoning_text += d_reasoning
                             if chunk:
+                                if first_content_at is None:
+                                    first_content_at = time.monotonic()
                                 full_text += chunk
                                 chunk_count += 1
                                 if chunk_count % 100 == 0:
                                     await _set_advisor_status(uid, phase="generating", output_chars=len(full_text), stream_chunks=chunk_count)
+                                # Self-throttled to ~1 edit/sec; skips until
+                                # there is renderable narrative content.
+                                _alt_preview = ""
+                                if not full_text.strip() and reasoning_text:
+                                    _rt = re.sub(r"\s+", " ", reasoning_text).strip()
+                                    if _rt:
+                                        _alt_preview = ("🤔 …" + _rt[-450:])[:1900]
+                                await update_live_preview(full_text, _alt_preview)
 
                             delta_tool_calls = delta.get("tool_calls") or []
                             for tc in delta_tool_calls:
@@ -4519,6 +4732,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     if f_delta.get("name"): existing["function"]["name"] += f_delta["name"]
                                     if f_delta.get("arguments"): existing["function"]["arguments"] += f_delta["arguments"]
                         request_success = True
+                        print(
+                            f" [STREAM STATS] uid={uid} model={candidate_model} "
+                            f"first_content_after={((first_content_at - round_started_at) if first_content_at else -1):.1f}s "
+                            f"chunks={chunk_count} chars={len(full_text)} "
+                            f"reasoning_chars={len(reasoning_text)} "
+                            f"round_seconds={time.monotonic() - round_started_at:.1f}s"
+                        )
             except (httpx.TimeoutException, httpx.RequestError) as e:
                 print(f" [{llm_provider.upper()} NETWORK ERROR] {e}")
                 if attempt_idx < len(models_to_try) - 1:
@@ -5547,6 +5767,37 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     })
                     attempts += 1
                     continue
+            else:
+                # Non-audit turns get the same schema enforcement as audits:
+                # the free-tier models hallucinate tool calls for tools that
+                # are not in the offered schema (e.g. re-fetching world model
+                # context that is already injected), and executing them burns
+                # rounds on data the model already has.
+                schema_names = {t["function"]["name"] for t in _tool_schema_for_mode()}
+                hallucinated = [
+                    tc.get("function", {}).get("name")
+                    for tc in tool_calls
+                    if isinstance(tc, dict) and tc.get("function", {}).get("name") not in schema_names
+                ]
+                if hallucinated:
+                    print(
+                        f" [SCHEMA GUARD] rejected tools not in current schema: "
+                        f"{hallucinated}; allowed={sorted(schema_names)}"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM ENFORCEMENT: one or more requested tools are not available "
+                            f"in this turn's schema ({', '.join(sorted(set(hallucinated)))}). "
+                            "Do not hallucinate tool calls. If you need a capability, call "
+                            "load_tool_schemas with the exact tool name first, then call the tool. "
+                            "If the information is already present in the injected Active World "
+                            "Model context, answer directly from it — do not re-fetch. "
+                            "Allowed tools right now: " + ", ".join(sorted(schema_names)) + "."
+                        ),
+                    })
+                    attempts += 1
+                    continue
             if MAX_TOOL_CALLS_PER_ROUND > 0:
                 tool_batches = [
                     tool_calls[i : i + MAX_TOOL_CALLS_PER_ROUND]
@@ -5876,7 +6127,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
         )
 
         pre_tool_text = _strip_fallback_tool_json(content)
-        if pre_tool_text and not any(
+        # When end_turn fired this round, the text is consumed verbatim as the
+        # final summary after the tools execute — accumulating it as narrative
+        # too would deliver the answer twice.
+        if pre_tool_text and not end_turn_this_round and not any(
             phrase in pre_tool_text.lower()
             for phrase in [
                 "initiating",
@@ -6120,7 +6374,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         # Legacy fallback: transparently redirect to Active World Model
                         q_arg = str(args.get("query") or args.get("category") or "").strip()
                         if q_arg and q_arg.lower() not in ("general", "all"):
-                            res = search_world_model(q_arg, limit=args.get("top_k", 5))
+                            res = await search_world_model_semantic(q_arg, limit=args.get("top_k", 5))
                             db_result = json.dumps(res, separators=(',', ':'))
                         else:
                             # If called generically (e.g. get_memories() or get_memories(category='general')),
@@ -6156,6 +6410,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         # Replace user_id = ? with actual user_id, allowing flexible spacing
                         q = re.sub(r"user_id\s*=\s*\?", f"user_id = '{uid}'", q)
                         db_result = verify_claim(args.get("claim", ""), q, uid)
+                    elif func_name == "list_world_model_claims":
+                        db_result = json.dumps(
+                            list_world_model_claims(
+                                predicate=args.get("predicate"),
+                                value_contains=str(args.get("value_contains") or ""),
+                                limit=int(args.get("limit", 100)),
+                                user_id=uid,
+                            ),
+                            separators=(',', ':')
+                        )
                     elif func_name == "query_spending":
                         db_result = query_spending(
                             merchant=args.get("merchant"),
@@ -6991,7 +7255,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             if queries_to_search:
                                 search_results = await asyncio.gather(
                                     *[
-                                        search_searxng(cq, time_range=time_range_arg, prior_queries=[])
+                                        search_searxng(cq, time_range=time_range_arg, prior_queries=[], user_id=user_id)
                                         for cq in queries_to_search
                                     ],
                                     return_exceptions=True,
@@ -7061,6 +7325,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     clean_query,
                                     time_range=time_range_arg,
                                     prior_queries=list(search_cache.keys()),
+                                    user_id=user_id,
                                 )
                                 for r_item in search_payload.get("results", []):
                                     if r_item.get("url"):
@@ -7121,6 +7386,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 allowed_urls=allowed_fetch_urls,
                                 discover_links=True,
                                 direct_user_url=_direct_user_url,
+                                user_id=user_id,
                             ), timeout=30.0)
                         except asyncio.TimeoutError:
                             db_result = f" Fetch failed: Connection timed out after 30 seconds. The site ({raw_url}) is likely tarpitting or blocking bots."
@@ -7358,7 +7624,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         if not query_str:
                             db_result = "ERROR: query is required."
                         else:
-                            res = search_world_model(query_str, limit=limit_val, user_id=uid)
+                            res = await search_world_model_semantic(query_str, limit=limit_val, user_id=uid)
                             db_result = json.dumps(res, separators=(',', ':'))
                     elif func_name == "get_world_model_dossier":
                         doc_target = str(args.get("doc_id_or_title", "")).strip()
@@ -7415,7 +7681,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 object_id=str(o_id).strip() if o_id else None,
                                 scalar_value=str(s_val) if s_val is not None else None,
                                 provenance_type=p_type,
-                                source_authority=s_auth
+                                source_authority=s_auth,
+                                owner_user_id=uid
                             )
                             db_result = json.dumps({"status": "ASSERTED", "claim_id": cid, "subject_id": s_id, "predicate": pred}, separators=(',', ':'))
                     elif func_name == "retract_world_model_claim":
@@ -7738,6 +8005,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         from src.services.qdrant_client import search_vectors
                         res = await search_vectors(query_str, limit=limit_val, user_id=uid)
                         db_result = json.dumps(res, separators=(',', ':')) if isinstance(res, (dict, list)) else str(res)
+                    elif func_name == "pin_knowledge_immutable":
+                        from src.services.world_model import pin_knowledge_immutable as _pin_immutable
+                        db_result = str(_pin_immutable(
+                            uid,
+                            str(args.get("kind") or ""),
+                            str(args.get("ref") or ""),
+                            str(args.get("reason") or ""),
+                        ))
                     elif func_name in ADVISOR_TOOLS_DISPATCH:
                         try:
                             tool_fn = ADVISOR_TOOLS_DISPATCH[func_name]
@@ -8143,6 +8418,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     final_content = re.sub(r"<memory>.*?</memory>", "", final_content, flags=re.DOTALL | re.IGNORECASE).strip()
 
     try:
+        await delete_live_preview()
         await render_stream(final_content)
         print(
             f" [ADVISOR FINAL SENT] uid={uid} chars={len(final_content)} "
@@ -8270,6 +8546,22 @@ CURRENT DATABASE FINANCIAL CONTEXT
     executed_tool_names = {entry.get("name") for entry in (turn_tool_trace or [])}
     if "assert_world_model_claim" not in executed_tool_names:
         asyncio.create_task(auto_extract_and_persist_claims(prompt_text, uid))
+
+    # Memory-first measurement: how many research tools actually ran vs. how
+    # much injected context was present. research_tools=0 with context present
+    # means the store replaced tool calls — the whole point of the memory RAG.
+    _research_tool_names = {
+        "search_web", "fetch_webpage", "scrape_rendered_page", "crawl_deeper",
+    }
+    _research_calls = sum(
+        1 for entry in (turn_tool_trace or [])
+        if str(entry.get("name") or "") in _research_tool_names
+    )
+    print(
+        f" [MEMORY-FIRST] uid={uid} research_tools={_research_calls}"
+        f" context_web={'Y' if 'PRIOR WEB RESEARCH' in (awm_context or '') else 'N'}"
+        f" context_claims={'Y' if 'RELEVANT GROUND TRUTH CLAIMS' in (awm_context or '') else 'N'}"
+    )
 
     return final_content
 

@@ -548,6 +548,76 @@ def extract_main_text(html: str) -> str:
     text = unescape(re.sub(r"<[^>]+>", " ", stripped))
     return re.sub(r"\s+", " ", text).strip()
 
+_SECTION_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+_SECTION_TEXT_BLOCK_TAGS = ("p", "li", "dt", "dd", "td", "th", "pre", "blockquote", "figcaption", "summary")
+_SECTION_MIN_TEXT = 20
+
+
+def extract_sections(html: str) -> list[tuple[str, str]]:
+    """Split page main content into (heading, section_text) pairs, preserving
+    the document's own structure.
+
+    This is the doc-side fix for the flat-pooling mush problem: a long
+    multi-topic page (drug monographs, reviews) becomes one vector per section
+    instead of one vector that averages everything into meaninglessness. Only
+    block-level text elements contribute (leaf containers like <p>/<li>/<td>),
+    so nested markup is not double-counted. Content before the first heading
+    becomes "Overview" when substantial; pages with fewer than two usable
+    sections return [] so callers fall back to the flat whole-page embed.
+    """
+    if not html or not _HAVE_BS4:
+        return []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(_BOILERPLATE_TAGS):
+            tag.decompose()
+        from bs4 import Comment
+        for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+            comment.extract()
+        root = None
+        for selector in ["main", "article", '[role="main"]', ".content", "#content", ".post-content", ".entry-content"]:
+            root = soup.select_one(selector)
+            if root:
+                break
+        if not root:
+            root = soup.body or soup
+
+        sections: list[tuple[str, str]] = []
+        preamble: list[str] = []
+        name: str | None = None
+        parts: list[str] = []
+
+        def flush() -> None:
+            nonlocal name, parts
+            text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+            if text and name:
+                sections.append((name, text))
+            elif text and not name:
+                preamble.append(text)
+            name = None
+            parts = []
+
+        for el in root.find_all(True):
+            if el.name in _SECTION_HEADING_TAGS:
+                flush()
+                name = el.get_text(" ", strip=True)
+            elif el.name in _SECTION_TEXT_BLOCK_TAGS:
+                text = re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+                if text:
+                    parts.append(text)
+        flush()
+
+        preamble_text = re.sub(r"\s+", " ", " ".join(preamble)).strip()
+        if preamble_text and (not sections or len(preamble_text) >= 60):
+            sections.insert(0, ("Overview", preamble_text))
+
+        return [
+            (name, text) for name, text in sections
+            if name and len(text) >= _SECTION_MIN_TEXT
+        ]
+    except Exception:
+        return []
+
 # ────────────────────────────────────────────────────────────
 # Content windowing (passage-based, not first-hit)
 # ────────────────────────────────────────────────────────────
@@ -922,6 +992,34 @@ def _extract_result_urls(search_text: str) -> list[str]:
 # ────────────────────────────────────────────────────────────
 # Main search function
 # ────────────────────────────────────────────────────────────
+SEARCH_EMBED_TOP_K = max(1, int(os.getenv("SEARCH_EMBED_TOP_K", "5")))
+
+
+def _embed_search_hits(user_id: str | None, query: str, results: list[dict]) -> None:
+    """Fire-and-forget embed of the top search hits, mirroring fetch_webpage.
+
+    Search is most of what the advisor does, so its hits earn a place in the
+    vector store too. URL-keyed points converge with later fetches of the same
+    page (fetch text is richer and last-write-wins), and the unique-URL bound
+    keeps the collection from stacking junk on repeated searches.
+    """
+    if not user_id:
+        return
+    from src.services.qdrant_client import index_web_search_result
+
+    for r in (results or [])[:SEARCH_EMBED_TOP_K]:
+        url = str(r.get("url") or "").strip()
+        title = str(r.get("title") or "").strip()
+        snippet = str(r.get("snippet") or "").strip()
+        if not url or not (snippet or title):
+            continue
+        asyncio.create_task(
+            index_web_search_result(
+                str(user_id), url, title[:500], snippet[:12000], query=query or ""
+            )
+        )
+
+
 async def search_searxng(
     query: str,
     append_location_hint: bool = False,
@@ -930,6 +1028,7 @@ async def search_searxng(
     regression_tier: int = 0,
     time_range: str | None = None,
     scrape: bool = True,
+    user_id: str | None = None,
 ) -> dict:
     """
     Search SearXNG.
@@ -1177,6 +1276,8 @@ async def search_searxng(
             f"identity={item.get('identity_score', 0)} "
             f"title={item.get('title', '')!r}"
         )
+
+    _embed_search_hits(user_id, q, results)
 
     return payload
 
@@ -1541,7 +1642,45 @@ async def fetch_webpage(
     discover_links: bool = False,
     prefer_rendered: bool = False,
     direct_user_url: bool = False,
+    user_id: str | None = None,
 ) -> str:
+    # The advisor explicitly chose this URL — that is the "used" signal that
+    # earns a page a place in the vector store (domain web_search_result).
+    embed_user = str(user_id) if user_id else ""
+
+    def _fire_web_embed(final_url: str, title: str, text: str, html: str | None = None) -> None:
+        # Prefer section-aware indexing when the page has real structure: one
+        # vector per heading keeps long docs from pooling into mush and lets
+        # retrieval land on the exact section that answers the query. Pages
+        # without >= 2 usable sections fall back to the flat whole-page embed.
+        if embed_user and html:
+            from src.services.qdrant_client import index_web_sections
+
+            try:
+                sections = extract_sections(html)
+            except Exception:
+                sections = []
+            if len(sections) >= 2:
+                asyncio.create_task(
+                    index_web_sections(
+                        embed_user,
+                        final_url,
+                        title,
+                        [
+                            {"name": name, "text": sec_text}
+                            for name, sec_text in sections
+                        ],
+                    )
+                )
+                return
+        if not embed_user or not text or not text.strip():
+            return
+        from src.services.qdrant_client import index_web_search_result
+
+        asyncio.create_task(
+            index_web_search_result(embed_user, final_url, title, str(text)[:12000])
+        )
+
     if not url or not url.lower().startswith(("http://", "https://")):
         return f" Not a valid http(s) URL: {url!r}"
     parsed = urlparse(url)
@@ -1580,6 +1719,7 @@ async def fetch_webpage(
                 if parsed_pdf.get("image_pages"):
                     result += f"\n[{len(parsed_pdf['image_pages'])} page(s) had no usable text layer and were rendered as images.]"
                 WEB_PAGE_CACHE[key] = (now, result, False)
+                _fire_web_embed(str(r.url), url, result)
                 return result
             html = r.text
             structured = _extract_jsonld_prices(html)
@@ -1615,6 +1755,13 @@ async def fetch_webpage(
                 static_result = "\n".join(parts)
                 WEB_PAGE_CACHE[key] = (now, static_result, False)
                 if not prefer_rendered:
+                    title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+                    title = (
+                        re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", title_m.group(1))).strip()[:300]
+                        if title_m else ""
+                    )
+                    _fire_web_embed(str(r.url), title, static_result, html=html)
+                if not prefer_rendered:
                     return static_result
 
     if static_result is None:
@@ -1631,6 +1778,7 @@ async def fetch_webpage(
         )
         if rendered and not rendered.startswith((" ", " Refused", " Playwright renderer unavailable", " Playwright render failed")):
             WEB_PAGE_CACHE[key] = (now, rendered, True)
+            _fire_web_embed(str(r.url), "", rendered)
             return rendered
 
     if static_result is not None:

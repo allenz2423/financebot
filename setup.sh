@@ -69,6 +69,36 @@ if ! grep -q "^SANDBOX_INTERNAL_TOKEN=.\+" .env 2>/dev/null; then
     echo -e "${GREEN}✓ Generated secure SANDBOX_INTERNAL_TOKEN.${NC}"
 fi
 
+# 3b. Embedding backend sanity check (local Ollama vs cloud embeddings)
+echo -e "\n${BOLD}[3b] Verifying vector-embedding configuration...${NC}"
+EMBED_BACKEND=$(grep -E "^EMBEDDING_BACKEND=" .env | head -1 | cut -d= -f2 | tr -d '"' || true)
+EMBED_BACKEND=${EMBED_BACKEND:-local}
+EMBED_MODEL=$(grep -E "^EMBEDDING_LOCAL_MODEL=" .env | head -1 | cut -d= -f2 | tr -d '"' || true)
+EMBED_MODEL=${EMBED_MODEL:-qwen3-embedding:0.6b}
+EMBED_SIZE=$(grep -E "^EMBEDDING_VECTOR_SIZE=" .env | head -1 | cut -d= -f2 | tr -d '"' || true)
+
+case "$EMBED_BACKEND" in
+    cloud|openai|openrouter)
+        if ! grep -q "^OPENAI_API_KEY=.\+" .env 2>/dev/null; then
+            echo -e "${RED}! EMBEDDING_BACKEND=$EMBED_BACKEND but OPENAI_API_KEY is empty in .env.${NC}"
+            echo -e "${RED}!  Cloud embeddings will fail until you populate it.${NC}"
+        else
+            echo -e "${GREEN}✓ Cloud embeddings configured (model: $EMBED_MODEL).${NC}"
+        fi
+        ;;
+    auto)
+        echo -e "${YELLOW}✓ Auto embeddings: local first, cloud fallback.${NC}"
+        ;;
+    *)
+        echo -e "${GREEN}✓ Local embeddings (Ollama model: $EMBED_MODEL).${NC}"
+        ;;
+esac
+if [ -n "$EMBED_SIZE" ]; then
+    echo -e "  EMBEDDING_VECTOR_SIZE=$EMBED_SIZE — ${YELLOW}must match the model and any existing Qdrant collection (dense dims can't be resized; recreate the collection if changed).${NC}"
+else
+    echo -e "  ${YELLOW}EMBEDDING_VECTOR_SIZE unset — auto-derived from the model. Set it explicitly if you use a custom model.${NC}"
+fi
+
 # 4. SearXNG Configuration check
 echo -e "\n${BOLD}[4/6] Verifying SearXNG search engine configuration...${NC}"
 if [ ! -f searxng/settings.yml ]; then
