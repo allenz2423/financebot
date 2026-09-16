@@ -18,6 +18,11 @@ networks:
     driver: bridge
     internal: true
 
+  # Outbound-only network for services that need to reach the public internet
+  # (delilah, searxng, ollama, omniroute, browserless).
+  egress:
+    driver: bridge
+
   # Uncomment if you use an existing Nginx Proxy Manager installation
   # that provides this external Docker network.
   #
@@ -27,7 +32,9 @@ networks:
 volumes:
   ollama_data:
   sandbox-packages:
+  sandbox-workspace:
   qdrant_data:
+  omniroute-data:
 
 services:
   delilah:
@@ -37,6 +44,7 @@ services:
 
     volumes:
       - ./data:/app/data
+      - sandbox-workspace:/workspace
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -44,6 +52,7 @@ services:
     networks:
       - default
       - financebot-internal
+      - egress
       # Uncomment if using Nginx Proxy Manager:
       # - nginx-proxy-manager_default
 
@@ -52,12 +61,28 @@ services:
 
     hostname: "${HOSTNAME}"
 
+    depends_on:
+      - ollama
+      - searxng
+      - sandbox
+      - stirling-pdf
+      - qdrant
+      - browserless
+      - mcp-web-browser
+      - omniroute
+
     environment:
       - OLLAMA_URL=http://ollama:11434/api/chat
       - SEARXNG_URL=http://searxng:8080/search
       - SANDBOX_URL=http://sandbox:8100/execute
       - SANDBOX_SHELL_URL=http://sandbox:8100/shell
       - SANDBOX_INSTALL_URL=http://sandbox-installer:8100/install
+      - SANDBOX_WORKSPACE_READ_URL=http://sandbox:8100/workspace/read
+      - STIRLING_PDF_URL=http://stirling-pdf:8080
+      - QDRANT_URL=http://qdrant:6333
+      - OLLAMA_EMBED_URL=http://ollama:11434/api/embed
+      - BROWSERLESS_URL=http://browserless:3000
+      - MCP_WEB_BROWSER_URL=http://mcp-web-browser:3000/sse
       - PYTHONUNBUFFERED=1
 
       # Search/research configuration.
@@ -245,4 +270,90 @@ services:
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
       - QDRANT__TELEMETRY_DISABLED=true
+
+  # Stirling PDF — PDF manipulation & form processing
+  stirling-pdf:
+    image: frooodle/s-pdf:latest
+    container_name: financebot-stirling-pdf
+    restart: unless-stopped
+    networks:
+      - financebot-internal
+    ports:
+      - "8085:8080"
+    environment:
+      - DOCKER_ENABLE_SECURITY=false
+      - SECURITY_ENABLELOGIN=false
+      - INSTALL_BOOK_AND_ADVANCED_HTML_OPS=false
+      - SYSTEM_DEFAULTLOCALE=en-US
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/v1/info/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # OmniRoute — local LLM gateway (free-tier-first routing + paid fallback).
+  # Delilah's OPENAI_URL points at this service (see .env.example); the "delilah"
+  # combo routes free-tier models first with openrouter/auto-beta as fallback.
+  # Optional: remove this service and restore OPENAI_URL to the direct
+  # OpenRouter endpoint to disable it.
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    container_name: financebot-omniroute
+    restart: unless-stopped
+    environment:
+      - PORT=20128
+      - HOST=0.0.0.0
+      - OMNIROUTE_PORT=20128
+      - OMNIROUTE_DATA_DIR=/app/data
+      - OMNIROUTE_ALLOW_DEFAULT_DATA_DIR=1
+      - INITIAL_PASSWORD=${OMNIROUTE_INITIAL_PASSWORD}
+      - JWT_SECRET=${OMNIROUTE_JWT_SECRET}
+      - API_KEY_SECRET=${OMNIROUTE_API_KEY_SECRET}
+      - STORAGE_ENCRYPTION_KEY=${OMNIROUTE_STORAGE_ENCRYPTION_KEY}
+      - OMNIROUTE_MEMORY_MB=${OMNIROUTE_MEMORY_MB:-2048}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - JINA_API_KEY=${JINA_API_KEY:-}
+    volumes:
+      - omniroute-data:/app/data
+    networks:
+      - financebot-internal
+      - egress
+    ports:
+      - "20128:20128"
+
+  # Browserless — headless Chromium sidecar for deep JS web scraping
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: financebot-browserless
+    restart: unless-stopped
+    networks:
+      - financebot-internal
+      - egress
+    ports:
+      - "3002:3000"
+    environment:
+      - CONCURRENT=5
+      - QUEUED=10
+      - TIMEOUT=60000
+      - PREBOOT_CHROME=true
+      - KEEP_ALIVE=true
+
+  # MCP Web Browser — Model Context Protocol sidecar for browser tools
+  mcp-web-browser:
+    build:
+      context: ./mcp-servers/web-browser
+      dockerfile: Dockerfile
+    container_name: financebot-mcp-web-browser
+    restart: unless-stopped
+    environment:
+      - BROWSERLESS_URL=http://browserless:3000
+      - PORT=3000
+    networks:
+      - financebot-internal
+      - egress
+    depends_on:
+      - browserless
 
