@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import math
 import re
 from typing import Any, Callable, Dict, List, Optional
 
@@ -66,6 +67,68 @@ def _summary_from_text(text: str) -> str:
     return masked[:MAX_SUMMARY_CHARS]
 
 
+# price_watch tolerance gate. ``baseline``/``tolerance`` are model-supplied,
+# so they are sanitized before use and never influence URL construction (the
+# gate builds the target from domain/product only).
+_PRICE_RE = re.compile(r"\$\s*(\d[\d,]*(?:\.\d{1,2})?)")
+DEFAULT_PRICE_TOLERANCE = 0.05
+MAX_BASELINE = 1_000_000.0
+
+
+def _extract_price(text: str) -> Optional[float]:
+    m = _PRICE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _price_gate(baseline: Any, tolerance: Any, found: Optional[float]) -> Dict[str, Any]:
+    """Classify a price_watch reading against a baseline + tolerance.
+
+    Verdicts: sale / rise / steady vs a ``tolerance`` fraction of the
+    baseline (default 5%); no_price_found when the page shows no $ amount;
+    invalid_baseline / invalid_tolerance on malformed or out-of-range args
+    (never a crash).
+    """
+    if found is None:
+        return {"verdict": "no_price_found", "found": None}
+    try:
+        base = float(baseline)
+    except (TypeError, ValueError):
+        return {"verdict": "invalid_baseline", "found": found}
+    if not math.isfinite(base) or base < 0 or base > MAX_BASELINE:
+        return {"verdict": "invalid_baseline", "found": found}
+    try:
+        tol = DEFAULT_PRICE_TOLERANCE if tolerance in (None, "") else float(tolerance)
+    except (TypeError, ValueError):
+        return {"verdict": "invalid_tolerance", "found": found}
+    if not math.isfinite(tol) or tol < 0 or tol > 1.0:
+        return {"verdict": "invalid_tolerance", "found": found}
+    diff = found - base
+    if diff <= -abs(base * tol):
+        verdict = "sale"
+    elif diff >= abs(base * tol):
+        verdict = "rise"
+    else:
+        verdict = "steady"
+    return {
+        "verdict": verdict,
+        "found": found,
+        "baseline": base,
+        "diff_pct": round(((found - base) / base * 100.0) if base else 0.0, 2),
+    }
+
+
+def _read_extra(kind: str, args: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Kind-specific result enrichment; price_watch adds the gate block."""
+    if kind != "price_watch" or args.get("baseline") is None:
+        return {}
+    return {"price": _price_gate(args.get("baseline"), args.get("tolerance"), _extract_price(text))}
+
+
 def _finalize_read(
     kind: str,
     url: str,
@@ -73,6 +136,7 @@ def _finalize_read(
     tenant: str,
     audit: Optional[AuditLog],
     include_screenshot: bool,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared post-fetch path: mask, footprint, audit row, mask-only dict."""
     if not isinstance(result, dict):
@@ -91,13 +155,15 @@ def _finalize_read(
         "text_hash16": footprint,
         "screenshot": bool(screenshot_bytes),
     }
+    if extra and "price" in extra:
+        detail["price_verdict"] = extra["price"].get("verdict")
     seq = None
     if audit is not None:
         seq = audit.append(
             actor=tenant, action="read_" + kind, tenant=tenant,
             subject=url, detail=detail,
         )
-    return {
+    out = {
         "kind": kind,
         "url": url,
         "status": "ok",
@@ -106,6 +172,9 @@ def _finalize_read(
         "screenshot_png": screenshot_bytes,
         "audit_seq": seq,
     }
+    if extra:
+        out.update(extra)
+    return out
 
 
 def _gate(kind: str, args: Dict[str, Any], allowed_domains: List[str],
@@ -138,8 +207,10 @@ def perform_read_action(
     The returned dict is mask-only and safe for chat/model context.
     """
     url = _gate(kind, args, allowed_domains, tenant, audit)
+    page = fetcher(url)
+    extra = _read_extra(kind, args, str(page.get("text") or ""))
     return _finalize_read(
-        kind, url, fetcher(url), tenant, audit, include_screenshot,
+        kind, url, page, tenant, audit, include_screenshot, extra=extra,
     )
 
 
@@ -167,8 +238,10 @@ async def perform_read_action_async(
             raise ReadActionError("read fetcher must return a dict")
         return result
 
+    page = await _fetch(url)
+    extra = _read_extra(kind, args, str(page.get("text") or ""))
     return _finalize_read(
-        kind, url, await _fetch(url), tenant, audit, include_screenshot,
+        kind, url, page, tenant, audit, include_screenshot, extra=extra,
     )
 
 

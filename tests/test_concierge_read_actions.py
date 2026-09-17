@@ -174,3 +174,87 @@ def test_async_executor_refusal_audits_and_raises(tmp_path):
         ))
     rows = audit.tail(limit=5)
     assert rows[0]["action"] == "read_refused"
+
+
+def test_price_watch_gate_verdict_sale(tmp_path):
+    audit = AuditLog(str(tmp_path / "a.db"))
+    fetcher = fake_fetcher(
+        "https://example.com/products/monitor",
+        text="Dell 27 monitor now only $79.99!",
+    )
+    res = perform_read_action(
+        "price_watch",
+        {"domain": "example.com", "product": "monitor", "baseline": 100.0},
+        ALLOW, "user:1", fetcher, audit=audit,
+    )
+    assert res["price"]["verdict"] == "sale"
+    assert res["price"]["found"] == 79.99
+    assert res["price"]["baseline"] == 100.0
+    assert res["price"]["diff_pct"] == -20.01
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "read_price_watch"
+    assert rows[0]["detail"]["price_verdict"] == "sale"
+
+
+def test_price_watch_gate_rise_and_steady():
+    rise = fake_fetcher("https://example.com/products/a", text="the price is now $110.00")
+    res = perform_read_action(
+        "price_watch", {"domain": "example.com", "product": "a", "baseline": 100.0},
+        ALLOW, "user:1", rise,
+    )
+    assert res["price"]["verdict"] == "rise"
+
+    steady = fake_fetcher("https://example.com/products/b", text="price: $102.00")
+    res = perform_read_action(
+        "price_watch", {"domain": "example.com", "product": "b", "baseline": 100.0},
+        ALLOW, "user:1", steady,
+    )
+    assert res["price"]["verdict"] == "steady"
+
+
+def test_price_watch_gate_no_price_and_invalid_args():
+    no_price = fake_fetcher("https://example.com/products/x", text="item unavailable")
+    res = perform_read_action(
+        "price_watch", {"domain": "example.com", "product": "x", "baseline": 100.0},
+        ALLOW, "user:1", no_price,
+    )
+    assert res["price"]["verdict"] == "no_price_found"
+
+    bad_base = fake_fetcher("https://example.com/products/y", text="Price: $50.00")
+    res = perform_read_action(
+        "price_watch", {"domain": "example.com", "product": "y", "baseline": "NaN"},
+        ALLOW, "user:1", bad_base,
+    )
+    assert res["price"]["verdict"] == "invalid_baseline"
+
+    bad_tol = fake_fetcher("https://example.com/products/z", text="Price: $50.00")
+    res = perform_read_action(
+        "price_watch", {"domain": "example.com", "product": "z",
+                        "baseline": 100.0, "tolerance": -0.1},
+        ALLOW, "user:1", bad_tol,
+    )
+    assert res["price"]["verdict"] == "invalid_tolerance"
+
+
+def test_price_watch_without_baseline_has_no_gate(tmp_path):
+    audit = AuditLog(str(tmp_path / "a.db"))
+    fetcher = fake_fetcher("https://example.com/products/m", text="Price $50.00")
+    res = perform_read_action(
+        "price_watch", {"domain": "example.com", "product": "m"},
+        ALLOW, "user:1", fetcher, audit=audit,
+    )
+    assert "price" not in res
+    rows = audit.tail(limit=5)
+    assert "price_verdict" not in rows[0]["detail"]
+
+
+def test_price_watch_gate_async():
+    async def async_fetch(url):
+        return {"text": "Deal: $45.00"}
+
+    import asyncio
+    res = asyncio.run(perform_read_action_async(
+        "price_watch", {"domain": "example.com", "product": "c", "baseline": 100.0},
+        ALLOW, "user:1", async_fetch,
+    ))
+    assert res["price"]["verdict"] == "sale"

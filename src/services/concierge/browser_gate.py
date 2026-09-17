@@ -30,7 +30,10 @@ _DOMAIN_RE = re.compile(
     r"^[a-z0-9*]([a-z0-9*-]*[a-z0-9*])?"
     r"(\.[a-z0-9*]([a-z0-9*-]*[a-z0-9*])?)*$"
 )
-_ARG_KEYS = frozenset({"domain", "order_id", "tracking_id", "product"})
+# baseline/tolerance support the price_watch tolerance gate; they are
+# sanitized in read_actions and never enter URL construction (the target is
+# built from domain/product only).
+_ARG_KEYS = frozenset({"domain", "order_id", "tracking_id", "product", "baseline", "tolerance"})
 
 
 class ReadGateError(ValueError):
