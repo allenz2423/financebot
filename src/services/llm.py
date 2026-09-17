@@ -6461,40 +6461,79 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         q = re.sub(r"user_id\s*=\s*\?", f"user_id = '{uid}'", q)
                         db_result = verify_claim(args.get("claim", ""), q, uid)
                     elif func_name == "request_concierge_action":
-                        # B1 concierge read-tier: tenant identity is derived from
-                        # the interaction (uid), never model-supplied. Audited +
-                        # sandboxed by the executor; no approval by design.
+                        # B1 read-tier (no approval) + B2 write-tier (human
+                        # approval via ActionApprovalView). Tenant identity is
+                        # derived from the interaction (uid), never model-supplied.
+                        kind_str = str(args.get("kind") or "") if args.get("kind") is not None else ""
                         try:
                             from src.services.concierge.llm_tool import (
                                 ConciergeToolError,
                                 request_concierge_action_async,
+                                propose_concierge_act,
                                 tool_result_json,
                             )
                             from src.services.concierge.tenants import TenantStore
                             from src.services.concierge.audit import AuditLog
                             from src.security.vault import DEFAULT_DB_PATH as _concierge_db
                             from src.services.browserless import scrape_rendered_page as _scrape_page
+                            from src.services.concierge.act_actions import ACT_KINDS
 
-                            async def _concierge_fetch(url: str) -> dict:
-                                res = await _scrape_page(url, timeout_ms=30000)
-                                if not isinstance(res, dict):
-                                    return {"text": "", "screenshot": None}
-                                return {"text": str(res.get("text") or ""), "screenshot": None}
+                            if kind_str in ACT_KINDS:
+                                proposal = propose_concierge_act(
+                                    tenant="user:" + str(uid),
+                                    kind=kind_str,
+                                    args=dict(args.get("args") or {}),
+                                    tenants=TenantStore(_concierge_db),
+                                    audit=AuditLog(_concierge_db),
+                                )
+                                # Surface an approval prompt in Discord; the LLM
+                                # only learns that the proposal is pending.
+                                try:
+                                    from src.bot.approval_views import ActionApprovalView
+                                    view = ActionApprovalView(
+                                        proposal_id=proposal["proposal_id"],
+                                        owner_uid=int(uid),
+                                        tenant="user:" + str(uid),
+                                    )
+                                    steps_preview = proposal["steps"] or []
+                                    preview = json.dumps(steps_preview, indent=2, sort_keys=True)[:500]
+                                    prompt_msg = (
+                                        f"⚠️ **Concierge write-tier action pending approval**\n"
+                                        f"Kind: `{proposal['kind']}`\n"
+                                        f"Target: {proposal['url']}\n"
+                                        f"Proposal ID: `{proposal['proposal_id']}`\n"
+                                        f"Steps preview:\n```json\n{preview}\n```\n"
+                                        f"Only <@{uid}> can approve or reject."
+                                    )
+                                    await reply_msg.channel.send(prompt_msg, view=view)
+                                except Exception as dm_err:
+                                    print(f" [CONCIERGE APPROVAL] DM send failed: {dm_err}")
+                                db_result = (
+                                    f"Write-tier act '{kind_str}' submitted for human approval "
+                                    f"(proposal_id={proposal['proposal_id']}). "
+                                    f"The user must click ✅ in Discord before execution proceeds."
+                                )
+                            else:
+                                async def _concierge_fetch(url: str) -> dict:
+                                    res = await _scrape_page(url, timeout_ms=30000)
+                                    if not isinstance(res, dict):
+                                        return {"text": "", "screenshot": None}
+                                    return {"text": str(res.get("text") or ""), "screenshot": None}
 
-                            res = await request_concierge_action_async(
-                                tenant="user:" + str(uid),
-                                kind=str(args.get("kind") or "") if args.get("kind") is not None else "",
-                                args=dict(args.get("args") or {}),
-                                tenants=TenantStore(_concierge_db),
-                                audit=AuditLog(_concierge_db),
-                                fetch_async=_concierge_fetch,
-                                include_screenshot=True,
-                            )
-                            db_result = tool_result_json(res)
+                                res = await request_concierge_action_async(
+                                    tenant="user:" + str(uid),
+                                    kind=kind_str,
+                                    args=dict(args.get("args") or {}),
+                                    tenants=TenantStore(_concierge_db),
+                                    audit=AuditLog(_concierge_db),
+                                    fetch_async=_concierge_fetch,
+                                    include_screenshot=True,
+                                )
+                                db_result = tool_result_json(res)
                         except ConciergeToolError as exc:
                             db_result = "Concierge refused: " + str(exc)
                         except Exception as exc:  # noqa: BLE001 — report back to model
-                            db_result = f"Concierge read failed: {type(exc).__name__}: {exc}"
+                            db_result = f"Concierge action failed: {type(exc).__name__}: {exc}"
                     elif func_name == "list_world_model_claims":
                         db_result = json.dumps(
                             list_world_model_claims(
