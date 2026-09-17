@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, List, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.browser_gate import ReadGateError, _check_domain, validate_target_url
-from src.services.concierge.read_actions import _mask_value, _summary_from_text
+from src.services.concierge.read_actions import _mask_value, _summary_from_text, _PAN_LIKE
 
 # Write-tier kinds. Read kinds ("order_status"... ) stay in browser_gate.READ_KINDS.
 ACT_KINDS = frozenset({"send_email", "schedule_event", "fill_form"})
@@ -40,6 +41,37 @@ _ACT_ARG_KEYS = {
     "schedule_event": ("domain",),
     "fill_form": ("domain",),
 }
+
+# Post-execution receipt extraction (B2 completion: execute -> verify -> receipt).
+# Receipts are transaction proof, not secrets, but PAN-shaped substrings are
+# defensively masked before anything leaves the act result / audit row.
+_RECEIPT_TOTAL_RE = re.compile(r"\$\s*(\d[\d,]*(?:\.\d{2})?)")
+_RECEIPT_CONFIRM_RE = re.compile(
+    r"(?:order|confirmation|confirm|ref|reference|invoice|receipt|txn?|transaction)"
+    r"\s*#?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-]{3,15})",
+    re.IGNORECASE,
+)
+
+
+def _mask_receipt(value: str) -> str:
+    """Mask PAN-shaped substrings in a receipt field; pass others through."""
+    return _mask_value(value) if _PAN_LIKE.search(value) else value
+
+
+def _extract_receipt(text: str) -> Dict[str, str]:
+    """Pull a (masked) confirmation token and dollar total from page text.
+
+    Returns a dict with whichever of `confirmation`/`total` are present; an
+    empty dict when neither matches.
+    """
+    out: Dict[str, str] = {}
+    m = _RECEIPT_CONFIRM_RE.search(text or "")
+    if m:
+        out["confirmation"] = _mask_receipt(m.group(1))
+    m = _RECEIPT_TOTAL_RE.search(text or "")
+    if m:
+        out["total"] = m.group(1)
+    return out
 
 
 class ActActionError(ValueError):
@@ -165,6 +197,7 @@ def perform_act(
 
     text = actuator.get_text() or ""
     summary = _summary_from_text(text)[:MAX_SUMMARY_CHS] or "(no result text)"
+    receipt = _extract_receipt(text)
     post_screenshot = actuator.screenshot() if include_screenshot else None
     footprint = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
     if audit is not None:
@@ -178,6 +211,7 @@ def perform_act(
                 "screenshot": bool(post_screenshot),
                 "ok": err is None,
                 **({"error": str(err)[:200]} if err else {}),
+                **({"receipt": receipt} if receipt else {}),
             },
         )
     return {
@@ -189,6 +223,7 @@ def perform_act(
         "text_hash16": footprint,
         "steps": _mask_step_texts(steps),
         "screenshot_png": post_screenshot,
+        "receipt": receipt,
     }
 
 

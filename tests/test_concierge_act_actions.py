@@ -7,6 +7,7 @@ from src.services.concierge.act_actions import (
     ACT_KINDS,
     ActActionError,
     Actuator,
+    _extract_receipt,
     perform_act,
 )
 from src.services.concierge.read_actions import _PAN_LIKE
@@ -228,3 +229,34 @@ def test_perform_act_summary_bounded_and_masked():
     res = perform_act("fill_form", _plan(), ALLOW, "user:1", act)
     assert len(res["summary"]) <= 2000
     assert _PAN_LIKE.search(res["summary"]) is None
+
+
+def test_extract_receipt_finds_confirmation_and_total():
+    text = "Thank you! Order #ORD-9X confirmed. Your total: $45.67 has been charged."
+    rec = _extract_receipt(text)
+    assert rec["confirmation"] == "ORD-9X"
+    assert rec["total"] == "45.67"
+
+
+def test_extract_receipt_none_when_absent():
+    assert _extract_receipt("Card processed. Thank you for shopping.") == {}
+
+
+def test_extract_receipt_masks_pan_in_confirmation():
+    text = "Order CONF-4111111111111111 confirmed. Total $12.00"
+    rec = _extract_receipt(text)
+    assert "confirmation" in rec
+    assert _PAN_LIKE.search(rec["confirmation"]) is None
+    assert rec["total"] == "12.00"
+
+
+def test_perform_act_attaches_receipt_to_result_and_audit(tmp_path):
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="Order #ORD-9 confirmed. Total: $19.99 charged.")
+    res = perform_act("fill_form", _plan(), ALLOW, "user:1", act, audit=audit)
+    assert res["receipt"]["confirmation"] == "ORD-9"
+    assert res["receipt"]["total"] == "19.99"
+    rows = audit.tail(limit=5)
+    detail = rows[0]["detail"]
+    assert detail["receipt"]["confirmation"] == "ORD-9"
+    assert detail["receipt"]["total"] == "19.99"

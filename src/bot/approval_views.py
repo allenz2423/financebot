@@ -199,12 +199,18 @@ class ActionApprovalView(discord.ui.View):
             )
 
             status_emoji = "✅" if res["status"] == "ok" else "⚠️"
+            rec = res.get("receipt") or {}
+            receipt_line = (
+                "\nReceipt: " + ", ".join(f"{k}={v}" for k, v in rec.items())
+                if rec else ""
+            )
             msg = (
                 f"{status_emoji} **{proposal['kind']}** executed on "
                 f"{proposal['url']}\n"
                 f"Verify: **{verification['verdict']}** "
                 f"(conf {verification['confidence']:.2f})\n"
                 f"Summary: {res.get('summary', '(no result)')[:300]}"
+                f"{receipt_line}"
             )
             await interaction.followup.send(msg, ephemeral=False)
         except Exception as exc:
