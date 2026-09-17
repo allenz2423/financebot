@@ -25,6 +25,22 @@ from src.services.concierge.read_actions import (
 )
 from src.services.concierge.tenants import TenantStore, TenantError
 
+# Approval prompt lifetime (seconds): spend-tier (financial) acts are high-risk.
+_DEFAULT_APPROVAL_TTL = 600.0
+_HIGH_RISK_APPROVAL_TTL = 120.0
+
+
+def _approval_ttl(status: Dict[str, Any]) -> float:
+    """Window a write-tier approval prompt stays live before auto-rejecting.
+
+    High-risk acts (spend-tier tenants, who may move money) get a shorter
+    window so a stale approval can't be executed unattended; standard write
+    acts keep the default 10-minute window. Read kinds never reach here.
+    """
+    if status.get("tier") == "spend":
+        return _HIGH_RISK_APPROVAL_TTL
+    return _DEFAULT_APPROVAL_TTL
+
 
 class ConciergeToolError(ValueError):
     pass
@@ -156,6 +172,7 @@ def propose_concierge_act(
     if not status.get("enabled"):
         raise ConciergeToolError("concierge is not enabled for you")
     allowed = status.get("allow_domains") or []
+    ttl = _approval_ttl(status)
 
     try:
         steps = _validate_steps(args.get("steps"))
@@ -180,7 +197,7 @@ def propose_concierge_act(
     store = ApprovalStore()
     proposal_id = store.create(
         tenant=tenant, uid=uid, kind=kind, args=args,
-        url=url, steps=steps,
+        url=url, steps=steps, approval_ttl=ttl,
     )
     return {
         "proposal_id": proposal_id,
@@ -188,6 +205,7 @@ def propose_concierge_act(
         "url": url,
         "steps": steps,
         "status": "pending",
+        "approval_ttl": ttl,
         "message": (
             f"Write-tier act '{kind}' submitted for your approval at {url}. "
             f"Check Discord for the approval prompt."

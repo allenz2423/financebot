@@ -6494,6 +6494,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                         proposal_id=proposal["proposal_id"],
                                         owner_uid=int(uid),
                                         tenant="user:" + str(uid),
+                                        timeout=proposal.get("approval_ttl", 600.0),
                                     )
                                     steps_preview = proposal["steps"] or []
                                     preview = json.dumps(steps_preview, indent=2, sort_keys=True)[:500]

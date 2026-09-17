@@ -31,6 +31,16 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Idempotent column additions for DBs created before approval_ttl existed."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(concierge_act_proposals)").fetchall()}
+    if "approval_ttl" not in cols:
+        conn.execute(
+            "ALTER TABLE concierge_act_proposals ADD COLUMN approval_ttl REAL NOT NULL DEFAULT 600.0"
+        )
+        conn.commit()
+
+
 def _init_schema(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS concierge_act_proposals (
@@ -45,13 +55,15 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at   TEXT NOT NULL,
             approved_at  TEXT,
             executed_at  TEXT,
-            result_detail TEXT
+            result_detail TEXT,
+            approval_ttl  REAL NOT NULL DEFAULT 600.0
         )
     """)
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_concierge_act_tenant
         ON concierge_act_proposals(tenant, status, created_at)
     """)
+    _migrate_schema(conn)
     conn.commit()
 
 
@@ -89,6 +101,7 @@ class ApprovalStore:
         args: Dict[str, Any],
         url: Optional[str] = None,
         steps: Optional[List[Dict[str, Any]]] = None,
+        approval_ttl: float = 600.0,
     ) -> str:
         """Insert a pending proposal; returns its proposal_id."""
         proposal_id = uuid.uuid4().hex[:16]
@@ -97,14 +110,15 @@ class ApprovalStore:
         try:
             conn.execute(
                 """INSERT INTO concierge_act_proposals
-                   (proposal_id, tenant, uid, kind, args, url, steps, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                   (proposal_id, tenant, uid, kind, args, url, steps, status, created_at, approval_ttl)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
                 (
                     proposal_id, tenant, uid, kind,
                     json.dumps(args, sort_keys=True),
                     url,
                     json.dumps(steps) if steps else None,
                     now,
+                    float(approval_ttl),
                 ),
             )
             conn.commit()
@@ -137,6 +151,7 @@ class ApprovalStore:
             "approved_at": row["approved_at"],
             "executed_at": row["executed_at"],
             "result_detail": json.loads(row["result_detail"]) if row["result_detail"] else None,
+            "approval_ttl": float(row["approval_ttl"]) if row["approval_ttl"] is not None else 600.0,
         }
 
     def update_status(

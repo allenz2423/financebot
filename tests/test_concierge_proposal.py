@@ -163,3 +163,70 @@ def test_approval_store_pending_for_tenant(tmp_path):
 
 def test_act_kinds_set():
     assert ACT_KINDS == frozenset({"send_email", "schedule_event", "fill_form"})
+
+
+def make_spend(tmp_path, domain="example.com"):
+    db = str(tmp_path / "c.db")
+    tenants = TenantStore(db, admins=[ADMIN])
+    audit = AuditLog(db)
+    tenants.enable(ADMIN, "user:1", tier="spend", spend_cap=50.0)
+    tenants.allow_domain(ADMIN, "user:1", domain)
+    return tenants, audit, db
+
+
+def test_propose_approval_ttl_default(tmp_path):
+    tenants, audit, _ = make(tmp_path)  # read tier -> standard window
+    res = propose_concierge_act(
+        tenant="user:1", kind="fill_form", args=_steps(),
+        tenants=tenants, audit=audit,
+    )
+    assert res["approval_ttl"] == 600.0
+
+
+def test_propose_approval_ttl_short_for_spend_tier(tmp_path):
+    tenants, audit, _ = make_spend(tmp_path)
+    res = propose_concierge_act(
+        tenant="user:1", kind="send_email", args=_steps(),
+        tenants=tenants, audit=audit,
+    )
+    assert res["approval_ttl"] == 120.0
+
+
+def test_approval_store_stores_and_returns_ttl(tmp_path):
+    store = ApprovalStore(str(tmp_path / "s.db"))
+    pid = store.create(
+        tenant="user:1", uid="1", kind="fill_form",
+        args={"domain": "example.com", "steps": [{"action": "navigate", "sel": "https://example.com"}]},
+        url="https://example.com",
+        steps=[{"action": "navigate", "sel": "https://example.com"}],
+        approval_ttl=120.0,
+    )
+    assert store.get(pid)["approval_ttl"] == 120.0
+
+    pid_default = store.create(
+        tenant="user:1", uid="1", kind="send_email",
+        args={}, url="https://example.com",
+    )
+    assert store.get(pid_default)["approval_ttl"] == 600.0
+
+
+def test_approval_store_migrates_legacy_db(tmp_path):
+    db = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db)
+    conn.execute("""CREATE TABLE concierge_act_proposals (
+        proposal_id TEXT PRIMARY KEY, tenant TEXT, uid TEXT, kind TEXT,
+        args TEXT, url TEXT, steps TEXT, status TEXT, created_at TEXT,
+        approved_at TEXT, executed_at TEXT, result_detail TEXT)""")
+    conn.execute(
+        "INSERT INTO concierge_act_proposals "
+        "(proposal_id, tenant, uid, kind, args, status, created_at) "
+        "VALUES ('legacy1', 'user:1', '1', 'send_email', '{}', 'pending', 't')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = ApprovalStore(db)
+    p = store.get("legacy1")
+    assert p is not None
+    assert p["approval_ttl"] == 600.0
+    assert p["status"] == "pending"
