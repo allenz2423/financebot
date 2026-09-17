@@ -5144,6 +5144,17 @@ async def on_ready():
     except Exception as exc:
         print(f" [MONITOR] Monitor watchdog failed to start: {type(exc).__name__}: {exc}")
 
+    # Concierge risk monitor: per-tenant anomaly alerts over the concierge
+    # audit chain (capture storms, refusals, repeated secrets). LLM-free.
+    try:
+        from src.services.concierge.monitor import concierge_risk_watchdog_loop
+        t_concierge_mon = bot.loop.create_task(concierge_risk_watchdog_loop())
+        _PERSISTENT_TASKS.add(t_concierge_mon)
+        t_concierge_mon.add_done_callback(_PERSISTENT_TASKS.discard)
+        print(" [CONCIERGE MONITOR] Persistent concierge risk monitor started.")
+    except Exception as exc:
+        print(f" [CONCIERGE MONITOR] Concierge monitor watchdog failed to start: {type(exc).__name__}: {exc}")
+
     # Gmail watcher: history-API polling for new mail. Deterministic digest
     # to Discord; LLM triage only for users who opted in via !gmail autoparse.
     try:
