@@ -386,6 +386,28 @@ class Vault:
             )
         return crypto.decrypt_bytes(self.key, envelope)
 
+    def materialize_profile(self, tenant: str, vault_ref: str, dest_dir: str) -> str:
+        """Mount-only decrypt path for session profiles (executor/browser only).
+
+        ``resolve()`` keeps refusing mount_only;THIS is the designed mount path:
+        decrypts to ``dest_dir`` (caller-owned tmpfs) and returns the unpacked profile
+        dir, ready to hand to a headed browser.  The caller MUST destroy the
+        dir after the session dies;the encrypted blob at rest never changes.
+        """
+        row = self._row_or_raise(tenant, vault_ref)
+        if row["kind"] != "session_profile":
+            raise VaultError(
+                f"vault_ref {vault_ref!r} is {row['kind']} (only session profiles mount)"
+            )
+        if row["status"] != "active":
+            raise VaultRevokedError(f"vault_ref {vault_ref!r} is {row['status']}")
+        envelope = row["ciphertext"]
+        if not envelope:
+            raise VaultError(f"vault_ref {vault_ref!r} has no mountable payload")
+        raw = crypto.decrypt_bytes(self.key, envelope)
+        from src.security.profile import unpack_profile
+        return str(unpack_profile(raw, dest_dir))
+
 
 __all__ = [
     "Vault",
