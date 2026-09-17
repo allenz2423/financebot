@@ -1213,9 +1213,9 @@ MONITOR_POLL_INTERVAL_SECONDS = int(os.getenv("MONITOR_POLL_INTERVAL_SECONDS", "
 MONITOR_DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "")
 
 
-async def _deliver_alerts(alert_ids: List[int], bot, channel_id) -> None:
+async def _deliver_alerts(alert_ids: List[int], bot, channel_id, user_id: str) -> None:
     """Best-effort Discord delivery for newly fired alerts."""
-    if not alert_ids or not bot or not channel_id:
+    if not alert_ids or not bot or not channel_id or not user_id:
         return
     try:
         channel = bot.get_channel(int(channel_id))
@@ -1226,7 +1226,7 @@ async def _deliver_alerts(alert_ids: List[int], bot, channel_id) -> None:
     from src.services.monitor import list_alerts  # local import safety
     # The caller already holds conn; we re-read alerts via the shared conn.
     import src.db.queries as queries
-    alerts = list_alerts(queries.conn, "1", limit=len(alert_ids), include_acked=False)
+    alerts = list_alerts(queries.conn, user_id, limit=len(alert_ids), include_acked=False)
     for alert in alerts:
         if alert["id"] not in alert_ids:
             continue
@@ -1267,7 +1267,7 @@ async def monitor_watchdog_loop():
                 channel_id = os.getenv("DISCORD_CHANNEL_ID")
                 bot = getattr(queries, "bot", None)
                 for r in results:
-                    await _deliver_alerts(r.get("alert_ids", []), bot, channel_id)
+                    await _deliver_alerts(r.get("alert_ids", []), bot, channel_id, r.get("user_id"))
                 # Push via ntfy for critical alerts.
                 try:
                     for r in results:

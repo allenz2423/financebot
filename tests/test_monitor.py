@@ -1,8 +1,10 @@
 """Tests for the persistent financial monitor engine."""
 
+import asyncio
 import sqlite3
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -347,4 +349,24 @@ def test_category_budget_overpacing_not_triggered_when_on_track():
     res = mon.run_monitor_pass(conn, user_id, deliver=False)
     assert res["rules_fired"] == 0
     assert mon.list_alerts(conn, user_id) == []
+
+
+def test_deliver_alerts_scopes_alerts_to_user():
+    """Discord delivery must re-read alerts for the pass's user, not hardcoded '1'."""
+    channel = AsyncMock()
+    bot = MagicMock()
+    bot.get_channel.return_value = channel
+    fake_conn = MagicMock()
+    alerts = [{"id": 7, "severity": "warning", "title": "T", "detail": "D"}]
+
+    with patch("src.db.queries.conn", fake_conn), \
+         patch("src.services.monitor.list_alerts", return_value=alerts) as mock_list:
+        asyncio.run(mon._deliver_alerts([7], bot, 12345, "u2"))
+
+    mock_list.assert_called_once_with(fake_conn, "u2", limit=1, include_acked=False)
+    channel.send.assert_awaited_once()
+    fake_conn.execute.assert_called_once_with(
+        "UPDATE monitor_alerts SET delivered_discord = 1 WHERE id = ?", (7,)
+    )
+    fake_conn.commit.assert_called_once()
 

@@ -514,6 +514,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     vector_claims = []
     vector_dossiers = []
     vector_web = []
+    vector_mail = []
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     # No intent detection of any kind — the embedding model is the sole
     # relevance gate. Fetch a wide candidate pool and keep only what clears
@@ -521,8 +522,14 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     # ones few.
     hits = []
     try:
-        from src.services.qdrant_client import search_vectors
-        hits = await search_vectors(query, limit=100, user_id=target_user_id)
+        from src.services.qdrant_client import search_vectors, retrieval_domains_for_query
+        # Mail-targeted queries (receipts, bills, orders, statements) also open
+        # the gmail_message domain; every other query keeps the claim-only
+        # universe exactly as benchmarked (MRR@10 0.681 with no distractors).
+        hits = await search_vectors(
+            query, limit=100, user_id=target_user_id,
+            domains=retrieval_domains_for_query(query),
+        )
 
         # Vector points can lag SQLite (supersessions, missed indexing) — only
         # trust hits whose claim is still CURRENT in the knowledge graph.
@@ -594,9 +601,19 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                         "text": str(payload.get("text", "") or ""),
                         "score": score
                     })
+                elif domain == "gmail_message":
+                    vector_mail.append({
+                        "subject": str(payload.get("subject", "") or ""),
+                        "sender_email": str(payload.get("sender_email", "") or ""),
+                        "date": str(payload.get("date", "") or ""),
+                        "section_name": str(payload.get("section_name", "") or ""),
+                        "text": str(payload.get("text", "") or ""),
+                        "score": score,
+                    })
         vector_claims.sort(key=lambda x: x["score"], reverse=True)
         vector_dossiers.sort(key=lambda x: x["score"], reverse=True)
         vector_web.sort(key=lambda x: x["score"], reverse=True)
+        vector_mail.sort(key=lambda x: x["score"], reverse=True)
     except Exception as e:
         logger.debug(f"Semantic vector search in world model context failed: {e}")
 
@@ -767,6 +784,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
         for c in vector_claims
     ) + sum(len(d.get("text", "").split()) + 10 for d in vector_dossiers)
     retrieval_words += sum(40 + len(w.get("text", "").split()) // 8 for w in vector_web)
+    retrieval_words += sum(40 + len(w.get("text", "").split()) // 8 for w in vector_mail)
     if retrieval_words:
         max_tokens = max(max_tokens or 0, int(retrieval_words / 0.75) + 30)
 
@@ -809,7 +827,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     # Do NOT stuff the prompt with random user facts. The embedding model
     # said nothing in memory is relevant — inject nothing. A lone web finding
     # above the floor is still injected: surfacing past research is the point.
-    if not vector_claims and not vector_dossiers and not vector_web and not entity_claims:
+    if not vector_claims and not vector_dossiers and not vector_web and not vector_mail and not entity_claims:
         return ""
 
     target_max_words = int(max_tokens * 0.75) if max_tokens else 200
@@ -906,6 +924,26 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
             if len(summary) > 280:
                 summary = summary[:277].rstrip() + "..."
             lines.append(f"• [WEB] {w_title} — {w['url']}{trust_mark}: {summary}")
+            current_words += 40 + len(summary.split()) // 4
+            if current_words >= target_max_words:
+                break
+        lines.append("")
+
+    # Email correspondence (gmail sections): indexed mail joins retrieval ONLY
+    # for mail-targeted queries (receipts, bills, orders, statements). Entries
+    # carry sender + subject + date so the model can answer from stored mail
+    # instead of asking the user to re-share it.
+    if vector_mail:
+        lines.append("[EMAIL RECEIPTS & CORRESPONDENCE]")
+        for m in vector_mail[:2]:
+            subject = re.sub(r"\s+", " ", (m.get("subject") or "")).strip()
+            sender = (m.get("sender_email") or "").strip() or "(unknown sender)"
+            date_s = (str(m.get("date") or "") or "date?")[:10]
+            section = f" [{m['section_name']}]" if m.get("section_name") else ""
+            summary = re.sub(r"\s+", " ", m.get("text", "") or " ").strip()
+            if len(summary) > 280:
+                summary = summary[:277].rstrip() + "..."
+            lines.append(f"• [MAIL] {subject or '(no subject)'}{section} — {sender} ({date_s}): {summary}")
             current_words += 40 + len(summary.split()) // 4
             if current_words >= target_max_words:
                 break

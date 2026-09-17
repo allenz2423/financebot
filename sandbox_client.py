@@ -537,6 +537,7 @@ async def install_python_package(
 
             resp = await client.post(
                 SANDBOX_INSTALL_URL,
+                headers=_sandbox_headers(),
                 json={
                     "package": package,
                     "timeout": effective_timeout,

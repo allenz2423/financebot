@@ -373,7 +373,7 @@ async def test_rag_context_filters_retracted_vector_hits(clean_test_entities, no
     )
     await asyncio.sleep(0)
 
-    async def fake_search(query, limit=5, user_id=None, collection_name=None):
+    async def fake_search(query, limit=5, user_id=None, collection_name=None, domains=None):
         return [{
             "score": 0.9,
             "id": "point_stale",
@@ -403,6 +403,123 @@ async def test_rag_context_filters_retracted_vector_hits(clean_test_entities, no
     ctx_retracted = await build_semantic_world_model_context("what fragrance does bob own", max_tokens=200)
     assert "Clive Christian" not in ctx_retracted
 
+
+def test_query_targets_mail_gate():
+    """The mail gate must open for commerce/correspondence cues and stay shut otherwise."""
+    from src.services.qdrant_client import query_targets_mail
+
+    assert query_targets_mail("how much did I spend at amazon this month?")
+    assert query_targets_mail("did my refund come through")
+    assert query_targets_mail("show me my latest invoices")
+    assert query_targets_mail("when does my spotify subscription renew")
+    assert query_targets_mail("what did the bank email about my overdraft")
+
+    assert not query_targets_mail("what fragrance does bob own")
+    assert not query_targets_mail("how is my portfolio doing")
+    assert not query_targets_mail("remind me about the trip to Maine")
+
+
+def test_retrieval_domains_for_query(monkeypatch):
+    """Mail queries get gmail_message appended; claim queries keep the default universe."""
+    from src.services.qdrant_client import retrieval_domains_for_query
+
+    monkeypatch.setenv("GMAIL_RETRIEVAL_ENABLED", "1")
+    domains = retrieval_domains_for_query("show me my amazon invoices")
+    assert domains is not None
+    assert domains[-1] == "gmail_message"
+    assert retrieval_domains_for_query("what fragrance does bob own") is None
+
+    monkeypatch.setenv("GMAIL_RETRIEVAL_ENABLED", "0")
+    assert retrieval_domains_for_query("show me my amazon invoices") is None
+
+
+@pytest.mark.asyncio
+async def test_rag_context_renders_email_hits_only_for_mail_queries(
+    clean_test_entities, no_vector_network, monkeypatch
+):
+    from src.services.world_model import build_semantic_world_model_context
+
+    captured = {}
+
+    async def fake_search(query, limit=5, user_id=None, collection_name=None, domains=None):
+        captured["domains"] = domains
+        if not domains or "gmail_message" not in domains:
+            return []
+        return [{
+            "score": 0.85,
+            "id": "sec_1",
+            "payload": {
+                "domain": "gmail_message",
+                "subject": "Your Amazon invoice",
+                "sender_email": "orders@amazon.com",
+                "date": "2026-09-10T09:00:00+00:00",
+                "section_name": "Body 1",
+                "text": "Total $42.50 for your order.",
+            },
+        }]
+
+    monkeypatch.setattr(no_vector_network, "search_vectors", fake_search)
+
+    # Mail-targeted query: gmail domain opened and email rendered.
+    ctx = await build_semantic_world_model_context("show me my amazon invoices", max_tokens=200)
+    assert captured["domains"] and "gmail_message" in captured["domains"]
+    assert "[EMAIL RECEIPTS & CORRESPONDENCE]" in ctx
+    assert "Your Amazon invoice" in ctx
+    assert "orders@amazon.com" in ctx
+
+    # Non-mail query: gmail domain stays closed, email never rendered.
+    ctx_no_mail = await build_semantic_world_model_context("what fragrance does bob own", max_tokens=200)
+    assert captured["domains"] is None or "gmail_message" not in captured["domains"]
+    assert "[EMAIL RECEIPTS & CORRESPONDENCE]" not in ctx_no_mail
+
+
+@pytest.mark.asyncio
+async def test_search_vectors_domains_reach_qdrant_filter(monkeypatch):
+    """The domains override must land in the Qdrant search filter."""
+    from src.services import qdrant_client as qc
+
+    captured = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"result": []}
+
+    class _FakeClient:
+        def __init__(self, timeout=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, timeout=None):
+            captured["payload"] = json
+            return _FakeResp()
+
+    async def fake_embed(text, instruction=None):
+        return [0.1] * 1024
+
+    async def fake_ensure(collection_name=None):
+        return True
+
+    monkeypatch.setattr(qc, "get_embedding", fake_embed)
+    monkeypatch.setattr(qc, "ensure_collection", fake_ensure)
+    monkeypatch.setattr(qc.httpx, "AsyncClient", _FakeClient)
+
+    await qc.search_vectors(
+        "amazon order", limit=7, user_id="u1",
+        domains=["world_model_claim", "gmail_message"],
+    )
+    domain_filter = [
+        f for f in captured["payload"]["filter"]["must"]
+        if f.get("key") == "domain"
+    ]
+    assert domain_filter == [{"key": "domain", "match": {"any": ["world_model_claim", "gmail_message"]}}]
+
 async def test_reconcile_user_vectors_converges(clean_test_entities, no_vector_network, monkeypatch):
     from src.services.qdrant_client import reconcile_user_vectors
 
@@ -419,9 +536,11 @@ async def test_reconcile_user_vectors_converges(clean_test_entities, no_vector_n
     await asyncio.sleep(0)
 
     async def fake_scroll(user_id, collection_name=None):
+        # Mirrors production payloads: index_single_claim always writes user_id
+        # on modern points; the stale point is an un-attributed legacy zombie.
         return [
             {"id": "stale-point-1", "claim_id": "claim_no_longer_exists", "domain": "world_model_claim"},
-            {"id": "active-point-1", "claim_id": cid_active, "domain": "world_model_claim"},
+            {"id": "active-point-1", "claim_id": cid_active, "domain": "world_model_claim", "user_id": "test_person:bob"},
             {"id": "snapshot-point", "claim_id": None, "domain": "financial_position"},
         ]
 

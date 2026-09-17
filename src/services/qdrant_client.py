@@ -445,11 +445,49 @@ async def upsert_points(points: List[Dict[str, Any]], collection_name: str = COL
         return resp.json()
 
 
+_MAIL_CUE_RE = re.compile(
+    r"\b(invoice|invoices|receipt|receipts|bill|billing|billed|order|orders|purchase|purchases|"
+    r"subscription|subscriptions|refund|refunds|statement|statements|payment|payments|paid|"
+    r"charge|charged|charges|transaction|transactions|shipping|delivery|shipped|renewal|renew|"
+    r"cancellation|canceled|cancelled|overdraft|overdrawn|confirmed|confirmation|email|e-mail|"
+    r"mail|gmail|inbox|newsletter|sender|spent|spend|spending|withdraw|deposit|fee|fees)\b",
+    re.IGNORECASE,
+)
+
+
+def query_targets_mail(query: str) -> bool:
+    """Deterministic gate: does this query ask about things email correspondence knows?
+
+    Receipts, bills, orders, invoices, statements, renewals and payment
+    confirmations live in mail, not in the claim KG — opening the gmail domain
+    for those queries is what turns indexed mail into usable memory. The list
+    is deliberately conservative: the claim-only universe stays untouched for
+    every non-mail query (the benchmarked MRR@10 0.681 path).
+    """
+    return bool(_MAIL_CUE_RE.search(query or ""))
+
+
+def retrieval_domains_for_query(query: str) -> Optional[List[str]]:
+    """Candidate domain universe for one retrieval query.
+
+    Returns None (use the default RENDERABLE_DOMAINS filter) except for
+    mail-targeted queries, which also open ``gmail_message`` so indexed email
+    sections join the candidate pool. GMAIL_RETRIEVAL_ENABLED=0 restores the
+    claim-only universe for every query.
+    """
+    if os.getenv("GMAIL_RETRIEVAL_ENABLED", "1") == "0" or not query_targets_mail(query):
+        return None
+    domains = list(RENDERABLE_DOMAINS)
+    domains.append("gmail_message")
+    return domains
+
+
 async def search_vectors(
     query_text: str,
     limit: int = 5,
     user_id: Optional[str] = None,
     collection_name: str = COLLECTION_NAME,
+    domains: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Search Qdrant for semantic neighbors of query_text."""
     await ensure_collection(collection_name)
@@ -464,8 +502,9 @@ async def search_vectors(
     must_filters: List[Dict[str, Any]] = []
     if user_id:
         must_filters.append({"key": "user_id", "match": {"value": str(user_id)}})
-    if RENDERABLE_DOMAINS:
-        must_filters.append({"key": "domain", "match": {"any": RENDERABLE_DOMAINS}})
+    effective_domains = RENDERABLE_DOMAINS if domains is None else domains
+    if effective_domains:
+        must_filters.append({"key": "domain", "match": {"any": effective_domains}})
     if must_filters:
         search_payload["filter"] = {"must": must_filters}
 
@@ -620,8 +659,98 @@ def _claim_point_id(claim_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"claim_{claim_id}"))
 
 
-def _gmail_point_id(user_id: str, message_id: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"gmail_{user_id}_{message_id}"))
+def _gmail_section_point_id(user_id: str, message_id: str, idx: int) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"gmail_{user_id}_{message_id}_sec_{idx}"))
+
+
+def _split_email_sections(
+    subject: str,
+    sender: str,
+    date: str,
+    body: str,
+    max_chars: int = 1600,
+) -> List[tuple[str, str]]:
+    """Split an email into (section_name, section_text) pairs.
+
+    The header (sender/date/subject) is its own section — subject text is the
+    highest-signal part of most mail and deserves a dedicated vector. The body
+    is then chunked on paragraph boundaries into ~max_chars pieces so one flat
+    pooled vector never averages a long threaded/forwarded body into mush.
+    """
+    sections: List[tuple[str, str]] = []
+    header = (
+        f"Email from {sender or '?'} on {date or '?'}\n"
+        f"Subject: {subject or '(no subject)'}"
+    )
+    sections.append(("Header", header))
+
+    body = re.sub(r"\s+", " ", (body or "")).strip()
+    if not body:
+        return sections
+
+    paras = [p.strip() for p in re.split(r"\n\s*\n|\r\n\s*\r\n", body) if p.strip()]
+    if not paras:
+        paras = [body]
+
+    part = 1
+    cur: List[str] = []
+    cur_len = 0
+    for p in paras:
+        # Hard-split any single over-long paragraph first.
+        while len(p) > max_chars:
+            if cur:
+                sections.append((f"Body {part}", " ".join(cur)))
+                part += 1
+                cur = []
+                cur_len = 0
+            sections.append((f"Body {part}", p[:max_chars]))
+            part += 1
+            p = p[max_chars:]
+        if cur_len and cur_len + len(p) > max_chars:
+            sections.append((f"Body {part}", " ".join(cur)))
+            part += 1
+            cur = []
+            cur_len = 0
+        cur.append(p)
+        cur_len += len(p)
+    if cur:
+        sections.append((f"Body {part}", " ".join(cur)))
+    return sections
+
+
+async def _delete_gmail_points_for_message(
+    user_id: str, message_id: str, collection_name: str = COLLECTION_NAME
+) -> int:
+    """Delete every indexed point for one message (a prior flat vector and/or
+    a section family) so a re-embed converges instead of stacking."""
+    base_url = _get_qdrant_url()
+    point_ids: List[str] = []
+    offset: Optional[str] = None
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            payload: Dict[str, Any] = {
+                "limit": 256,
+                "with_payload": False,
+                "filter": {
+                    "must": [
+                        {"key": "user_id", "match": {"value": str(user_id)}},
+                        {"key": "message_id", "match": {"value": str(message_id)}},
+                    ]
+                },
+            }
+            if offset:
+                payload["offset"] = offset
+            resp = await client.post(
+                f"{base_url}/collections/{collection_name}/points/scroll", json=payload
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"Qdrant scroll failed ({resp.status_code}): {resp.text}")
+            data = resp.json().get("result", {})
+            point_ids += [p["id"] for p in data.get("points", [])]
+            offset = data.get("next_page_offset")
+            if offset is None:
+                break
+    return await _delete_point_ids(point_ids, collection_name)
 
 
 async def index_gmail_message(
@@ -634,32 +763,43 @@ async def index_gmail_message(
 ) -> bool:
     """Embed and index one archived email into the vector store.
 
+    One vector per email section (header + body chunks) instead of a single
+    flat whole-message vector, so a long threaded/forwarded mail retrieves on
+    the exact part that matches a query rather than one pooled mush vector.
     Emails get domain "gmail_message", which is NOT in SEMANTIC_RETRIEVAL_DOMAINS
     by default — they are indexed (searchable, diag-nosed, future-proof) but do
-    not crowd claim retrieval with marketing noise. Extend that env var to fold
-    them into semantic RAG.
+    not crowd claim retrieval with marketing noise. Mail-targeted queries
+    (receipts/bills/orders/statements) open the domain via the deterministic
+    query gate in retrieval_domains_for_query(); set GMAIL_RETRIEVAL_ENABLED=0
+    to keep it closed for everything.
     """
     try:
-        text = (
-            f"Email from {sender or '?'} on {date or '?'}\n"
-            f"Subject: {subject or '(no subject)'}\n\n"
-            f"{body or ''}"
-        )
-        emb = await get_embedding(text)
-        point_id = _gmail_point_id(str(user_id), str(message_id))
-        await upsert_points([{
-            "id": point_id,
-            "vector": emb,
-            "payload": {
-                "user_id": str(user_id),
-                "domain": "gmail_message",
-                "message_id": str(message_id),
-                "sender_email": (sender or "")[:500],
-                "subject": (subject or "")[:500],
-                "date": date or "",
-                "text": text[:12000],
-            },
-        }])
+        sections = _split_email_sections(subject or "", sender or "", date or "", body or "")
+        if not sections:
+            return False
+        embeds = await get_embeddings([t for _, t in sections])
+        if len(embeds) != len(sections):
+            embeds = [await get_embedding(t) for _, t in sections]
+
+        points: List[Dict[str, Any]] = []
+        for i, ((name, text), vec) in enumerate(zip(sections, embeds)):
+            points.append({
+                "id": _gmail_section_point_id(str(user_id), str(message_id), i),
+                "vector": vec,
+                "payload": {
+                    "user_id": str(user_id),
+                    "domain": "gmail_message",
+                    "message_id": str(message_id),
+                    "sender_email": (sender or "")[:500],
+                    "subject": (subject or "")[:500],
+                    "date": date or "",
+                    "section_name": name,
+                    "text": text[:12000],
+                },
+            })
+
+        await _delete_gmail_points_for_message(str(user_id), str(message_id))
+        await upsert_points(points)
         return True
     except Exception as e:
         logger.warning(f"Failed to index gmail message into Qdrant: {e}")

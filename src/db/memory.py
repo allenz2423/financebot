@@ -1,12 +1,10 @@
 import sqlite3
 import json
-import httpx
 import math
-import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from src.core.state import DB_PATH, OLLAMA_URL
+from src.core.state import DB_PATH
 
 def init_epistemic_memory_schema():
     """Upgrade delilah_memories to support epistemic attributes and embeddings."""
@@ -32,23 +30,16 @@ def init_epistemic_memory_schema():
         conn.commit()
 
 async def _get_embedding(text: str) -> List[float]:
-    """Get text embedding using Ollama."""
-    # This assumes Ollama is available. In a production environment, 
-    # we would fall back to an internal model or cloud API.
-    # For now, we'll try Ollama and fallback to a dummy zero-vector 
-    # if it fails (so at least keyword search can proceed in hybrid).
+    """Get text embedding from the shared embedding stack."""
     try:
-        model = os.getenv("WAKEUP_MODEL", "nomic-embed-text") # Standard embedding model
-        # Try local Ollama
-        embed_url = OLLAMA_URL.replace("/api/chat", "/api/embeddings")
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post(embed_url, json={"model": model, "prompt": text})
-            if res.status_code == 200:
-                return res.json().get("embedding", [])
+        from src.services.qdrant_client import get_embedding
+        return await get_embedding(text)
     except Exception as e:
         print(f"Embedding failed: {e}")
-    
-    # Fallback to pseudo-embedding (hash based) just so it doesn't crash if Ollama isn't loaded
+
+    # Fallback zero-vector.  Its dimension (768) mismatches the live
+    # embedding dimension (1024), so _cosine_similarity returns 0.0 and
+    # hybrid search degrades to keyword matching.
     return [0.0] * 768
 
 def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:

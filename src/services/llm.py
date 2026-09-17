@@ -3722,6 +3722,12 @@ EXECUTIVE REPORTING & DISCORD PRESENTATION:
 - Progressive disclosure: summary first -> tool drill-down on demand.
 - Discord formatting: (1) Executive Verdict, (2) Bold Diagnostics (**Safe-to-Spend: $X**, **Health Score: Y/100**), (3) Trade-Off Analysis table, (4) Prescribed Next Steps with dollar targets.
 - LaTeX reports: In sandbox, use modern sans-serif (\usepackage{helvet}), booktabs, tcolorbox, escaped chars (\$, \%), compile in $FINANCEBOT_WORKSPACE, deliver via send_workspace_file.
+
+FILE DELIVERY PROTOCOL (user asks for a file/artifact/report):
+1. Load the needed tools in ONE call: load_tool_schemas(["run_python_sandbox", "run_shell", "send_workspace_file", "list_workspace_files"]).
+2. Generate the artifact in the sandbox with run_python_sandbox/run_shell, writing it under $FINANCEBOT_WORKSPACE.
+3. Deliver the finished artifact with send_workspace_file(path=...) — if unsure of the exact path, call list_workspace_files first.
+Never paste the raw artifact content inline as a substitute for sending the file itself.
 """
     system_prompt += """
 RUNTIME CONTRACT:
@@ -8004,8 +8010,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         if not query_str:
                             raise ValueError("query is required for search_vector_memory")
                         limit_val = int(args.get("limit", 5))
-                        from src.services.qdrant_client import search_vectors
-                        res = await search_vectors(query_str, limit=limit_val, user_id=uid)
+                        from src.services.qdrant_client import search_vectors, retrieval_domains_for_query
+                        res = await search_vectors(
+                            query_str, limit=limit_val, user_id=uid,
+                            domains=retrieval_domains_for_query(query_str),
+                        )
                         db_result = json.dumps(res, separators=(',', ':')) if isinstance(res, (dict, list)) else str(res)
                     elif func_name == "pin_knowledge_immutable":
                         from src.services.world_model import pin_knowledge_immutable as _pin_immutable
