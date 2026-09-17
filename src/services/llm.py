@@ -1182,12 +1182,12 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "request_concierge_action",
-            "description": "Concierge read-tier action gateway: run ONE supervised read (order_status / tracking / price_watch) against a domain in the user's concierge allowlist. Read-only, audited, sandboxed — never mutates accounts and never returns card numbers or other secret values (expect mask-only output). Refuses cleanly if concierge is not enabled for this user or the target domain is not allowed.",
+            "description": "Concierge action gateway. Read-tier kinds (order_status / tracking / price_watch) run ONE supervised read against a domain in the user's concierge allowlist — read-only, audited, sandboxed, mask-only output. Write-tier kinds (send_email / schedule_event / fill_form) NEVER self-execute: they validate the plan against the tenant allowlist and create a pending approval proposal that the user must ✅/✕ in Discord (via the ActionApprovalView) before any browser act occurs; the model only sees 'submitted for approval'. Refuses cleanly if concierge is not enabled, the tier is too low (writes need write/spend tier), or the target domain is not allowed.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["order_status", "tracking", "price_watch"]},
-                    "args": {"type": "object", "description": "Kind-specific arguments. order_status: merchant + order_id; tracking: courier + tracking_number; price_watch: merchant + item_name."}
+                    "kind": {"type": "string", "enum": ["order_status", "tracking", "price_watch", "send_email", "schedule_event", "fill_form"]},
+                    "args": {"type": "object", "description": "Reads: order_status {domain,order_id}, tracking {domain,tracking_id}, price_watch {domain,product}. Writes: {domain, summary, steps} where steps is a list of {action: navigate|click|type|screenshot|assert_text, sel, value?}; secret-bearing type values are masked before storage and only injected from the vault at execution."}
                 },
                 "required": ["kind", "args"]
             }
