@@ -1,5 +1,6 @@
 """B2 proposal + approval-store tests: validation, gating, persistence."""
 
+import json
 import sqlite3
 
 import pytest
@@ -17,11 +18,11 @@ from src.services.concierge.tenants import TenantStore
 ADMIN = "admin:1"
 
 
-def make(tmp_path, domain="example.com"):
+def make(tmp_path, domain="example.com", tier="write"):
     db = str(tmp_path / "c.db")
     tenants = TenantStore(db, admins=[ADMIN])
     audit = AuditLog(db)
-    tenants.enable(ADMIN, "user:1")
+    tenants.enable(ADMIN, "user:1", tier=tier)
     tenants.allow_domain(ADMIN, "user:1", domain)
     return tenants, audit, db
 
@@ -242,3 +243,149 @@ def test_approval_store_supports_rolled_back_status(tmp_path):
     p = store.get(pid)
     assert p["status"] == "rolled_back"
     assert p["result_detail"]["error"] == "step failed"
+
+
+# --- B2 hardening (security audit findings) ---
+
+
+def test_propose_read_tier_is_refused_and_audited(tmp_path):
+    tenants, audit, _ = make(tmp_path, tier="read")
+    with pytest.raises(ConciergeToolError, match="write or spend"):
+        propose_concierge_act(
+            tenant="user:1", kind="send_email", args=_steps(),
+            tenants=tenants, audit=audit,
+        )
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_refused"
+    assert "write or spend" in rows[0]["detail"]["reason"]
+
+
+def test_propose_persists_allowed_domains_on_proposal(tmp_path):
+    tenants, audit, db = make(tmp_path)
+    proposal_store = ApprovalStore(db)
+    res = propose_concierge_act(
+        tenant="user:1", kind="fill_form", args=_steps(),
+        tenants=tenants, audit=audit, store=proposal_store,
+    )
+    p = proposal_store.get(res["proposal_id"])
+    assert p["allowed_domains"] == ["example.com"]
+
+
+def test_propose_vaults_secret_type_values(tmp_path):
+    from src.security.vault import Vault, VaultRevokedError
+    tenants, audit, db = make(tmp_path)
+    proposal_store = ApprovalStore(db)
+    vault = Vault(db, master_key="test-master-key")
+    steps = [
+        {"action": "navigate", "sel": "https://example.com/login"},
+        {"action": "type", "sel": "#password", "value": "SuperSecret-Passw0rd"},
+        {"action": "type", "sel": "#user", "value": "alice"},
+        {"action": "click", "sel": "#btn"},
+    ]
+    res = propose_concierge_act(
+        tenant="user:1", kind="fill_form",
+        args={"domain": "example.com", "steps": steps},
+        tenants=tenants, audit=audit, store=proposal_store, vault=vault,
+    )
+    # the secret is masked + tunneled behind a vault_ref; plaintext never stored
+    by_sel = {s["sel"]: s for s in res["steps"]}
+    assert by_sel["#password"]["value"] == "\u2022" * 4
+    assert "vault_ref" in by_sel["#password"]
+    assert by_sel["#user"]["value"] == "alice"  # non-secret stays as-is
+    stored = proposal_store.get(res["proposal_id"])
+    assert "SuperSecret-Passw0rd" not in str(stored["args"])
+    assert "SuperSecret-Passw0rd" not in str(stored["steps"])
+    ref = by_sel["#password"]["vault_ref"]
+    # encrypted at rest, resolvable once by the executor
+    payload = json.loads(vault.resolve("user:1", ref))
+    assert payload["password|value"] == "SuperSecret-Passw0rd"
+    # terminal transition revokes the per-proposal secret
+    proposal_store.update_status(res["proposal_id"], "executed")
+    with pytest.raises(VaultRevokedError):
+        vault.resolve("user:1", ref)
+
+
+def test_propose_vaults_pan_shaped_values(tmp_path):
+    from src.security.vault import Vault
+    tenants, audit, db = make(tmp_path)
+    proposal_store = ApprovalStore(db)
+    vault = Vault(db, master_key="test-master-key")
+    res = propose_concierge_act(
+        tenant="user:1", kind="fill_form",
+        args={"domain": "example.com", "steps": [
+            {"action": "type", "sel": "#cc", "value": "4111 1111 1111 1111"},
+        ]},
+        tenants=tenants, audit=audit, store=proposal_store, vault=vault,
+    )
+    step = res["steps"][0]
+    assert "4111" not in str(step)
+    stored = proposal_store.get(res["proposal_id"])
+    assert "4111" not in str(stored["steps"])
+    assert "vault_ref" in step
+
+
+def test_propose_refuses_ephemeral_cvv_value(tmp_path):
+    tenants, audit, _ = make(tmp_path)
+    with pytest.raises(ConciergeToolError, match="can never be stored"):
+        propose_concierge_act(
+            tenant="user:1", kind="fill_form",
+            args={"domain": "example.com", "steps": [
+                {"action": "type", "sel": "#cvv", "value": "123"},
+            ]},
+            tenants=tenants, audit=audit,
+        )
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_refused"
+
+
+def test_approval_store_claim_is_atomic(tmp_path):
+    db = str(tmp_path / "s.db")
+    store = ApprovalStore(db)
+    pid = store.create(tenant="user:1", uid="1", kind="send_email", args={})
+    assert store.claim(pid) is True
+    assert store.claim(pid) is False  # second caller cannot double-execute
+    assert store.get(pid)["status"] == "approved"
+
+
+def test_approval_store_claim_refuses_expired_ttl(tmp_path):
+    db = str(tmp_path / "s.db")
+    store = ApprovalStore(db)
+    pid = store.create(tenant="user:1", uid="1", kind="send_email", args={},
+                       approval_ttl=0.0)  # window already lapsed
+    assert store.claim(pid) is False
+    assert store.get(pid)["status"] == "expired"
+
+
+def test_approval_store_expire_stale_sweeps_pending(tmp_path):
+    db = str(tmp_path / "s.db")
+    store = ApprovalStore(db)
+    pid = store.create(tenant="user:1", uid="1", kind="send_email", args={},
+                       approval_ttl=0.0)
+    alive = store.create(tenant="user:1", uid="1", kind="send_email", args={},
+                         approval_ttl=600.0)
+    # pending_for_tenant triggers the sweep: the lapsed window is expired,
+    # the fresh window stays pending
+    pending = [p["proposal_id"] for p in store.pending_for_tenant("user:1")]
+    assert pending == [alive]
+    assert store.expire_stale() == 0  # nothing left to sweep
+    assert store.get(pid)["status"] == "expired"
+    assert store.get(alive)["status"] == "pending"
+
+
+def test_approval_store_terminal_transition_revokes_vault_refs(tmp_path):
+    from src.security.vault import Vault, VaultRevokedError
+    db = str(tmp_path / "s.db")
+    vault = Vault(db, master_key="test-master-key")
+    rec = vault.store_fields(
+        tenant="user:1", kind="secret", label="act secret",
+        fields={"password|v": "hunter2"}, consumer_scope=["example.com"],
+    )
+    store = ApprovalStore(db)
+    pid = store.create(
+        tenant="user:1", uid="1", kind="fill_form",
+        args={}, steps=[{"action": "type", "sel": "#password",
+                         "value": "\u2022" * 4, "vault_ref": rec["vault_ref"]}],
+    )
+    assert store.update_status(pid, "executed") is True
+    with pytest.raises(VaultRevokedError):
+        vault.resolve("user:1", rec["vault_ref"])

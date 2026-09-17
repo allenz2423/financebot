@@ -25,16 +25,30 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from typing import List, Optional
 
 from src.core.state import bot
 from src.security.vault import DEFAULT_DB_PATH as _DB
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.state import DraftStore
-from src.services.concierge.tenants import NotAdminError, TenantError, TenantStore
+from src.services.concierge.tenants import NotAdminError, TenantError, TenantStore, is_admin
 
 AUDIT = AuditLog(_DB)
 TENANTS = TenantStore(_DB)
 DRAFTS = DraftStore(_DB)
+
+# Subcommands that read or mutate cross-tenant state: admins only. "login"
+# stays user-facing (a tenant logs into their own vault session).
+_ADMIN_ONLY_ACTIONS = frozenset({
+    "enable", "disable", "tier", "limit", "allow", "status", "kill", "audit",
+})
+
+
+def _command_gate(actor: str, action: str, admins) -> Optional[str]:
+    """Denial reason for non-admins on admin-only subcommands, else None."""
+    if action in _ADMIN_ONLY_ACTIONS and not is_admin(actor, admins):
+        return "you are not a concierge admin"
+    return None
 
 
 def _actor(ctx) -> str:
@@ -75,8 +89,11 @@ async def concierge_admin(ctx, *, raw: str = ""):
         return
 
     action = args[0].lower()
-    tenant = _tenant_of(ctx) if action != "audit" else _parse_mention(args[1:])
     actor = _actor(ctx)
+    gate_reason = _command_gate(actor, action, TENANTS.admins)
+    if gate_reason:
+        return await _deny(ctx, gate_reason)
+    tenant = _tenant_of(ctx) if action != "audit" else _parse_mention(args[1:])
 
     try:
         if action == "enable":

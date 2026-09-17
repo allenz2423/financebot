@@ -14,7 +14,15 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, List, Optional
 
-from src.services.concierge.act_actions import ACT_KINDS, ActActionError, _validate_steps, _act_target_url
+from src.security.vault import Vault, DEFAULT_DB_PATH as _DB
+from src.services.concierge.act_actions import (
+    ACT_KINDS,
+    ActActionError,
+    _validate_steps,
+    _act_target_url,
+    _secret_field_type,
+    _step_vault_refs,
+)
 from src.services.concierge.approval_store import ApprovalStore
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.browser_gate import READ_KINDS, ReadGateError
@@ -145,19 +153,67 @@ def tool_result_json(result: Dict[str, Any]) -> str:
     return json.dumps(safe, separators=(",", ":"), sort_keys=True)
 
 
+def _protect_secret_steps(
+    steps: List[Dict[str, Any]],
+    tenant: str,
+    domain: str,
+    vault: "Vault",
+) -> List[Dict[str, Any]]:
+    """Vault-inject secret-bearing type values before anything persists.
+
+    Matches the tool-schema contract ("secret-bearing type values are masked
+    before storage and only injected from the vault at execution"): the value
+    is replaced by a masked placeholder + a tenant-scoped ``vault_ref``; the
+    plaintext exists only as an encrypted vault ciphertext, decrypted once at
+    execution inside the approval callback. Values that can never be
+    persisted (cvv/captcha — FORCED_EPHEMERAL) refuse the proposal: CVV
+    re-entry at approval is a design item, not shipped yet.
+    """
+    protected: List[Dict[str, Any]] = []
+    for i, step in enumerate(steps):
+        ftype = _secret_field_type(step)
+        if ftype is None:
+            protected.append(dict(step))
+            continue
+        sel = str(step.get("sel") or step.get("key") or f"step[{i}]")
+        if ftype == "ephemeral":
+            raise ConciergeToolError(
+                f"{sel} takes a value that can never be stored (cvv/captcha) — "
+                "CVV re-entry at approval is not supported yet; drop that step"
+            )
+        vault_kind = "payment" if ftype in ("card_pan", "card_exp") else "secret"
+        rec = vault.store_fields(
+            tenant=tenant,
+            kind=vault_kind,
+            label=f"concierge act step {sel}",
+            fields={f"{ftype}|value": str(step.get("value") or "")},
+            consumer_scope=[domain],
+        )
+        s = dict(step)
+        s["value"] = "\u2022" * 4
+        s["vault_ref"] = rec["vault_ref"]
+        s["vault_kind"] = vault_kind
+        protected.append(s)
+    return protected
+
+
 def propose_concierge_act(
     tenant: str,
     kind: str,
     args: Dict[str, Any],
     tenants: TenantStore,
     audit: AuditLog,
+    store: Optional[ApprovalStore] = None,
+    vault: Optional[Vault] = None,
 ) -> Dict[str, Any]:
     """Validate + store a write-tier act proposal awaiting human approval.
 
     Writes are never self-executing: the model only *proposes*, a human must
     approve via the Discord ``ActionApprovalView``. This function performs
-    all pre-execution validation (tenant enabled, domain allowlisted, steps
-    well-formed) and persists a pending proposal.
+    all pre-execution validation (tenant enabled AND tier-gated, domain
+    allowlisted, steps well-formed + navigate targets gated) and persists a
+    pending proposal carrying the validated allowlist so execution re-checks
+    against exactly what was gated here.
     """
     if kind not in ACT_KINDS:
         raise ConciergeToolError(
@@ -174,9 +230,28 @@ def propose_concierge_act(
     allowed = status.get("allow_domains") or []
     ttl = _approval_ttl(status)
 
+    tier = str(status.get("tier") or "read")
+    if tier not in ("write", "spend"):
+        audit.append(
+            actor=tenant, action="act_refused", tenant=tenant,
+            subject=kind,
+            detail={
+                "reason": f"{kind} requires write or spend tier (tenant tier: {tier})",
+                "kind": kind,
+            },
+        )
+        raise ConciergeToolError(
+            f"concierge tier '{tier}' cannot request write-tier '{kind}' "
+            "(needs write or spend)"
+        )
+
     try:
-        steps = _validate_steps(args.get("steps"))
+        steps = _validate_steps(args.get("steps"), allowed_domains=allowed)
     except ActActionError as exc:
+        audit.append(
+            actor=tenant, action="act_refused", tenant=tenant,
+            subject=kind, detail={"reason": str(exc)[:300], "kind": kind},
+        )
         raise ConciergeToolError(str(exc)) from exc
 
     try:
@@ -188,22 +263,36 @@ def propose_concierge_act(
         )
         raise ConciergeToolError(str(exc)) from exc
 
+    domain = str(args.get("domain") or "").strip().lower()
+    vault_obj = vault or Vault()
+    try:
+        protected_steps = _protect_secret_steps(steps, tenant, domain, vault_obj)
+    except ConciergeToolError as exc:
+        audit.append(
+            actor=tenant, action="act_refused", tenant=tenant,
+            subject=kind, detail={"reason": str(exc)[:300], "kind": kind},
+        )
+        raise
+
     audit.append(
         actor=tenant, action="act_proposed", tenant=tenant,
-        subject=kind, detail={"kind": kind, "url": url, "steps": len(steps)},
+        subject=kind, detail={"kind": kind, "url": url, "steps": len(protected_steps)},
     )
 
     uid = tenant.split(":", 1)[1] if tenant.startswith("user:") else ""
-    store = ApprovalStore()
-    proposal_id = store.create(
-        tenant=tenant, uid=uid, kind=kind, args=args,
-        url=url, steps=steps, approval_ttl=ttl,
+    safe_args = dict(args)
+    safe_args["steps"] = protected_steps
+    proposal_store = store or ApprovalStore()
+    proposal_id = proposal_store.create(
+        tenant=tenant, uid=uid, kind=kind, args=safe_args,
+        url=url, steps=protected_steps, approval_ttl=ttl,
+        allowed_domains=allowed,
     )
     return {
         "proposal_id": proposal_id,
         "kind": kind,
         "url": url,
-        "steps": steps,
+        "steps": protected_steps,
         "status": "pending",
         "approval_ttl": ttl,
         "message": (

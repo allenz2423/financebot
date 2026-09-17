@@ -23,6 +23,13 @@ from src.services.concierge.audit import AuditLog
 from src.services.concierge.browser_gate import ReadGateError, resolve_action_target
 
 _PAN_LIKE = re.compile(r"\b\d{13,19}\b")
+# 12-19 digit account runs written in 4-digit groups ("4111 1111 1111
+# 1111", "4111-1111-1111-1111"): contiguous-run masking alone misses these.
+_PAN_GROUPED = re.compile(r"(?<!\d)\d{4}(?:[ \-]\d{4}){2,3}(?!\d)")
+# Long-lived credential/API token shapes that must never surface in output.
+_TOKEN_LIKE = re.compile(
+    r"\b(?:sk-|ghp_|gho_|glpat|ya29\.|xox[baprs]-|AKIA)[A-Za-z0-9_\-]{8,}\b"
+)
 _SECRET_KEYS = ("password", "secret", "token", "api_key", "authorization", "pan", "cvv")
 
 MAX_SUMMARY_CHARS = 2000
@@ -33,9 +40,15 @@ class ReadActionError(ValueError):
 
 
 def _mask_value(value: str) -> str:
-    """Mask literal secret-looking values in read output (PAN runs)."""
+    """Mask literal secret-looking values in read output.
+
+    Covers contiguous PAN runs, grouped (spaced/hyphenated) account runs,
+    and long-lived token shapes (sk-…, ghp_…, …) — never the surrounding text.
+    """
     text = value if isinstance(value, str) else str(value)
     text = _PAN_LIKE.sub("\u2022" * 4, text)
+    text = _PAN_GROUPED.sub("\u2022" * 4, text)
+    text = _TOKEN_LIKE.sub("\u2022" * 4, text)
     return text
 
 
@@ -250,5 +263,9 @@ __all__ = [
     "perform_read_action_async",
     "ReadActionError",
     "_mask_dict",
+    "_mask_value",
     "_summary_from_text",
+    "_PAN_LIKE",
+    "_PAN_GROUPED",
+    "_TOKEN_LIKE",
 ]

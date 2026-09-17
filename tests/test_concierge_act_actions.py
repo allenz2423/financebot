@@ -269,3 +269,145 @@ def test_act_outcome_executed_for_clean_act():
 
 def test_act_outcome_rolled_back_for_failed_act():
     assert _act_outcome({"status": "error", "error": "boom"}) == "rolled_back"
+
+
+# --- B2 write-tier hardening (security audit findings) ---
+
+
+def test_perform_act_navigate_to_non_allowlisted_host_refuses_before_nav(tmp_path):
+    """Step-level SSRF gate: a navigate step to a host outside the allowlist is
+    refused (audited act_refused) and the actuator never drives the target."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="x")
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "navigate", "sel": "https://169.254.169.254/latest/meta-data/"},  # link-local / non-allowlisted
+        ],
+    }
+    with pytest.raises(ActActionError, match="not allowed"):
+        perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_refused"
+    # the plan is gated up front — the actuator never drives the disallowed target
+    assert act.navigate_calls == []
+
+
+def test_perform_act_navigate_internal_host_fails_closed(tmp_path):
+    """SSRF gate is checked at propose AND re-checked at execute: a plan whose
+    navigate targets the internal metadata host is refused even when the plan's
+    own 'domain' field was allowlisted."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="x")
+    plan = {
+        "domain": "example.com",
+        "steps": [{"action": "navigate", "sel": "http://169.254.169.254/latest/meta-data/"}],
+    }
+    with pytest.raises(ActActionError, match="not allowed"):
+        perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    assert act.navigate_calls == []
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_refused"
+
+
+def test_perform_act_resolves_vault_ref_secret_into_type_value(tmp_path):
+    """Executor-side secret injection: a type step carrying a vault_ref is
+    resolved through the caller-provided resolver and the plaintext never
+    leaves the resolver boundary (result steps stay masked)."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="done")
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "type", "sel": "#user", "value": "alice"},
+            {"action": "type", "sel": "#password", "value": "\u2022" * 4,
+             "vault_ref": "vref-1"},
+        ],
+    }
+
+    def _resolver(ref):
+        assert ref == "vref-1"
+        return "SuperSecret-Passw0rd"
+
+    res = perform_act(
+        "fill_form", plan, ALLOW, "user:1", act, audit=audit,
+        resolve_secret=_resolver,
+    )
+    assert res["status"] == "ok"
+    assert act.type_calls == [
+        ("#user", "alice"), ("#password", "SuperSecret-Passw0rd"),
+    ]
+    by_sel = {s["sel"]: s["value"] for s in res["steps"] if s.get("action") == "type"}
+    assert by_sel["#password"] == "\u2022" * 4
+    rows = audit.tail(limit=5)
+    assert "SuperSecret-Passw0rd" not in str(rows[0]["detail"])
+
+
+def test_perform_act_secret_shaped_value_without_ref_fails_closed(tmp_path):
+    """A secret-bearer field that reaches execution with a live value and no
+    vault_ref must fail closed: the plaintext is never typed into the site."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="done")
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "type", "sel": "#password", "value": "hunter2"},  # no vault_ref
+        ],
+    }
+    res = perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    assert res["status"] == "error"
+    assert "vault_ref" in res["error"]
+    assert act.type_calls == []  # plaintext never left the executor boundary
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_fill_form"
+    assert rows[0]["detail"]["ok"] is False
+
+
+def test_perform_act_assert_text_value_mismatch_is_error(tmp_path):
+    """assert_text semantics: element must be visible AND the expected value
+    must appear in the page text; a mismatch is captured, not swallowed."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="Welcome back!", visible=True)
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "assert_text", "sel": "#banner", "value": "Unauthorized"},
+        ],
+    }
+    res = perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    assert res["status"] == "error"
+    assert "expected" in res["error"]
+    rows = audit.tail(limit=5)
+    assert rows[0]["detail"]["ok"] is False
+
+
+def test_perform_act_assert_text_value_present_passes(tmp_path):
+    """assert_text passes only when the element is visible AND the expected
+    value is present in the page text (not just element existence)."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="Welcome back, alice!", visible=True)
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "assert_text", "sel": "#banner", "value": "Welcome back"},
+        ],
+    }
+    res = perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    assert res["status"] == "ok"
+
+
+def test_perform_act_receipt_masks_token_like_values(tmp_path):
+    """Receipt extraction must mask token-like secrets (sk-/ghp_/glpat...)."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="Invoice ref: sk-1234567890abcdef confirmed. Total: $9.99")
+    res = perform_act("fill_form", _plan(), ALLOW, "user:1", act, audit=audit)
+    rec = res.get("receipt") or {}
+    for v in rec.values():
+        assert "sk-1234567890abcdef" not in str(v)
+    rows = audit.tail(limit=5)
+    assert "sk-1234567890abcdef" not in str(rows[0]["detail"])

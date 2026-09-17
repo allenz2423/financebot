@@ -70,3 +70,33 @@ def test_validation_errors(tmp_path):
         ts.set_spend_cap("user:1", "user:3", -1.0)
     with pytest.raises(TenantError):
         ts.allow_domain("user:1", "user:3", "a..b")
+
+
+# --- command-gate hardening (security audit finding: admin disclosure) ---
+
+
+def test_command_gate_blocks_non_admins_on_admin_actions():
+    from src.bot.concierge_commands import _command_gate
+    for action in ("enable", "disable", "tier", "limit", "allow", "status",
+                   "kill", "audit"):
+        assert _command_gate("user:2", action, ADMINS) is not None
+        assert "not a concierge admin" in _command_gate("user:2", action, ADMINS)
+
+
+def test_command_gate_allows_admins_on_admin_actions():
+    from src.bot.concierge_commands import _command_gate
+    for action in ("enable", "disable", "tier", "limit", "allow", "status",
+                   "kill", "audit"):
+        assert _command_gate("user:1", action, ADMINS) is None
+
+
+def test_command_gate_login_is_exempt_for_everyone():
+    from src.bot.concierge_commands import _command_gate
+    assert _command_gate("user:2", "login", ADMINS) is None
+    assert _command_gate("user:1", "login", ADMINS) is None
+
+
+def test_command_gate_unknown_actions_are_not_admin_only():
+    from src.bot.concierge_commands import _command_gate
+    assert _command_gate("user:2", "totally_unknown", ADMINS) is None
+    assert _command_gate("user:2", "enablex", ADMINS) is None

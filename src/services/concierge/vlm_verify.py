@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from src.services.concierge.browser_driver import screenshot_page
+from src.services.concierge.browser_gate import validate_target_url
 
 
 def _expected_strings(steps: List[Dict[str, Any]]) -> List[str]:
@@ -105,8 +106,16 @@ async def verify_act(
     steps: List[Dict[str, Any]],
     page_text: str = "",
     timeout_ms: int = 30000,
+    allowed_domains: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Public entry: assert that expected outcomes are visible post-execution."""
+    """Public entry: assert that expected outcomes are visible post-execution.
+
+    ``allowed_domains`` (when given) re-gates the re-navigation target before
+    the verification screenshot, so the post-execution browser window is held
+    to the same SSRF/allowlist rules as the act itself.
+    """
+    if allowed_domains:
+        validate_target_url(url, allowed_domains)
     expected = _expected_strings(steps)
     if expected and page_text:
         # Fast path: if all expected strings are already in the page text,

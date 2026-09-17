@@ -8,6 +8,7 @@ from src.services.concierge.read_actions import (
     MAX_SUMMARY_CHARS,
     ReadActionError,
     _mask_dict,
+    _mask_value,
     _summary_from_text,
     perform_read_action,
     perform_read_action_async,
@@ -258,3 +259,42 @@ def test_price_watch_gate_async():
         ALLOW, "user:1", async_fetch,
     ))
     assert res["price"]["verdict"] == "sale"
+
+
+# --- masking hardening (security audit findings) ---
+
+
+def test_mask_value_masks_grouped_pan():
+    for grouped in ("4111 1111 1111 1111", "4111-1111-1111-1111",
+                    "4111 1111 1111"):
+        assert _mask_value("paid with " + grouped + " ok") == "paid with " + "\u2022" * 4 + " ok"
+
+
+def test_mask_value_masks_token_like_shapes():
+    for token in ("sk-1234567890abcdef", "ghp_abcdefghijklmnopqrst",
+                  "glpat-abcdef123456", "ya29.abcdefghijklmnopqrstuvwx",
+                  "AKIAIOSFODNN7EXAMPLE"):
+        assert _mask_value("token " + token + " end") == "token " + "\u2022" * 4 + " end"
+
+
+def test_mask_value_masks_contiguous_pan():
+    assert _mask_value("card 4111111111111111 total") == "card " + "\u2022" * 4 + " total"
+
+
+def test_mask_value_leaves_plain_text_untouched():
+    assert _mask_value("Your order ORD-123 shipped for $19.99") == \
+        "Your order ORD-123 shipped for $19.99"
+
+
+def test_mask_value_masked_text_in_read_summary(tmp_path):
+    audit = AuditLog(str(tmp_path / "a.db"))
+    fetcher = fake_fetcher(
+        "https://example.com/tracking/1Z9",
+        text="ref sk-1234567890abcdef and card 4111 1111 1111 1111",
+    )
+    res = perform_read_action(
+        "tracking", {"domain": "example.com", "tracking_id": "1Z9"},
+        ALLOW, "user:1", fetcher, audit=audit,
+    )
+    assert "sk-1234567890abcdef" not in res["summary"]
+    assert "4111 1111 1111 1111" not in res["summary"]

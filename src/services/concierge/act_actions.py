@@ -19,11 +19,17 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.browser_gate import ReadGateError, _check_domain, validate_target_url
-from src.services.concierge.read_actions import _mask_value, _summary_from_text, _PAN_LIKE
+from src.services.concierge.read_actions import (
+    _mask_value,
+    _summary_from_text,
+    _PAN_LIKE,
+    _PAN_GROUPED,
+    _TOKEN_LIKE,
+)
 
 # Write-tier kinds. Read kinds ("order_status"... ) stay in browser_gate.READ_KINDS.
 ACT_KINDS = frozenset({"send_email", "schedule_event", "fill_form"})
@@ -31,9 +37,24 @@ ACT_KINDS = frozenset({"send_email", "schedule_event", "fill_form"})
 # Each act plan is a list of validated steps. Only these action verbs are
 # permitted; selectors must reference the allowlisted host.
 VALID_STEP_ACTIONS = frozenset({"navigate", "click", "type", "screenshot", "assert_text"})
-_SECRET_KEYS = ("password", "secret", "token", "api_key", "authorization", "pan", "cvv")
+_SECRET_KEYS = (
+    "password", "pwd", "secret", "token", "api_key", "authorization",
+    "bearer", "pan", "cvv", "ccv", "cvc", "card", "otp", "captcha",
+)
 MAX_STEP_TEXT = 4096
 MAX_SUMMARY_CHS = 2000
+
+# Type-step value classification, most specific first. Maps selector/key
+# substrings to a vault field type; "ephemeral" fields (cvv/captcha) can
+# never be persisted and re-entry is not implemented yet.
+_SECRET_FIELD_SNIFF = (
+    ("ephemeral", ("cvv", "cvc", "ccv", "captcha")),
+    ("card_pan", ("pan", "card")),
+    ("card_exp", ("exp", "expiry", "expiration")),
+    ("otp", ("otp", "2fa", "totp", "authenticator")),
+    ("token", ("token", "api_key", "authorization", "bearer")),
+    ("password", ("password", "pwd", "passwd")),
+)
 
 # Per-kind required arg keys (everything else is rejected up front).
 _ACT_ARG_KEYS = {
@@ -54,8 +75,13 @@ _RECEIPT_CONFIRM_RE = re.compile(
 
 
 def _mask_receipt(value: str) -> str:
-    """Mask PAN-shaped substrings in a receipt field; pass others through."""
-    return _mask_value(value) if _PAN_LIKE.search(value) else value
+    """Mask secret-shaped substrings in a receipt field; pass others through.
+
+    Applies the shared masker (PAN runs, grouped account runs, token shapes)
+    so e.g. an "Invoice ref: sk-1234abcd" page line cannot surface a raw
+    credential in the Discord receipt line.
+    """
+    return _mask_value(value)
 
 
 def _extract_receipt(text: str) -> Dict[str, str]:
@@ -108,7 +134,51 @@ class Actuator:
     def element_visible(self, selector: str) -> bool: ...  # pragma: no cover
 
 
-def _validate_steps(steps: Any) -> List[dict]:
+def _secret_field_type(step: Dict[str, Any]) -> Optional[str]:
+    """Classify a type step's value for secret handling.
+
+    Returns a vault field type (``card_pan``/``card_exp``/``otp``/``token``/
+    ``password``/``text``-style) when the value must be vault-injected,
+    ``"ephemeral"`` when it can never be persisted (cvv/captcha), or None
+    when the value is not secret-bearing and can be stored as-is.
+    """
+    if not isinstance(step, dict) or step.get("action") != "type":
+        return None
+    value = str(step.get("value") or "")
+    if _PAN_LIKE.search(value) or _PAN_GROUPED.search(value):
+        return "card_pan"
+    if _TOKEN_LIKE.search(value):
+        return "token"
+    sel = (str(step.get("sel") or "") + str(step.get("key") or "")).lower()
+    for ftype, needles in _SECRET_FIELD_SNIFF:
+        for needle in needles:
+            if needle in sel:
+                return ftype
+    return None
+
+
+def _step_vault_refs(steps: List[Dict[str, Any]]) -> List[str]:
+    """Collect the vault refs referenced by an act plan (for lifecycle mgmt)."""
+    return [
+        str(step["vault_ref"]) for step in steps or []
+        if isinstance(step, dict) and step.get("vault_ref")
+    ]
+
+
+def _validate_step_navigations(steps: List[dict], allowed_domains: List[str]) -> None:
+    """Gate every step-level navigate target: allowlist + SSRF/DNS-public.
+
+    Refused targets raise ReadGateError BEFORE any actuator work starts, so a
+    tampered or hostile plan can never drive the browser toward an internal
+    host (ollama/qdrant/browserless/… or cloud metadata).
+    """
+    for i, step in enumerate(steps):
+        if step.get("action") != "navigate":
+            continue
+        validate_target_url(str(step.get("sel") or ""), allowed_domains)
+
+
+def _validate_steps(steps: Any, allowed_domains: Optional[List[str]] = None) -> List[dict]:
     if not isinstance(steps, list) or not steps:
         raise ActActionError("act args must include a non-empty 'steps' list")
     cleaned: List[dict] = []
@@ -124,6 +194,11 @@ def _validate_steps(steps: Any) -> List[dict]:
                 raise ActActionError(f"step[{i}] type value exceeds {MAX_STEP_TEXT} chars")
         if "sel" not in step and action not in ("screenshot", "assert_text"):
             raise ActActionError(f"step[{i}] '{action}' requires a 'sel' selector")
+        if action == "navigate" and allowed_domains:
+            try:
+                validate_target_url(str(step.get("sel") or ""), allowed_domains)
+            except ReadGateError as exc:
+                raise ActActionError(f"step[{i}] navigate target refused: {exc}") from exc
         cleaned.append(step)
     return cleaned
 
@@ -161,11 +236,18 @@ def perform_act(
     actuator: "Actuator",
     audit: Optional[AuditLog] = None,
     include_screenshot: bool = True,
+    resolve_secret: Optional[Callable[[str], str]] = None,
 ) -> dict:
     """Run one audited write action (proposal side; execution is approved elsewhere).
 
-    Gating is identical to reads (allowlist + SSRF). The actuator drives the
-    approved plan inside the disposable browser. Returns a MASK-ONLY dict.
+    Gating is identical to reads (allowlist + SSRF): the initial URL AND every
+    step-level navigate target are validated against the tenant allowlist +
+    DNS-public rules BEFORE any actuator work, and a refusal is audited as
+    ``act_refused``. Secret-bearing type values are never typed raw: they
+    arrive via a ``vault_ref`` resolved by ``resolve_secret`` (vault-injected
+    at execution); a secret-shaped value without a ref fails closed. The
+    actuator drives the approved plan inside the disposable browser. Returns
+    a MASK-ONLY dict.
     """
     if kind not in ACT_KINDS:
         raise ActActionError(
@@ -179,6 +261,7 @@ def perform_act(
     steps = _validate_steps(args.get("steps"))
 
     try:
+        _validate_step_navigations(steps, allowed_domains)
         url = _act_target_url(kind, args, allowed_domains)
     except ReadGateError as exc:
         if audit is not None:
@@ -193,20 +276,39 @@ def perform_act(
         actuator.navigate(url)
         if include_screenshot:
             actuator.screenshot()
-        for step in steps:
+        for i, step in enumerate(steps):
             action = step["action"]
             if action == "navigate":
                 actuator.navigate(step["sel"])
             elif action == "click":
                 actuator.click(step["sel"])
             elif action == "type":
-                actuator.type_text(step["sel"], step.get("value", ""))
+                value = str(step.get("value") or "")
+                vault_ref = step.get("vault_ref")
+                if vault_ref:
+                    if resolve_secret is None:
+                        raise ActActionError(
+                            f"step[{i}] {step['sel']!r} has vault_ref but no resolver"
+                        )
+                    value = resolve_secret(str(vault_ref))
+                elif _secret_field_type(step) is not None:
+                    raise ActActionError(
+                        f"step[{i}] secret-bearing type value for {step['sel']!r} "
+                        "must be vault-injected (vault_ref missing)"
+                    )
+                actuator.type_text(step["sel"], value)
             elif action == "screenshot":
                 if include_screenshot:
                     actuator.screenshot()
             elif action == "assert_text":
-                if not actuator.element_visible(step["sel"]) and not actuator.get_text():
+                if not actuator.element_visible(step["sel"]):
                     raise ActActionError(f"assert_text failed for {step['sel']}")
+                expected = str(step.get("value") or "")
+                if expected and expected not in (actuator.get_text() or ""):
+                    raise ActActionError(
+                        f"assert_text failed for {step['sel']}: "
+                        f"expected {expected!r} not on page"
+                    )
     except Exception as exc:  # noqa: BLE001 — surface but keep audit + mask
         err = f"{type(exc).__name__}: {exc}"
 
@@ -247,4 +349,8 @@ __all__ = [
     "ActActionError",
     "Actuator",
     "perform_act",
+    "_validate_steps",
+    "_validate_step_navigations",
+    "_secret_field_type",
+    "_step_vault_refs",
 ]

@@ -52,3 +52,32 @@ def test_verify_act_no_assertions_short_circuits():
         page_text="",
     ))
     assert result["verdict"] == "no_assertions"
+
+
+def test_verify_act_renavigation_gated_by_allowed_domains():
+    """The post-execution re-navigation must be held to the same allowlist:
+    an out-of-scope URL raises before any screenshot/VLM work happens."""
+    from src.services.concierge.browser_gate import ReadGateError
+    import asyncio
+    try:
+        asyncio.run(verify_act(
+            url="http://169.254.169.254/latest/meta-data/",
+            steps=[{"action": "assert_text", "sel": "#x", "value": "hi"}],
+            page_text="",
+            allowed_domains=["example.com"],
+        ))
+        raise AssertionError("verify_act should have refused the re-navigation")
+    except ReadGateError as exc:
+        assert "not allowed" in str(exc)
+
+
+def test_verify_act_allows_renavigation_inside_scope():
+    """Same-scope re-navigation passes the gate and short-circuits on text."""
+    import asyncio
+    res = asyncio.run(verify_act(
+        url="https://example.com/orders",
+        steps=[{"action": "assert_text", "sel": "#x", "value": "Shipped"}],
+        page_text="Your order Shipped today",
+        allowed_domains=["example.com"],
+    ))
+    assert res["verdict"] == "verified"
