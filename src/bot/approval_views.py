@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import discord
 
-from src.services.concierge.act_actions import Actuator, perform_act
+from src.services.concierge.act_actions import Actuator, perform_act, _act_outcome
 from src.services.concierge.approval_store import ApprovalStore
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.tenants import TenantStore
@@ -183,8 +183,9 @@ class ActionApprovalView(discord.ui.View):
             verification = await verify_act(
                 proposal["url"], proposal["steps"], page_text=page_text
             )
+            outcome = _act_outcome(res)
             audit.append(
-                actor=self.tenant, action="act_executed", tenant=self.tenant,
+                actor=self.tenant, action="act_" + outcome, tenant=self.tenant,
                 subject=proposal["kind"],
                 detail={
                     "proposal_id": self.proposal_id,
@@ -194,18 +195,19 @@ class ActionApprovalView(discord.ui.View):
                 },
             )
             store.update_status(
-                self.proposal_id, "executed",
+                self.proposal_id, outcome,
                 result_detail={"act_result": res, "verification": verification},
             )
 
-            status_emoji = "✅" if res["status"] == "ok" else "⚠️"
+            status_emoji = "✅" if outcome == "executed" else "⚠️"
+            outcome_word = "executed" if outcome == "executed" else "rolled back"
             rec = res.get("receipt") or {}
             receipt_line = (
                 "\nReceipt: " + ", ".join(f"{k}={v}" for k, v in rec.items())
                 if rec else ""
             )
             msg = (
-                f"{status_emoji} **{proposal['kind']}** executed on "
+                f"{status_emoji} **{proposal['kind']}** {outcome_word} on "
                 f"{proposal['url']}\n"
                 f"Verify: **{verification['verdict']}** "
                 f"(conf {verification['confidence']:.2f})\n"

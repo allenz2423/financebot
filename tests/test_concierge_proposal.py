@@ -230,3 +230,15 @@ def test_approval_store_migrates_legacy_db(tmp_path):
     assert p is not None
     assert p["approval_ttl"] == 600.0
     assert p["status"] == "pending"
+
+
+def test_approval_store_supports_rolled_back_status(tmp_path):
+    db = str(tmp_path / "s.db")
+    store = ApprovalStore(db)
+    pid = store.create(tenant="user:1", uid="1", kind="send_email", args={})
+    assert store.update_status(
+        pid, "rolled_back", result_detail={"error": "step failed"}
+    ) is True
+    p = store.get(pid)
+    assert p["status"] == "rolled_back"
+    assert p["result_detail"]["error"] == "step failed"

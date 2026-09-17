@@ -7,6 +7,7 @@ from src.services.concierge.act_actions import (
     ACT_KINDS,
     ActActionError,
     Actuator,
+    _act_outcome,
     _extract_receipt,
     perform_act,
 )
@@ -260,3 +261,11 @@ def test_perform_act_attaches_receipt_to_result_and_audit(tmp_path):
     detail = rows[0]["detail"]
     assert detail["receipt"]["confirmation"] == "ORD-9"
     assert detail["receipt"]["total"] == "19.99"
+
+
+def test_act_outcome_executed_for_clean_act():
+    assert _act_outcome({"status": "ok"}) == "executed"
+
+
+def test_act_outcome_rolled_back_for_failed_act():
+    assert _act_outcome({"status": "error", "error": "boom"}) == "rolled_back"

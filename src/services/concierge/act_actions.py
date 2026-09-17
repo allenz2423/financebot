@@ -74,6 +74,21 @@ def _extract_receipt(text: str) -> Dict[str, str]:
     return out
 
 
+def _act_outcome(res: Dict[str, Any]) -> str:
+    """Classify a perform_act result for the proposal status machine.
+
+    ``executed`` when the act completed cleanly; ``rolled_back`` when it
+    errored mid-flight. A rolled_back act discards its disposable browser
+    session (see ``ActionApprovalView._approve`` finally -> actuator.close)
+    and is NOT marked complete — stale or partial acts can't be mistaken
+    for a successful write. The model only ever sees this via the audit
+    trail + Discord DM, never raw output.
+    """
+    if res.get("status") == "ok":
+        return "executed"
+    return "rolled_back"
+
+
 class ActActionError(ValueError):
     pass
 
