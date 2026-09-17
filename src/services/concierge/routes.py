@@ -1,4 +1,4 @@
-"""FastAPI capture page (B0: token-gated GET + POST,, no-body-logging.
+"""FastAPI capture page (B0: token-gated GET + POST, no-body-logging.
 
 
 
@@ -6,9 +6,9 @@ Follows the /linkbank/{session_id} precedent: GET renders the form from the
 stored intent (token NOT consumed); POST redeems once, stores vault fields
 encrypted, discards ephemeral fields, and returns a MASK-ONLY success object.
 
- No submitted value ever appears in a response, log, error,, or audit:
+ No submitted value ever appears in a response, log, error, or audit:
 handlers never print POST bodies, and error text carries only exception messages
-(which name labels,, never values).
+(which name labels, never values).
 
 The router is mountable on any FastAPI app (tests mount it on a bare app;
 production wires it via ``register_capture_routes`` on ``src.core.state.app``).
@@ -105,6 +105,23 @@ async def submit_capture(token: str, request: Request):
         result = process_capture_submission(store, vault, token, tenant, body)
     except (CaptureTokenError, CaptureIntentError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    # Mask-only audit row (invariant 10): labels + refs, never values.
+    try:
+        audit = request.app.state.concierge_audit
+    except AttributeError:
+        from src.services.concierge.audit import AuditLog
+        from src.security.vault import DEFAULT_DB_PATH as _VAULT_DB
+        audit = AuditLog(_VAULT_DB)
+    detail = {
+        "kind": result.get("kind"),
+        "stored": [s["vault_ref"] for s in result.get("stored", [])],
+        "ephemeral": result.get("ephemeral_fields", []),
+    }
+    try:
+        audit.append(actor=tenant, action="capture_stored", tenant=tenant,
+                     subject="capture", detail=detail)
+    except Exception:
+        pass
     return JSONResponse(result)
 
 

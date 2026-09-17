@@ -1181,6 +1181,21 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "request_concierge_action",
+            "description": "Concierge read-tier action gateway: run ONE supervised read (order_status / tracking / price_watch) against a domain in the user's concierge allowlist. Read-only, audited, sandboxed — never mutates accounts and never returns card numbers or other secret values (expect mask-only output). Refuses cleanly if concierge is not enabled for this user or the target domain is not allowed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["order_status", "tracking", "price_watch"]},
+                    "args": {"type": "object", "description": "Kind-specific arguments. order_status: merchant + order_id; tracking: courier + tracking_number; price_watch: merchant + item_name."}
+                },
+                "required": ["kind", "args"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "query_spending",
             "description": "Get finalized spending for a merchant/category, optionally bounded by date. Pending charges are excluded unless include_pending=true.",
             "parameters": {
@@ -3182,6 +3197,7 @@ BOT_TOOLS_SCHEMA = [
 
 SCHEMA_TOOL_NAMES = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
 EXPECTED_TOOL_NAMES = {
+    "request_concierge_action",
     "scrape_rendered_page",
     "find_government_forms",
     "fill_pdf_form",
@@ -4238,6 +4254,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
             # and rejecting search_web at the guard forces it to stall or
             # invent an answer instead of fetching.
             "search_web", "fetch_webpage", "scrape_rendered_page", "crawl_deeper",
+            # Concierge read-tier: offered every round so concierge-enabled
+            # users can supervise order/tracking/price reads without needing
+            # dynamic discovery; the tenant gate refuses for other users.
+            "request_concierge_action",
         }
         if not _audit_is_active():
             if context_policy["gmail_only"]:
@@ -6440,6 +6460,41 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         # Replace user_id = ? with actual user_id, allowing flexible spacing
                         q = re.sub(r"user_id\s*=\s*\?", f"user_id = '{uid}'", q)
                         db_result = verify_claim(args.get("claim", ""), q, uid)
+                    elif func_name == "request_concierge_action":
+                        # B1 concierge read-tier: tenant identity is derived from
+                        # the interaction (uid), never model-supplied. Audited +
+                        # sandboxed by the executor; no approval by design.
+                        try:
+                            from src.services.concierge.llm_tool import (
+                                ConciergeToolError,
+                                request_concierge_action_async,
+                                tool_result_json,
+                            )
+                            from src.services.concierge.tenants import TenantStore
+                            from src.services.concierge.audit import AuditLog
+                            from src.security.vault import DEFAULT_DB_PATH as _concierge_db
+                            from src.services.browserless import scrape_rendered_page as _scrape_page
+
+                            async def _concierge_fetch(url: str) -> dict:
+                                res = await _scrape_page(url, timeout_ms=30000)
+                                if not isinstance(res, dict):
+                                    return {"text": "", "screenshot": None}
+                                return {"text": str(res.get("text") or ""), "screenshot": None}
+
+                            res = await request_concierge_action_async(
+                                tenant="user:" + str(uid),
+                                kind=str(args.get("kind") or "") if args.get("kind") is not None else "",
+                                args=dict(args.get("args") or {}),
+                                tenants=TenantStore(_concierge_db),
+                                audit=AuditLog(_concierge_db),
+                                fetch_async=_concierge_fetch,
+                                include_screenshot=True,
+                            )
+                            db_result = tool_result_json(res)
+                        except ConciergeToolError as exc:
+                            db_result = "Concierge refused: " + str(exc)
+                        except Exception as exc:  # noqa: BLE001 — report back to model
+                            db_result = f"Concierge read failed: {type(exc).__name__}: {exc}"
                     elif func_name == "list_world_model_claims":
                         db_result = json.dumps(
                             list_world_model_claims(
