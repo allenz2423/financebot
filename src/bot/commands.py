@@ -1,4 +1,5 @@
 import src.core.state
+import src.bot.concierge_commands  # noqa: F401  (registers !concierge admin plane)
 import html
 import json
 import os
@@ -87,6 +88,10 @@ from src.db.queries import *
 from src.services.llm import *
 from src.db.prefs import set_user_timezone, get_user_timezone
 from src.services.analyst import run_autonomous_analyst
+
+# Mount the concierge credential-capture router on the shared app.
+from src.services.concierge.routes import register_capture_routes
+register_capture_routes(app)
 
 
 

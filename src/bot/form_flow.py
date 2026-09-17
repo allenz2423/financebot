@@ -58,8 +58,41 @@ class StartFormView(discord.ui.View):
                 "Only the person who requested this form can fill it out.", ephemeral=True
             )
             return
-        modal = FormModal(self.session_id, 0, self.owner_uid)
-        await interaction.response.send_modal(modal)
+        try:
+            sess = get_session(self.session_id)
+            if sess is None:
+                await interaction.response.send_message(
+                    "This form session is no longer available. "
+                    "Ask Delilah to create a new one.",
+                    ephemeral=True,
+                )
+                return
+            # Resume, don't reset: open the first page with any unanswered
+            # question. This keeps a form alive if the user misses the
+            # ephemeral "Continue" button and clicks Start again — a
+            # half-filled form carries on instead of silently restarting.
+            resume_index = 0
+            for idx, page in enumerate(sess.pages):
+                if any(q["key"] not in sess.answers for q in page["questions"]):
+                    resume_index = idx
+                    break
+            print(
+                f" [FORM] StartFormView opening page {resume_index + 1}"
+                f" of {len(sess.pages)} for session={self.session_id}",
+                flush=True,
+            )
+            modal = FormModal(self.session_id, resume_index, self.owner_uid)
+            await interaction.response.send_modal(modal)
+        except Exception as exc:
+            print(f" [FORM] _start send_modal failed: {exc}")
+            try:
+                await interaction.response.send_message(
+                    "Couldn't open the form (discord rejected the modal). "
+                    "Try asking Delilah for the form again.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
 
 class FormModal(discord.ui.Modal):
@@ -79,10 +112,21 @@ class FormModal(discord.ui.Modal):
         self.owner_uid = int(owner_uid)
 
         for q in page["questions"]:
+            # Discord hard limits: label <= 45 chars, placeholder <= 100 chars.
+            # The schema service is generous (200/4000) because the LLM emits
+            # free text; the trim happens here at the platform boundary. An
+            # over-long label/placeholder makes Discord reject the whole modal
+            # with HTTP 400, so the form would appear completely dead.
+            label = q["label"]
+            if len(label) > 45:
+                label = label[:42] + "…"
+            placeholder = q.get("help_text") or q["label"] or "Your answer"
+            if len(placeholder) > 100:
+                placeholder = placeholder[:97] + "…"
             self.add_item(
                 discord.ui.TextInput(
-                    label=q["label"][:100],
-                    placeholder=(q.get("help_text") or q["label"] or "Your answer")[:4000],
+                    label=label,
+                    placeholder=placeholder,
                     custom_id=q["key"][:100],
                     style=TEXT_STYLE.get(q["input_type"], discord.TextStyle.short),
                     required=q["required"],
@@ -182,8 +226,19 @@ class PageAdvanceView(discord.ui.View):
                 "Only the form owner can continue.", ephemeral=True
             )
             return
-        modal = FormModal(self.session_id, self.page_index, self.owner_uid)
-        await interaction.response.send_modal(modal)
+        try:
+            modal = FormModal(self.session_id, self.page_index, self.owner_uid)
+            await interaction.response.send_modal(modal)
+        except Exception as exc:
+            print(f" [FORM] _continue send_modal failed: {exc}")
+            try:
+                await interaction.response.send_message(
+                    "Couldn't open the next page (discord rejected the modal). "
+                    "Try asking Delilah for the form again.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="✕")
     async def _close(self, interaction: discord.Interaction, button: discord.ui.Button):

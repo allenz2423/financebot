@@ -16,15 +16,12 @@ file makes the validation/assertion logic trivially unit-testable.
 from __future__ import annotations
 
 import uuid
-import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from src.services.world_model import assert_claim
 from src.services.qdrant_client import index_single_claim
-
-logger = logging.getLogger(__name__)
 
 # In-memory form sessions. These are ephemeral by design: a form is tied to an
 # active advisor turn and is discarded once answered or when the session
@@ -91,36 +88,46 @@ def validate_form_schema(form_schema: Any) -> tuple[str, str, List[Dict[str, Any
         questions = page.get("questions")
         if not isinstance(questions, list) or not questions:
             raise FormValidationError(f"page {i} ({page_title}) requires a non-empty questions array")
-        if len(questions) > 5:
-            raise FormValidationError(f"page {i} ({page_title}) has at most 5 questions")
 
-        norm_qs: List[Dict[str, Any]] = []
-        for j, q in enumerate(questions):
-            if not isinstance(q, dict):
-                raise FormValidationError(f"question {j} on page {i} must be an object")
-            key = str(q.get("key") or "").strip()
-            if not key:
-                raise FormValidationError(f"question {j} on page {i} requires a 'key'")
-            if len(key) > 100:
-                raise FormValidationError(f"question {j} on page {i} has a 'key' over 100 chars")
-            if key in seen_keys:
-                raise FormValidationError(f"duplicate question key '{key}' across the form")
-            seen_keys.add(key)
+        # Discord modals hold at most 5 text inputs, so an over-long page is
+        # split into multiple pages instead of rejected. Models routinely emit
+        # 6+ questions per page; failing here costs a whole cloud round-trip.
+        chunks = [questions[k : k + 5] for k in range(0, len(questions), 5)]
+        for ci, chunk in enumerate(chunks):
+            norm_qs: List[Dict[str, Any]] = []
+            for j, q in enumerate(chunk):
+                if not isinstance(q, dict):
+                    raise FormValidationError(f"question {j} on page {i} must be an object")
+                key = str(q.get("key") or "").strip()
+                if not key:
+                    raise FormValidationError(f"question {j} on page {i} requires a 'key'")
+                if len(key) > 100:
+                    raise FormValidationError(f"question {j} on page {i} has a 'key' over 100 chars")
+                if key in seen_keys:
+                    raise FormValidationError(f"duplicate question key '{key}' across the form")
+                seen_keys.add(key)
 
-            label = str(q.get("label") or key).strip()[:200] or key
-            input_type = str(q.get("input_type") or "short").strip().lower()
-            if input_type not in INPUT_TYPES:
-                input_type = "short"
-            norm_qs.append({
-                "key": key,
-                "label": label,
-                "input_type": input_type,
-                "required": bool(q.get("required", True)),
-                "help_text": str(q.get("help_text", "") or ""),
-                "predicate": str(q.get("predicate") or key).strip()
-                or key,
-            })
-        norm_pages.append({"page_title": page_title, "questions": norm_qs})
+                label = str(q.get("label") or key).strip()[:200] or key
+                input_type = str(q.get("input_type") or "short").strip().lower()
+                if input_type not in INPUT_TYPES:
+                    input_type = "short"
+                norm_qs.append({
+                    "key": key,
+                    "label": label,
+                    "input_type": input_type,
+                    "required": bool(q.get("required", True)),
+                    "help_text": str(q.get("help_text", "") or ""),
+                    "predicate": str(q.get("predicate") or key).strip()
+                    or key,
+                })
+            chunk_title = page_title if ci == 0 else f"{page_title} (cont.)"
+            norm_pages.append({"page_title": chunk_title, "questions": norm_qs})
+
+    if len(norm_pages) > 10:
+        raise FormValidationError(
+            f"form_schema expands to {len(norm_pages)} pages after splitting "
+            "over-long pages; keep it to 10 pages max"
+        )
 
     return title, purpose, norm_pages
 
@@ -143,7 +150,11 @@ def queue_form(owner_uid: Any, channel_id: Any, form_schema: Any) -> Dict[str, A
         pages=pages,
     )
     PENDING_FORMS[session_id] = session
-    logger.info("form queued: title=%r pages=%d questions=%d uid=%s", title, len(pages), total_questions, session_id[:8])
+    print(
+        f" [FORM] queued session={session_id[:8]} title={title!r} "
+        f"pages={len(pages)} questions={total_questions} uid={session.owner_uid}",
+        flush=True,
+    )
     return {
         "status": "FORM_QUEUED",
         "session_id": session_id,
@@ -200,7 +211,7 @@ async def finalize_form(session_id: str) -> Dict[str, Any]:
                 )
                 claims.append({"key": q["key"], "predicate": predicate, "claim_id": claim_id, "value": str(answer)})
             except Exception as exc:  # noqa: BLE001 — claim persistence must be resilient
-                logger.warning("form_flow: assert_claim failed for %r: %s", predicate, exc)
+                print(f" [FORM] assert_claim failed for {predicate!r}: {type(exc).__name__}: {exc}", flush=True)
                 errors.append(f"{predicate}: {type(exc).__name__}")
                 continue
             try:
@@ -214,7 +225,7 @@ async def finalize_form(session_id: str) -> Dict[str, Any]:
                 )
                 embedded += 1
             except Exception as exc:  # noqa: BLE001 — embedding is best-effort
-                logger.warning("form_flow: index_single_claim failed for %r: %s", predicate, exc)
+                print(f" [FORM] index_single_claim failed for {predicate!r}: {type(exc).__name__}: {exc}", flush=True)
                 errors.append(f"embed {predicate}: {type(exc).__name__}")
 
     return {

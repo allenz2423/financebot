@@ -3370,6 +3370,19 @@ def _resolve_tool_alias(func_name: str) -> str:
     return TOOL_ALIASES.get(func_name, func_name)
 
 
+def _bind_bare_argument_shape(obj: dict) -> tuple[str, dict] | None:
+    """Recover a tool call from a bare arguments object.
+
+    Weaker/free-tier models sometimes emit ONLY the tool's arguments
+    (e.g. {"form_schema": {...}}) without the {"name": ...} envelope.
+    Returns (tool_name, args) when the object's shape unambiguously
+    identifies exactly one tool, else None.
+    """
+    if isinstance(obj.get("form_schema"), dict):
+        return "request_user_form", obj
+    return None
+
+
 # Set of all mutation tools that should always commit to the database
 MUTATION_TOOLS = {
     "set_portfolio_holding",
@@ -4835,6 +4848,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         args = obj["parameters"]
                     else:
                         args = {}
+
+            if not func_name:
+                # Bare-arguments recovery: weaker/free-tier models sometimes
+                # emit ONLY the tool's arguments object ({"form_schema": {...}})
+                # without the {"name": ...} envelope. Binding is shape-based and
+                # unambiguous; the whole object passes through as arguments.
+                bound = _bind_bare_argument_shape(obj)
+                if bound is not None:
+                    func_name, args = bound
 
             if not func_name:
                 continue

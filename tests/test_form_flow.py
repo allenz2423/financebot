@@ -74,6 +74,50 @@ def test_validate_rejects_too_many_pages():
         validate_form_schema({"title": "T", "pages": pages})
 
 
+def test_validate_splits_overlong_page_into_chunks():
+    schema = {
+        "title": "T",
+        "pages": [
+            {
+                "page_title": "Bulk",
+                "questions": [
+                    {"key": f"q{i}", "label": f"Q{i}"} for i in range(6)
+                ],
+            }
+        ],
+    }
+    title, purpose, pages = validate_form_schema(schema)
+    # 6 questions -> 2 pages of <=5, each keeping the original title on part 1
+    assert len(pages) == 2
+    assert [len(p["questions"]) for p in pages] == [5, 1]
+    assert pages[0]["page_title"] == "Bulk"
+    assert pages[1]["page_title"] == "Bulk (cont.)"
+    all_keys = [q["key"] for p in pages for q in p["questions"]]
+    assert all_keys == [f"q{i}" for i in range(6)]
+
+
+def test_validate_raises_when_split_exceeds_ten_pages():
+    # 2 * 6 questions -> 4 pages, still within limits after split
+    pages = [
+        {"page_title": f"P{i}", "questions": [
+            {"key": f"p{i}q{j}", "label": f"Q{j}"} for j in range(6)
+        ]}
+        for i in range(2)
+    ]
+    title, purpose, norm = validate_form_schema({"title": "T", "pages": pages})
+    assert len(norm) == 4
+    # 6 * 6 questions -> 12 pages after splitting: input passes the <=10 page
+    # check, the post-split guard must reject the expansion
+    many = [
+        {"page_title": f"P{i}", "questions": [
+            {"key": f"p{i}q{j}", "label": f"Q{j}"} for j in range(6)
+        ]}
+        for i in range(6)
+    ]
+    with pytest.raises(FormValidationError):
+        validate_form_schema({"title": "T", "pages": many})
+
+
 def test_validate_rejects_question_without_key():
     bad = {
         "title": "T",

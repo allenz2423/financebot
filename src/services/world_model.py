@@ -39,6 +39,16 @@ def get_primary_user_id() -> str:
         pass
     return "primary_user"
 
+
+def _normalize_user_ref(subject: str, user_id: Optional[str] = None) -> str:
+    """Map the LLM-facing 'user:current' placeholder onto the caller's real tenant
+    partition (``user:<id>``) so world-model isolation (``eid != user_prefix``)
+    never hides those claims. Other refs pass through unchanged."""
+    if subject == "user:current":
+        uid = str(user_id or get_primary_user_id()).strip()
+        return f"user:{uid}"
+    return subject
+
 def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -56,6 +66,7 @@ def upsert_entity(
     attributes: Optional[Dict[str, Any]] = None
 ) -> str:
     """Create or update a canonical entity node in the Active World Model."""
+    entity_id = _normalize_user_ref(entity_id)
     aliases_json = json.dumps(aliases or [])
     attributes_json = json.dumps(attributes or {})
     
@@ -89,9 +100,11 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
     Multi-tenant safe: user:<id> entities belonging to other users are never matched.
     """
     matched_ids = set()
-    normalized_q = query.lower()
+    normalized_q = _normalize_user_ref(query.lower())
     target_user_id = str(user_id or get_primary_user_id()).strip() if user_id is not None else None
     user_prefix = f"user:{target_user_id}" if target_user_id else None
+    if user_prefix:
+        normalized_q = normalized_q.replace("user:current", user_prefix)
 
     with _get_connection() as conn:
         c = conn.cursor()
@@ -99,7 +112,7 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
         # 1. Direct scan against aliases and canonical names
         c.execute("SELECT entity_id, canonical_name, aliases FROM kg_entities")
         for row in c.fetchall():
-            eid = row["entity_id"]
+            eid = _normalize_user_ref(row["entity_id"], target_user_id)
             if eid.startswith("user:") and user_prefix and eid != user_prefix:
                 continue
 
@@ -129,7 +142,7 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
                     ORDER BY rank LIMIT 10
                 """, (fts_query,))
                 for row in c.fetchall():
-                    tid = row["target_id"]
+                    tid = _normalize_user_ref(row["target_id"], target_user_id)
                     if tid.startswith("user:") and user_prefix and tid != user_prefix:
                         continue
                     matched_ids.add(tid)
@@ -240,6 +253,7 @@ def assert_claim(
     explicit retraction via retract_world_model_claim().
     """
     cid = claim_id or f"claim_{uuid.uuid4().hex[:12]}"
+    subject_id = _normalize_user_ref(subject_id, owner_user_id)
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     v_from = valid_from or now_utc
     scalar_str = str(scalar_value) if scalar_value is not None else None
@@ -1033,6 +1047,7 @@ def get_world_model_entity(entity_id_or_name: str, user_id: Optional[str] = None
     Retrieve full profile and active claims for an entity by ID or name/alias.
     Multi-tenant safe: entities belonging to other users are excluded.
     """
+    entity_id_or_name = _normalize_user_ref(entity_id_or_name, user_id)
     resolved = resolve_entities(entity_id_or_name, user_id=user_id)
     target_id = resolved[0] if resolved else entity_id_or_name.strip().lower()
     # If resolution found nothing and the input isn't a valid entity ID,
@@ -1096,7 +1111,7 @@ def search_world_model(query: str, limit: int = 5, user_id: Optional[str] = None
             
             for row in c.fetchall():
                 res = dict(row)
-                tid = res.get("target_id", "")
+                tid = _normalize_user_ref(res.get("target_id", ""), target_user_id)
                 # Multi-tenant isolation: do not leak another user's entity, dossier, or claims
                 if tid.startswith("user:") and user_prefix and tid != user_prefix:
                     continue
