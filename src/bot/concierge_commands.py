@@ -167,6 +167,11 @@ async def concierge_admin(ctx, *, raw: str = ""):
             await ctx.send(text[:1900])
             return
 
+        if action == "login":
+            from src.bot.concierge_login import handle_login
+            await handle_login(ctx, args[1] if len(args) > 1 else "")
+            return
+
         await _deny(ctx, "unknown action " + action)
         return
 
