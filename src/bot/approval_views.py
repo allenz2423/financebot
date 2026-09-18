@@ -254,6 +254,16 @@ _STEALTH_INIT_SCRIPT = """
 _HANDLE_ATTR = "data-concierge-handle"
 _HANDLE_RE = re.compile(r"^\s*e(\d+)\s*$")
 
+# A login mission is approved against a bare domain, which frequently opens a
+# marketing homepage with no sign-in affordance at all (or one hidden behind a
+# consent wall). With no credential field on screen the advisor can only click
+# something unrelated and then stall on "page did not change". These are the
+# conventional paths a site exposes its sign-in form on, tried only after the
+# initial page is confirmed to have no credential field.
+_LOGIN_PATHS = ("/signin", "/login", "/sign-in")
+# ``page_stage`` values that mean a credential field is actually on screen.
+_CREDENTIAL_STAGES = frozenset({"password", "identifier"})
+
 
 def _format_control(item: Dict[str, Any]) -> str:
     """One inventory line: ``e3 <button> "Sign in" selector=...``."""
@@ -1442,6 +1452,10 @@ class BrowserlessActuator(Actuator):
         """Classify the visible interaction stage using generic form controls."""
         self._ensure()
         self._assert_on_scope()
+        return str(self._loop.run_until_complete(self._stage_now()) or "unknown")
+
+    async def _stage_now(self) -> str:
+        """Interaction stage of the live page, evaluated in-place (async)."""
 
         async def _frame_stage(frame) -> str:
             try:
@@ -1458,27 +1472,127 @@ class BrowserlessActuator(Actuator):
             except Exception:
                 return "page"
 
-        async def _stage() -> str:
+        try:
+            if self._page is None or self._page.is_closed():
+                return "unavailable"
+            frames = [self._page.main_frame] + [
+                f for f in self._page.frames if f != self._page.main_frame
+            ]
+            best = "page"
+            for frame in frames:
+                stage = await _frame_stage(frame)
+                if stage == "password":
+                    return "password"
+                if stage == "identifier":
+                    best = "identifier"
+                elif stage == "form" and best == "page":
+                    best = "form"
+            return best
+        except Exception:
+            return "unknown"
+
+    def reach_login_form(
+        self, domain: str, fallback_url: str, poll_seconds: float = 8.0
+    ) -> str:
+        """Best-effort: put the mission's browser on the site's sign-in form.
+
+        A login mission is approved against a bare domain, which usually opens
+        a marketing homepage whose sign-in affordance is absent (or hidden
+        behind a consent wall). With no credential field on screen the advisor
+        can only click an unrelated control and then stall on "page did not
+        change". Reach the form the way a person would: follow a visible
+        sign-in link, otherwise try the conventional sign-in paths (waiting out
+        a client-side consent/bot challenge), and return to ``fallback_url`` if
+        none exposes a credential field.
+
+        Returns a short note — ``"already"``, ``"link"``, ``"path:<p>"``,
+        ``"none"`` or ``"unavailable"`` — for the audit and advisor context.
+        Never raises: reaching the form is opportunistic, not part of the act
+        contract.
+        """
+        try:
+            self._ensure()
+            self._assert_on_scope()
+        except Exception:
+            return "unavailable"
+
+        async def _wait_for_credentials(deadline: float) -> bool:
+            while deadline > 0:
+                await asyncio.sleep(0.5)
+                deadline -= 0.5
+                try:
+                    if await self._stage_now() in _CREDENTIAL_STAGES:
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        async def _goto(url: str) -> bool:
+            try:
+                resp = await self._page.goto(
+                    url, wait_until="domcontentloaded", timeout=self._timeout
+                )
+                if resp is not None and int(resp.status) >= 400:
+                    return False
+            except Exception:
+                return False
+            self._assert_on_scope()
+            return True
+
+        async def _job() -> str:
             try:
                 if self._page is None or self._page.is_closed():
                     return "unavailable"
-                frames = [self._page.main_frame] + [
-                    f for f in self._page.frames if f != self._page.main_frame
-                ]
-                best = "page"
-                for frame in frames:
-                    stage = await _frame_stage(frame)
-                    if stage == "password":
-                        return "password"
-                    if stage == "identifier":
-                        best = "identifier"
-                    elif stage == "form" and best == "page":
-                        best = "form"
-                return best
+                if await self._stage_now() in _CREDENTIAL_STAGES:
+                    return "already"
+                host = str(domain).strip().lower().lstrip(".")
+                # 1) Follow a visible sign-in link if the page has one.
+                try:
+                    href = await self._page.evaluate("""() => {
+                        const visible = (el) => {
+                            const s = getComputedStyle(el), r = el.getBoundingClientRect();
+                            return s.visibility !== 'hidden' && s.display !== 'none' &&
+                                r.width > 0 && r.height > 0;
+                        };
+                        const want = /(log\\s?in|sign\\s?in|log\\s?on|my\\s?account)/i;
+                        for (const a of document.querySelectorAll('a[href]')) {
+                            const t = (a.innerText || a.getAttribute('aria-label') || '').trim();
+                            const h = a.getAttribute('href') || '';
+                            if (visible(a) && want.test(t + ' ' + h)) return h;
+                        }
+                        return '';
+                    }""")
+                except Exception:
+                    href = ""
+                if href:
+                    try:
+                        target = (
+                            href if href.startswith("http")
+                            else "https://" + host + "/" + href.lstrip("/")
+                        )
+                        if await _goto(target) and await _wait_for_credentials(poll_seconds):
+                            return "link"
+                    except Exception:
+                        pass
+                # 2) Try the conventional sign-in paths. The primary path is
+                #    retried once: a bot/consent challenge often sets its cookie
+                #    on the first hit and only renders the form on the next.
+                attempts = list(_LOGIN_PATHS) + [_LOGIN_PATHS[0]]
+                for path in attempts:
+                    if await _goto("https://" + host + path):
+                        if await _wait_for_credentials(poll_seconds):
+                            return "path:" + path
+                # 3) Nothing exposed a credential field — do not strand the
+                #    browser on a 404/consent page.
+                await _goto(fallback_url)
+                return "none"
             except Exception:
-                return "unknown"
+                return "none"
 
-        return str(self._loop.run_until_complete(_stage()) or "unknown")
+        try:
+            return self._loop.run_until_complete(_job())
+        except Exception:
+            return "none"
 
     def element_visible(self, selector: str) -> bool:
         self._ensure()
@@ -1687,7 +1801,9 @@ class ActionApprovalView(discord.ui.View):
                         "Permission was granted for the approved browser mission. "
                         "Use concierge_browser_step with the active mission_id to observe the current page, "
                         "then take exactly one appropriate next action at a time. Do not guess selectors; "
-                        "inspect after every action. Stop and report if the page shows a challenge or failure.",
+                        "inspect after every action. If the page has no sign-in or credential field, do NOT "
+                        "click unrelated controls: navigate to the site's sign-in page (e.g. /signin or "
+                        "/login) first. Stop and report if the page shows a challenge or failure.",
                         self.owner_uid,
                         continuation,
                         required_tools={"concierge_browser_step"},
@@ -1972,6 +2088,24 @@ def execute_approved_act(
             include_screenshot=True,
             resolve_secret=resolve_secret_for_live_page,
         )
+        # A fill_form mission is approved against the bare domain, which often
+        # opens a marketing homepage that exposes no sign-in control at all
+        # (PayPal's /us/home is one). Land the mission on the actual sign-in
+        # form before snapshotting/verifying, so the advisor's first observe
+        # already has a credential field to type into instead of only an
+        # unrelated control it can click and stall on.
+        if keep_browser and mission and hasattr(actuator, "reach_login_form"):
+            login_domain = mission.get("domain") or proposal.get("domain") or urlparse(proposal["url"]).netloc
+            try:
+                res["login_entry"] = actuator.reach_login_form(login_domain, proposal["url"])
+            except Exception as exc:  # noqa: BLE001 — opportunistic, never fatal
+                res["login_entry"] = "error"
+                print(f" [CONCIERGE LOGIN] reach_login_form failed: {exc}", flush=True)
+            audit.append(
+                actor=tenant, action="login_entry", tenant=tenant,
+                subject=login_domain,
+                detail={"proposal_id": proposal_id, "result": res["login_entry"]},
+            )
         verification = asyncio.run(verify(
             proposal["url"], proposal["steps"],
             page_text=res.get("summary", "") or "",
@@ -2239,6 +2373,21 @@ def agentic_browser_step(
             if not browser_auth_challenge(settled_summary, settled_urls):
                 summary, blocked = settled_summary, False
         page_stage = actuator.page_stage()
+        # If a login mission is still on a page with no credential field — the
+        # sign-in form was not reachable (a bot/consent wall) or the landing
+        # page simply has none — steer the model to the sign-in page instead of
+        # letting it click an unrelated control (a marketing tab, a cookie
+        # banner) and then stall on "page did not change".
+        if missions[0].get("kind") == "fill_form" and page_stage == "page" and not blocked:
+            _signin_host = str(missions[0].get("domain") or "").strip().lower().lstrip(".")
+            summary = (
+                f"{summary}\n\n[NO SIGN-IN FORM ON THIS PAGE] This page exposes no "
+                f"login or credential field. Do not click unrelated controls — a "
+                f"marketing tab or a cookie banner is not a way to sign in. To reach "
+                f"the sign-in form, call concierge_browser_step with action=\"navigate\" "
+                f"and url=\"https://{_signin_host}/signin\" (try /login if no form "
+                f"loads). Once the form is on screen, type into its fields by id."
+            )
         page_url = getattr(actuator, "_page", None).url if getattr(actuator, "_page", None) else missions[0]["url"]
         internal_shots = os.getenv("CONCIERGE_INTERNAL_SCREENSHOTS", "0").lower() in {
             "1", "true", "yes", "on"

@@ -712,3 +712,39 @@ def test_execute_approved_act_unclaimed_when_already_terminal(tmp_path):
     result = execute_approved_act(pid, "user:1", store=store, vault=vault)
     assert result.get("unclaimed") is True
     assert result["ok"] is False
+
+
+def test_execute_approved_act_reaches_login_form_for_fill_form(tmp_path):
+    """Approving a fill_form (login) mission must land the browser on the
+    site's sign-in form before the advisor observes, so it never fumbles a
+    marketing landing page. Regression for the PayPal /us/home run."""
+    from src.bot.approval_views import execute_approved_act
+    from src.security.vault import Vault
+
+    db = str(tmp_path / "e.db")
+    store = ApprovalStore(db)
+    vault = Vault(db)
+    pid = _approved_flow_proposal(store)
+
+    class _LoginActuator(_OkActuator):
+        def __init__(self):
+            super().__init__()
+            self.reached = []
+
+        def reach_login_form(self, domain, fallback_url, poll_seconds=8.0):
+            self.reached.append((domain, fallback_url))
+            return "path:/signin"
+
+    act = _LoginActuator()
+
+    async def _verify(*a, **k):
+        return {"verdict": "confirmed", "confidence": 0.9}
+
+    result = execute_approved_act(
+        pid, "user:1", store=store, vault=vault,
+        actuator_factory=lambda url, allowed: act,
+        verify_factory=_verify,
+    )
+    assert result["ok"] is True
+    assert act.reached == [("example.com", "https://example.com/login")]
+    assert result["res"]["login_entry"] == "path:/signin"

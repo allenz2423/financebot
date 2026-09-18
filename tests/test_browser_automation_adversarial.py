@@ -1543,3 +1543,117 @@ def test_adversarial_otp_field_is_flagged_as_one_time_code_not_vault_secret():
         assert "918273" not in summary2, summary2
     finally:
         act.close()
+
+
+# ============================================================================
+# Login-entry: reaching the sign-in form from a marketing landing page
+# ============================================================================
+
+
+def _serve(act, domain, pages):
+    """Serve a {path: html} map on https://<domain>/<path> (other paths 404)."""
+    act._ensure(navigate=False)
+    page = act._page
+
+    async def setup_route():
+        async def handle(route):
+            from urllib.parse import urlparse as _up
+            path = _up(route.request.url).path or "/"
+            body = pages.get(path)
+            if body is None:
+                await route.fulfill(status=404, content_type="text/html", body="not found")
+            else:
+                await route.fulfill(status=200, content_type="text/html", body=body)
+        await page.route(f"https://{domain}/**", handle)
+
+    act._loop.run_until_complete(setup_route())
+
+
+HOME_NO_LOGIN = """<!DOCTYPE html><html><body>
+  <nav><a href="/personal">Personal</a><a href="/business">Business</a></nav>
+  <main><button id="tab-1" type="button">Send</button>
+        <a href="/offers">Browse Offers</a></main>
+  <div id="cookie"><button id="acceptAllButton" type="button">Yes, I accept</button></div>
+</body></html>"""
+
+SIGNIN_FORM = """<!DOCTYPE html><html><body>
+  <main><form action="/signin" name="login">
+    <input id="email" name="login_email" type="email" />
+    <input id="password" name="login_password" type="password" />
+    <button id="btnLogin" type="submit">Log In</button>
+  </form></main>
+</body></html>"""
+
+
+def test_adversarial_reach_login_form_navigates_to_signin_path():
+    """A login mission that lands on a marketing page with no sign-in control
+    must reach the site's sign-in form by path, so the advisor gets a
+    credential field instead of a marketing button to fumble. Regression for
+    the live PayPal /us/home run where the model clicked the 'Send' tab."""
+    domain = "reach-path.test"
+    base = f"https://{domain}/"
+    act = BrowserlessActuator(base, allowed_domains=[domain], cdp_url=CDP_TEST_URL)
+    _serve(act, domain, {"/": HOME_NO_LOGIN, "/signin": SIGNIN_FORM})
+    try:
+        act.navigate(base)
+        assert act.page_stage() == "page"  # no credential field on the landing page
+        note = act.reach_login_form(domain, base, poll_seconds=1.0)
+        assert note == "path:/signin", note
+        assert act.page_stage() == "password"
+        assert "/signin" in act._page.url
+    finally:
+        act.close()
+
+
+def test_adversarial_reach_login_form_follows_visible_signin_link():
+    """When the landing page has a visible sign-in link, follow it rather than
+    guessing a path."""
+    domain = "reach-link.test"
+    base = f"https://{domain}/"
+    home = HOME_NO_LOGIN.replace(
+        '<a href="/offers">Browse Offers</a>',
+        '<a href="/login">Log In</a><a href="/offers">Browse Offers</a>',
+    )
+    ident = """<!DOCTYPE html><html><body><main>
+      <form action="/login" name="login"><input id="email" name="email" type="email" />
+      <button type="submit">Next</button></form></main></body></html>"""
+    act = BrowserlessActuator(base, allowed_domains=[domain], cdp_url=CDP_TEST_URL)
+    _serve(act, domain, {"/": home, "/login": ident})
+    try:
+        act.navigate(base)
+        assert act.page_stage() == "page"
+        note = act.reach_login_form(domain, base, poll_seconds=1.0)
+        assert note == "link", note
+        assert act.page_stage() == "identifier"
+    finally:
+        act.close()
+
+
+def test_adversarial_reach_login_form_noop_when_already_on_form():
+    """If the mission already opened on a credential form, leave it untouched."""
+    domain = "reach-already.test"
+    url = f"https://{domain}/signin"
+    act = BrowserlessActuator(url, allowed_domains=[domain], cdp_url=CDP_TEST_URL)
+    _serve(act, domain, {"/signin": SIGNIN_FORM})
+    try:
+        act.navigate(url)
+        assert act.reach_login_form(domain, url, poll_seconds=1.0) == "already"
+        assert act.page_stage() == "password"
+    finally:
+        act.close()
+
+
+def test_adversarial_reach_login_form_returns_to_fallback_when_absent():
+    """If no sign-in form is reachable, restore the entry page instead of
+    stranding the browser on a 404."""
+    domain = "reach-none.test"
+    base = f"https://{domain}/"
+    act = BrowserlessActuator(base, allowed_domains=[domain], cdp_url=CDP_TEST_URL)
+    _serve(act, domain, {"/": HOME_NO_LOGIN})  # /signin, /login, /sign-in all 404
+    try:
+        act.navigate(base)
+        note = act.reach_login_form(domain, base, poll_seconds=1.0)
+        assert note == "none", note
+        assert act._page.url.rstrip("/") == base.rstrip("/")
+    finally:
+        act.close()
