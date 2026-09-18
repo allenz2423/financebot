@@ -992,3 +992,91 @@ def test_gmail_only_turn_offers_read_and_browser_tools():
     assert "concierge_browser_step" in llm._GMAIL_ONLY_TOOLS
     # No typo'd/unknown tool names in the allowlist.
     assert llm._GMAIL_ONLY_TOOLS <= schema_names, llm._GMAIL_ONLY_TOOLS - schema_names
+
+
+def test_browser_action_detector_and_browser_tool_trace_helper():
+    """The action detector fires on 'log in / checkout / buy / cart' requests
+    and stays quiet on an ordinary financial question. `_browser_tool_ran`
+    treats a failed step as no progress but either real tool as progress."""
+    for text in (
+        "can you log into amazon and then checkout on my cart?",
+        "please sign in to target and buy the item",
+        "add to cart and place the order",
+        "log me in to paypal",
+    ):
+        assert llm._BROWSER_ACTION_RE.search(text) is not None, text
+    for text in (
+        "what did i spend on groceries this month",
+        "how much is left in my checking account",
+        "your paypal savings offer is 3.30% apy",
+    ):
+        assert llm._BROWSER_ACTION_RE.search(text) is None, text
+
+    assert llm._browser_tool_ran([]) is False
+    assert llm._browser_tool_ran([{"name": "concierge_act_status", "ok": True}]) is False
+    # A failed browser step made no progress.
+    assert llm._browser_tool_ran([{"name": "concierge_browser_step", "ok": False}]) is False
+    assert llm._browser_tool_ran([{"name": "concierge_browser_step", "ok": True}]) is True
+    # Creating the approval is itself progress; do not re-demand it.
+    assert llm._browser_tool_ran([{"name": "request_concierge_action", "ok": True}]) is True
+
+
+_AMAZON_NARRATION = (
+    "I'll help you log into Amazon and check out your cart. Let me request a new "
+    "fill_form mission, observe the Amazon sign-in page, and type your credentials. "
+    "You're now signed into Amazon and your order has been placed successfully."
+)
+
+
+class _NarrateThenObserveClient:
+    """Call 1: the whole Amazon login+checkout narrated as prose with zero tool
+    calls. Call 2: a real observe, once the enforcement demands it. Call 3: a
+    plain answer built from what was observed."""
+
+    calls = 0
+    payloads = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    def stream(self, *args, **kwargs):
+        type(self).calls += 1
+        type(self).payloads.append(copy.deepcopy(kwargs.get("json") or {}))
+        if type(self).calls == 1:
+            return _text_response(_AMAZON_NARRATION)
+        if type(self).calls == 2:
+            return _observe_response()
+        return _text_response("Your Amazon cart contains 2 items for a total of $41.98.")
+
+
+@pytest.mark.asyncio
+async def test_browser_action_narration_is_bounced_to_a_real_tool_call():
+    """'Log into amazon and checkout' narrated as prose with no tool call must be
+    bounced back to the model until it emits a real browser tool — the fabricated
+    'order has been placed' must never reach the user."""
+    _NarrateThenObserveClient.calls = 0
+    _NarrateThenObserveClient.payloads = []
+    with patch.object(llm.httpx, "AsyncClient", _NarrateThenObserveClient), patch(
+        "src.bot.approval_views.agentic_browser_step", _browser_step
+    ), patch.dict(os.environ, _llm_env()):
+        result = await asyncio.wait_for(
+            llm.chat_with_delilah(
+                "can you log into amazon and then checkout on my cart?",
+                "342385739952160769",
+                _ReplyMessage(),
+            ),
+            timeout=30,
+        )
+
+    assert _NarrateThenObserveClient.calls == 3
+    enforcement = json.dumps(_NarrateThenObserveClient.payloads[1])
+    assert "asked for a browser action" in enforcement
+    # The fabricated completion never reached the user; the observed answer did.
+    assert "order has been placed" not in result
+    assert "$41.98" in result

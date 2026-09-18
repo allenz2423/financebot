@@ -3805,6 +3805,32 @@ _LIVE_STATE_FALLBACK = (
     "again and I'll look at the live session."
 )
 
+# A browser action (sign in, check out, buy, …) is never satisfied by a
+# narrated plan. Free-tier models routinely write the whole flow as prose
+# ("Let me observe the page … Great, you're logged in") while emitting zero
+# tool calls; the state guard above then refuses the fabricated result and the
+# user is left with nothing done. Force the real call instead.
+_BROWSER_ACTION_RE = re.compile(
+    r"\b(?:log\s?in|log\s?into|log\s+me\s+in|sign\s?in|sign\s?into|sign\s+me\s+in|"
+    r"check\s?out|checkout|"
+    r"add\s+to\s+(?:my\s+|the\s+)?cart|my\s+cart|shopping\s+cart|"
+    r"buy|purchase|place\s+(?:an\s+|the\s+)?order)\b",
+    re.IGNORECASE,
+)
+
+_BROWSER_ACTION_NUDGE = (
+    "SYSTEM ENFORCEMENT: the user asked for a browser action (sign in, check "
+    "out, buy, …) but your reply emitted no native browser tool call — you only "
+    "narrated steps you did not take. Do not describe actions you did not "
+    "perform. Emit the real tool call now: if an active mission already covers "
+    "the site, call `concierge_browser_step` with that `mission_id` and "
+    "action=\"observe\"; otherwise call `request_concierge_action` with "
+    "kind=\"fill_form\" and args={\"domain\": \"<the site>\"} — that creates the "
+    "approval the user clicks ✅ on, and approval grants the mission. A session "
+    "already open on another site does NOT block a new one: each domain simply "
+    "needs its own approval. Then act one observed step at a time."
+)
+
 
 # A mailbox-shaped query handed to the web search tool can never return the
 # user's email — the search engines have no access to their inbox — and it
@@ -3896,6 +3922,22 @@ def _observed_live_browser(trace) -> bool:
             isinstance(entry, dict)
             and entry.get("name") == "concierge_browser_step"
             and entry.get("ok")
+        ):
+            return True
+    return False
+
+
+def _browser_tool_ran(trace) -> bool:
+    """True when this turn actually started or advanced a browser task.
+
+    Used to force a real call when the model only *narrates* a browser action;
+    either tool counts, so an already-created approval is not re-demanded.
+    """
+    for entry in trace or []:
+        if (
+            isinstance(entry, dict)
+            and entry.get("ok")
+            and entry.get("name") in {"concierge_browser_step", "request_concierge_action"}
         ):
             return True
     return False
@@ -6066,6 +6108,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Bounded, so a weak model that refuses to read the live page still exits
     # with an honest non-answer instead of looping.
     live_state_nudges = 0
+    # Bounded, so a model that keeps narrating a browser action instead of
+    # calling the tool still exits instead of looping.
+    browser_action_nudges = 0
 
     while True:
         dynamically_loaded_tools = dynamically_loaded_tools if 'dynamically_loaded_tools' in locals() else set()
@@ -6591,6 +6636,29 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     "i'm not finished",
                 )
             )
+
+            # ── Browser-action enforcement ──
+            # "Log into X / check out my cart" is an action, not a question.
+            # When the model answers such a turn with prose that claims a live
+            # state or promises tool calls — but ran no browser tool at all —
+            # it has not done anything; force the real call instead of letting
+            # the state guard below end the turn on a non-answer.
+            if (
+                not audit_active_now
+                and not pause_active
+                and browser_action_nudges < 2
+                and not _browser_tool_ran(turn_tool_trace)
+                and _BROWSER_ACTION_RE.search(prompt_lower)
+                and (_claims_live_browser_state(text_final) or promised_tools)
+            ):
+                browser_action_nudges += 1
+                print(
+                    " [BROWSER ACTION ENFORCEMENT] browser action narrated with "
+                    "no tool call; forcing the real call"
+                )
+                messages.append({"role": "user", "content": _BROWSER_ACTION_NUDGE})
+                attempts += 1
+                continue
 
             # ── Live browser/account state guard ──
             # Never let a "you are logged in as X" verdict ship when this
