@@ -18,6 +18,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 BROWSERLESS_URL = os.getenv("BROWSERLESS_URL", "http://browserless:3000").rstrip("/")
+BROWSERLESS_CDP_PATH = os.getenv("BROWSERLESS_CDP_PATH", "/chromium")
 DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSERLESS_TIMEOUT_MS", "30000"))
 
 
@@ -35,10 +36,18 @@ def _ws_url() -> str:
     if BROWSERLESS_URL.startswith("https://"):
         ws = "wss://" + BROWSERLESS_URL[len("https://"):]
     elif BROWSERLESS_URL.startswith("http://"):
-        ws = "wss://" + BROWSERLESS_URL[len("http://"):]
+        ws = "ws://" + BROWSERLESS_URL[len("http://"):]
     else:
         ws = BROWSERLESS_URL
-    return ws.rstrip("/") + "/playwright"
+    # Browserless's Chromium image exposes its direct CDP connection at
+    # /chromium. The /chrome route belongs to a different Browserless target
+    # and returns 404 in the deployed chromium image.
+    path = BROWSERLESS_CDP_PATH.strip()
+    if not path:
+        path = "/chromium"
+    if not path.startswith("/"):
+        path = "/" + path
+    return ws.rstrip("/") + path
 
 
 async def act_on_page(
@@ -62,14 +71,11 @@ async def act_on_page(
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_websocket(_ws_url())
-        context = await browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                         "(KHTML, like Gecko) Chrome/120 Safari/537.36"),
-        )
+        browser = await p.chromium.connect_over_cdp(_ws_url())
+        context = browser.contexts[0]
         page = await context.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        await page.set_viewport_size({"width": 1400, "height": 900})
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
         pre_text = await _text(page)
         pre_screenshot = await page.screenshot(full_page=False)
@@ -80,7 +86,7 @@ async def act_on_page(
             kind = step.get("type")
             if kind == "goto":
                 await page.goto(step.get("url") or url,
-                                wait_until=step.get("wait_until", "networkidle"),
+                                wait_until=step.get("wait_until", "domcontentloaded"),
                                 timeout=step.get("timeout_ms", timeout_ms))
             elif kind == "fill":
                 await page.fill(step["selector"], str(step.get("value", "")))
@@ -113,10 +119,11 @@ async def screenshot_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> byt
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_websocket(_ws_url())
-        context = await browser.new_context(viewport={"width": 1400, "height": 900})
+        browser = await p.chromium.connect_over_cdp(_ws_url())
+        context = browser.contexts[0]
         page = await context.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        await page.set_viewport_size({"width": 1400, "height": 900})
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         shot = await page.screenshot(full_page=True)
         await context.close()
         await browser.close()

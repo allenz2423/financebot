@@ -20,6 +20,7 @@ import hashlib
 import json
 import re
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.browser_gate import ReadGateError, _check_domain, validate_target_url
@@ -36,7 +37,7 @@ ACT_KINDS = frozenset({"send_email", "schedule_event", "fill_form"})
 
 # Each act plan is a list of validated steps. Only these action verbs are
 # permitted; selectors must reference the allowlisted host.
-VALID_STEP_ACTIONS = frozenset({"navigate", "click", "type", "screenshot", "assert_text"})
+VALID_STEP_ACTIONS = frozenset({"navigate", "click", "type", "scroll", "screenshot", "assert_text"})
 _SECRET_KEYS = (
     "password", "pwd", "secret", "token", "api_key", "authorization",
     "bearer", "pan", "cvv", "ccv", "cvc", "card", "otp", "captcha",
@@ -132,6 +133,32 @@ class Actuator:
     def screenshot(self) -> bytes: ...  # pragma: no cover
     def get_text(self) -> str: ...  # pragma: no cover
     def element_visible(self, selector: str) -> bool: ...  # pragma: no cover
+    def scroll(self, value: str = "down", selector: str = "") -> None: ...  # pragma: no cover
+
+    def heal(self) -> bool:
+        """Clear a known interstitial (bot-check/captcha) blocking the flow.
+
+        Auto-pilot continuation hook: returns True if a blocker was found and
+        dismissed (so ``perform_act`` retries the failed step), False when the
+        page is clear. Stubs inherit this no-op; the real browser actuator
+        clicks through curated checkpoint markers (never arbitrary elements).
+        """
+        return False
+
+    def storage_state(self) -> bytes:
+        """Return serialized browser storage state (cookies + local storage)."""
+        return b"{}"
+
+    def restore_storage_state(self, state_bytes: bytes) -> None:
+        """Restore browser storage state (cookies + local storage)."""
+        return None
+
+    def close(self) -> None:
+        """Best-effort teardown of the disposable browser session.
+
+        Never raises; the real actuator closes its CDP context/browser/loop.
+        """
+        return None
 
 
 def _secret_field_type(step: Dict[str, Any]) -> Optional[str]:
@@ -165,17 +192,44 @@ def _step_vault_refs(steps: List[Dict[str, Any]]) -> List[str]:
     ]
 
 
-def _validate_step_navigations(steps: List[dict], allowed_domains: List[str]) -> None:
+def _host_of(url: Any) -> str:
+    """Bare host of a URL, www-stripped + lowercased (mission scope keying).
+
+    Mirrors ``approval_store._host_of`` so execute-time navigation gating and
+    mission scoping agree on what "the same site" means.
+    """
+    if not url:
+        return ""
+    try:
+        host = (urlparse(str(url)).hostname or "").lower()
+    except ValueError:
+        host = ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _validate_step_navigations(
+    steps: List[dict], allowed_domains: List[str], target_host: Optional[str] = None,
+) -> None:
     """Gate every step-level navigate target: allowlist + SSRF/DNS-public.
 
     Refused targets raise ReadGateError BEFORE any actuator work starts, so a
     tampered or hostile plan can never drive the browser toward an internal
-    host (ollama/qdrant/browserless/… or cloud metadata).
+    host (ollama/qdrant/browserless/… or cloud metadata). With ``target_host``
+    given, step navigations must ALSO stay on that host (www-stripped): a
+    redirect-through-another-allowlisted-domain step is refused as incoherent
+    with the act's own target.
     """
     for i, step in enumerate(steps):
         if step.get("action") != "navigate":
             continue
-        validate_target_url(str(step.get("sel") or ""), allowed_domains)
+        target = str(step.get("sel") or "")
+        validate_target_url(target, allowed_domains)
+        if target_host and _host_of(target) != target_host:
+            raise ActActionError(
+                f"step[{i}] navigate target {target!r} leaves the act's target "
+                f"host {target_host!r} — step navigations must stay on the act's "
+                "host (no cross-domain redirects)"
+            )
 
 
 def _validate_steps(steps: Any, allowed_domains: Optional[List[str]] = None) -> List[dict]:
@@ -188,13 +242,53 @@ def _validate_steps(steps: Any, allowed_domains: Optional[List[str]] = None) -> 
         action = step.get("action")
         if action not in VALID_STEP_ACTIONS:
             raise ActActionError(f"step[{i}] action '{action}' is not a permitted act verb")
+        # Models occasionally emit the semantically equivalent
+        # {"action": "navigate", "url": "https://..."} form. Normalize it
+        # to the canonical selector field before validation. The URL still
+        # passes the normal allowlist, SSRF, and same-host gates below.
+        if action == "navigate" and not step.get("sel"):
+            # Navigation targets are commonly emitted as ``url`` by models,
+            # while some tool adapters use ``target`` or ``value``. Normalize
+            # these generic names before validation; navigation still passes
+            # through the same allowlist, SSRF, and same-host checks.
+            for field in ("url", "target", "value"):
+                if step.get(field):
+                    step = dict(step)
+                    step["sel"] = step[field]
+                    break
+        # The agentic browser tool calls this field ``selector`` while the
+        # approval/act schema historically called it ``sel``. Accept both and
+        # canonicalize before any validation or persistence so a harmless
+        # naming mismatch cannot reject an otherwise valid approved action.
+        if "sel" not in step and step.get("selector"):
+            step = dict(step)
+            step["sel"] = step["selector"]
         if action == "type":
             value = str(step.get("value") or "")
             if len(value) > MAX_STEP_TEXT:
                 raise ActActionError(f"step[{i}] type value exceeds {MAX_STEP_TEXT} chars")
-        if "sel" not in step and action not in ("screenshot", "assert_text"):
+            if "vault:" in value:
+                raise ActActionError(
+                    f"step[{i}] type value must be literal text — a 'vault:' token "
+                    "({{vault:...}} or bare vault:s_...:field) is not typed directly; "
+                    "reference the stored value via vault_ref on the step, never inline"
+                )
+        if "sel" not in step and action not in ("scroll", "screenshot", "assert_text"):
             raise ActActionError(f"step[{i}] '{action}' requires a 'sel' selector")
+        if action == "scroll" and not step.get("sel") and not step.get("value"):
+            raise ActActionError(f"step[{i}] 'scroll' requires a selector or value")
         if action == "navigate" and allowed_domains:
+            target = str(step.get("sel") or "").strip()
+            if not target.lower().startswith(("http://", "https://")):
+                # Check if target is a domain name or domain/path
+                first_allowed = allowed_domains[0] if allowed_domains else "amazon.com"
+                if target.startswith("/"):
+                    target = f"https://{first_allowed}{target}"
+                elif any(target.split("/")[0].endswith(d) for d in allowed_domains):
+                    target = f"https://{target}"
+                else:
+                    target = f"https://{first_allowed}/{target.lstrip('/')}"
+                step["sel"] = target
             try:
                 validate_target_url(str(step.get("sel") or ""), allowed_domains)
             except ReadGateError as exc:
@@ -205,9 +299,20 @@ def _validate_steps(steps: Any, allowed_domains: Optional[List[str]] = None) -> 
 
 def _act_target_url(kind: str, args: dict, allowed_domains: List[str]) -> str:
     domain = str(args.get("domain") or "").strip().lower()
+    # tolerate a scheme/path in the domain arg (model habit): strip to bare host
+    domain = re.sub(r"^https?://", "", domain).split("/")[0].split("?")[0].rstrip(".")
     if not _check_domain(domain):
         raise ReadGateError("act args require a valid domain")
-    candidate = "https://" + domain
+    # Browser missions may start at a user/model-selected path (for example a
+    # sign-in page) instead of always opening the host root.  The path remains
+    # constrained to the declared, allowlisted domain; this is generic URL
+    # handling, not a site-specific route.
+    explicit_url = str(args.get("url") or "").strip()
+    if explicit_url:
+        candidate = explicit_url
+    else:
+        raw_path = str(args.get("path") or "").strip().lstrip("/")
+        candidate = "https://" + domain + ("/" + raw_path if raw_path else "")
     return validate_target_url(candidate, allowed_domains)
 
 
@@ -261,9 +366,12 @@ def perform_act(
     steps = _validate_steps(args.get("steps"))
 
     try:
-        _validate_step_navigations(steps, allowed_domains)
         url = _act_target_url(kind, args, allowed_domains)
-    except ReadGateError as exc:
+        # Every step-level navigate must stay on the act's own target host
+        # (www-stripped) — redirects through other allowlisted domains are
+        # refused, not executed.
+        _validate_step_navigations(steps, allowed_domains, target_host=_host_of(url))
+    except (ReadGateError, ActActionError) as exc:
         if audit is not None:
             audit.append(
                 actor=tenant, action="act_refused", tenant=tenant,
@@ -278,43 +386,77 @@ def perform_act(
             actuator.screenshot()
         for i, step in enumerate(steps):
             action = step["action"]
-            if action == "navigate":
-                actuator.navigate(step["sel"])
-            elif action == "click":
-                actuator.click(step["sel"])
-            elif action == "type":
-                value = str(step.get("value") or "")
-                vault_ref = step.get("vault_ref")
-                if vault_ref:
-                    if resolve_secret is None:
-                        raise ActActionError(
-                            f"step[{i}] {step['sel']!r} has vault_ref but no resolver"
+            # Auto-pilot continuation: each step may be retried once after
+            # ``heal()`` clears a known interstitial (Amazon AVS bot-check,
+            # captcha claimView) that intercepted the flow — so the approved
+            # act keeps going instead of rolling back at the first deviation.
+            attempt = 0
+            while True:
+                try:
+                    if action == "heal":
+                        actuator.heal()
+                    elif action == "navigate":
+                        actuator.navigate(step["sel"])
+                    elif action == "click":
+                        actuator.click(step["sel"])
+                    elif action == "type":
+                        value = str(step.get("value") or "")
+                        vault_ref = step.get("vault_ref")
+                        if vault_ref:
+                            if resolve_secret is None:
+                                raise ActActionError(
+                                    f"step[{i}] {step['sel']!r} has vault_ref but no resolver"
+                                )
+                            value = resolve_secret(str(vault_ref))
+                        elif _secret_field_type(step) is not None:
+                            raise ActActionError(
+                                f"step[{i}] secret-bearing type value for {step['sel']!r} "
+                                "must be vault-injected (vault_ref missing)"
+                            )
+                        actuator.type_text(step["sel"], value)
+                    elif action == "scroll":
+                        actuator.scroll(
+                            value=str(step.get("value") or "down"),
+                            selector=str(step.get("sel") or ""),
                         )
-                    value = resolve_secret(str(vault_ref))
-                elif _secret_field_type(step) is not None:
-                    raise ActActionError(
-                        f"step[{i}] secret-bearing type value for {step['sel']!r} "
-                        "must be vault-injected (vault_ref missing)"
-                    )
-                actuator.type_text(step["sel"], value)
-            elif action == "screenshot":
-                if include_screenshot:
-                    actuator.screenshot()
-            elif action == "assert_text":
-                if not actuator.element_visible(step["sel"]):
-                    raise ActActionError(f"assert_text failed for {step['sel']}")
-                expected = str(step.get("value") or "")
-                if expected and expected not in (actuator.get_text() or ""):
-                    raise ActActionError(
-                        f"assert_text failed for {step['sel']}: "
-                        f"expected {expected!r} not on page"
-                    )
+                    elif action == "screenshot":
+                        if include_screenshot:
+                            actuator.screenshot()
+                    elif action == "assert_text":
+                        if not actuator.element_visible(step["sel"]):
+                            raise ActActionError(f"assert_text failed for {step['sel']}")
+                        expected = str(step.get("value") or "")
+                        if expected and expected not in (actuator.get_text() or ""):
+                            raise ActActionError(
+                                f"assert_text failed for {step['sel']}: "
+                                f"expected {expected!r} not on page"
+                            )
+                    break
+                except Exception:
+                    attempt += 1
+                    if attempt >= 2:
+                        raise
+                    try:
+                        healed = actuator.heal()
+                    except Exception:  # noqa: BLE001 — heal is best-effort
+                        healed = False
+                    if not healed:
+                        raise
     except Exception as exc:  # noqa: BLE001 — surface but keep audit + mask
         err = f"{type(exc).__name__}: {exc}"
 
     text = actuator.get_text() or ""
     summary = _summary_from_text(text)[:MAX_SUMMARY_CHS] or "(no result text)"
-    receipt = _extract_receipt(text)
+    # A screenshot-only fill_form approval merely opens/attaches the live
+    # mission. Incidental prices or words on the homepage are not transaction
+    # evidence, so do not manufacture a receipt before a mutation occurs.
+    marker_only = len(steps) == 1 and steps[0].get("action") == "screenshot"
+    has_mutation = any(
+        step.get("action") in {"click", "type"}
+        for step in steps
+        if isinstance(step, dict)
+    )
+    receipt = _extract_receipt(text) if (has_mutation or not marker_only) else {}
     post_screenshot = actuator.screenshot() if include_screenshot else None
     footprint = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
     if audit is not None:

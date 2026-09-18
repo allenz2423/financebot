@@ -61,6 +61,14 @@ def test_next_vnc_port_skips_open_ports(tmp_path):
     assert store.next_vnc_port(base=6090) == 6091
 
 
+def test_next_vnc_port_skips_excluded_host_ports(tmp_path):
+    """Ports known busy on the host (e.g. a sibling container's published
+    noVNC port) must be skipped even though the in-container OS probe cannot
+    see them — the exact 6081 'port is already allocated' spawn failure."""
+    store, _ = make(tmp_path)
+    assert store.next_vnc_port(base=6090, exclude={6090, 6091}) == 6092
+
+
 def test_finish_records_vault_ref_and_blocks_double(tmp_path):
     store, vault = make(tmp_path)
     sess = open_session(store)
@@ -171,6 +179,19 @@ def test_complete_login_session_requires_open_and_owner(tmp_path):
         )
 
 
+def test_latest_ready_for_domain_matches_www_alias(tmp_path):
+    """A session stored for www.example.com must be found by a lookup of
+    example.com (and vice versa): callers always strip the www. prefix."""
+    store, _ = make(tmp_path)
+    sess = store.create("user:1", "www login", "www.example.com", 6092)
+
+    stripped = store.latest_ready_for_domain("user:1", "example.com")
+    assert stripped is not None and stripped["session_id"] == sess["session_id"]
+
+    verbatim = store.latest_ready_for_domain("user:1", "www.example.com")
+    assert verbatim is not None and verbatim["session_id"] == sess["session_id"]
+
+
 def test_pack_profile_dir_stores_browser_tree(tmp_path):
     prof = tmp_path / "prof"
     (prof / "Default" / "Network").mkdir(parents=True)
@@ -186,3 +207,65 @@ def test_pack_profile_dir_stores_browser_tree(tmp_path):
         names = tar.getnames()
     assert "Default/Preferences" in names
     assert "Default/Network/Cookies" in names
+
+
+def test_retirable_reclaims_terminal_and_superseded_sessions(tmp_path):
+    """Only the newest open/done browser per (tenant, domain) may survive: the
+    rest — plus every terminal session — must be reclaimable, otherwise an
+    abandoned login leaks a headed Chromium and its published noVNC port."""
+    import time
+
+    store, _ = make(tmp_path)
+    old = store.create("user:1", "l", "amazon.com", 6090)
+    time.sleep(0.01)
+    new = store.create("user:1", "l", "amazon.com", 6091)
+    other = store.create("user:1", "l", "paypal.com", 6092)
+    dead = store.create("user:1", "l", "ebay.com", 6093)
+    store.kill(dead["session_id"], "user:1")
+
+    retirable = {s["session_id"] for s in store.retirable()}
+    assert old["session_id"] in retirable        # superseded by `new`
+    assert dead["session_id"] in retirable       # terminal
+    assert new["session_id"] not in retirable    # newest ready for amazon.com
+    assert other["session_id"] not in retirable  # sole session for paypal.com
+
+
+def test_retirable_matches_www_alias_per_domain(tmp_path):
+    import time
+
+    store, _ = make(tmp_path)
+    a = store.create("user:1", "l", "amazon.com", 6090)
+    time.sleep(0.01)
+    b = store.create("user:1", "l", "www.amazon.com", 6091)
+    retirable = {s["session_id"] for s in store.retirable()}
+    # Same (tenant, stripped-domain) key: the older one is dead weight.
+    assert a["session_id"] in retirable
+    assert b["session_id"] not in retirable
+
+
+def test_retire_marks_live_session_reaped(tmp_path):
+    store, _ = make(tmp_path)
+    sess = store.create("user:1", "l", "amazon.com", 6090)
+    store.retire(sess["session_id"])
+    # 'reaped' (not 'expired') so the reaper never selects it again.
+    assert store.get(sess["session_id"])["status"] == "reaped"
+
+    # A second retire is idempotent.
+    store.retire(sess["session_id"])
+    assert store.get(sess["session_id"])["status"] == "reaped"
+
+
+def test_retirable_never_reclaims_the_newest_live_session(tmp_path):
+    """A live open session is the browser a mission attaches to and the user
+    may still be viewing in VNC: the reaper must not age it out, however old."""
+    store, _ = make(tmp_path)
+    sess = store.create("user:1", "l", "amazon.com", 6090)
+    # Simulate a very old row without a newer sibling.
+    store._conn().execute(
+        "UPDATE concierge_browser_sessions SET created_at = ?, updated_at = ? "
+        "WHERE session_id = ?",
+        ("2020-01-01T00:00:00.000000Z", "2020-01-01T00:00:00.000000Z",
+         sess["session_id"]),
+    )
+    assert store.retirable() == []
+    assert store.get(sess["session_id"])["status"] == "open"

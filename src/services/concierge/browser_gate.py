@@ -33,7 +33,7 @@ _DOMAIN_RE = re.compile(
 # baseline/tolerance support the price_watch tolerance gate; they are
 # sanitized in read_actions and never enter URL construction (the target is
 # built from domain/product only).
-_ARG_KEYS = frozenset({"domain", "order_id", "tracking_id", "product", "baseline", "tolerance"})
+_ARG_KEYS = frozenset({"domain", "path", "url", "order_id", "tracking_id", "product", "baseline", "tolerance"})
 
 
 class ReadGateError(ValueError):
@@ -90,7 +90,9 @@ def validate_target_url(candidate: str, allowed_domains: List[str])->str:
     if not isinstance(candidate, str):
         raise ReadGateError("read target must be a URL string")
     if not candidate.lower().startswith(("http://", "https://")):
-        raise ReadGateError("read target must be http(s)")
+        raise ReadGateError(
+            "read target must be a full http(s):// URL (e.g. https://amazon.com)"
+        )
     parts = urlsplit(candidate)
     host = (parts.hostname or "").lower()
     if not host:
@@ -112,7 +114,10 @@ def validate_target_url(candidate: str, allowed_domains: List[str])->str:
             ok = True
             break
     if not ok:
-        raise ReadGateError(f"domain {host!r} is not allowed for this tenant")
+        raise ReadGateError(
+            f"domain {host!r} is not allowed for this tenant "
+            f"(allowed: {', '.join(sorted(allowed)) or 'none'})"
+        )
     if not is_public_host(host):
         raise ReadGateError("read target host is not a public address")
     return parts.geturl()[:2048]
@@ -128,7 +133,7 @@ def _slug(value: Any)->str:
 
 
 def resolve_action_target(kind: str, args: Dict[str, Any], allowed_domains: List[str])->str:
-    """Build + gate a read URL from a kind and scoped args (never a raw URL)。"""
+    """Build + gate a read URL from a kind and scoped args."""
     if kind not in READ_KINDS:
         raise ReadGateError(f"unknown read kind {kind!r} (valid: {sorted(READ_KINDS)}))")
     if not isinstance(args, dict):
@@ -137,15 +142,37 @@ def resolve_action_target(kind: str, args: Dict[str, Any], allowed_domains: List
     if unknown:
         raise ReadGateError("read args carry disallowed keys: " + ", ".join(sorted(unknown)))
     domain = str(args.get("domain") or "").strip().lower()
+    if not domain and args.get("url"):
+        candidate_url = str(args["url"]).strip()
+        return validate_target_url(candidate_url, allowed_domains)
     if not _check_domain(domain):
         raise ReadGateError("read args require a valid domain")
+
+    # If an explicit path is supplied (e.g. "/gp/css/order-history" or "orders"), allow roaming:
+    if args.get("path"):
+        raw_path = str(args["path"]).strip().lstrip("/")
+        return validate_target_url("https://" + domain + "/" + raw_path, allowed_domains)
+
     if kind == "order_status":
-        path = "orders/" + _slug(args.get("order_id"))
+        order_id = args.get("order_id")
+        if order_id or "order_id" in args:
+            path = "orders/" + _slug(order_id)
+        elif args.get("path"):
+            path = str(args["path"]).strip().lstrip("/")
+        else:
+            path = "orders/" + _slug(order_id)
     elif kind == "tracking":
-        path = "tracking/" + _slug(args.get("tracking_id"))
+        tracking_id = args.get("tracking_id")
+        if tracking_id or "tracking_id" in args:
+            path = "tracking/" + _slug(tracking_id)
+        elif args.get("path"):
+            path = str(args["path"]).strip().lstrip("/")
+        else:
+            path = "tracking/" + _slug(tracking_id)
     else:
-        path = "products/" + _slug(args.get("product"))
-    return validate_target_url("https://" + domain + "/" + path, allowed_domains)
+        product = args.get("product")
+        path = ("products/" + _slug(product)) if product else ""
+    return validate_target_url("https://" + domain + ("/" + path if path else ""), allowed_domains)
 
 
 __all__ = [

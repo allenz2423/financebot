@@ -6,11 +6,12 @@ import sqlite3
 import pytest
 
 from src.security.vault import DEFAULT_DB_PATH
-from src.services.concierge.act_actions import ACT_KINDS
+from src.services.concierge.act_actions import ACT_KINDS, Actuator
 from src.services.concierge.approval_store import ApprovalStore
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.llm_tool import (
     ConciergeToolError,
+    concierge_act_status,
     propose_concierge_act,
 )
 from src.services.concierge.tenants import TenantStore
@@ -44,7 +45,7 @@ def test_propose_write_kind_creates_pending_proposal(tmp_path):
     tenants, audit, db = make(tmp_path)
     res = propose_concierge_act(
         tenant="user:1", kind="fill_form", args=_steps(),
-        tenants=tenants, audit=audit,
+        tenants=tenants, audit=audit, store=ApprovalStore(db),
     )
     assert res["kind"] == "fill_form"
     assert res["status"] == "pending"
@@ -114,11 +115,88 @@ def test_propose_invalid_domain_is_audited_and_refused(tmp_path):
     assert rows[0]["action"] == "act_refused"
 
 
+def test_propose_accepts_selector_alias_for_click_steps(tmp_path):
+    tenants, audit, _ = make(tmp_path, domain="amazon.com")
+    result = propose_concierge_act(
+        tenant="user:1", kind="fill_form",
+        args={
+            "domain": "amazon.com",
+            "steps": [
+                {"action": "navigate", "url": "https://amazon.com/gp/cart"},
+                {"action": "click", "selector": "#remove-item"},
+            ],
+        },
+        tenants=tenants, audit=audit,
+    )
+    assert result["steps"][1]["sel"] == "#remove-item"
+
+
+@pytest.mark.parametrize("field", ["target", "value"])
+def test_propose_normalizes_generic_navigation_target_aliases(tmp_path, field):
+    tenants, audit, _ = make(tmp_path, domain="example.com")
+    result = propose_concierge_act(
+        tenant="user:1", kind="fill_form",
+        args={
+            "domain": "example.com",
+            "steps": [{"action": "navigate", field: "https://example.com/cart"}],
+        },
+        tenants=tenants, audit=audit,
+    )
+    assert result["steps"][0]["sel"] == "https://example.com/cart"
+
+
+def test_propose_cross_domain_redirect_plan_refused(tmp_path):
+    """A cross-domain redirect is refused at propose time: a
+    navigate that leaves the act's own target host (even to an allowlisted
+    domain) never reaches an approval prompt, and the refusal is audited."""
+    tenants, audit, db = make(tmp_path, domain="amazon.com")
+    tenants.allow_domain(ADMIN, "user:1", "example.com")
+    args = {
+        "domain": "amazon.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://amazon.com/ap/signin"},
+            {"action": "navigate", "sel": "https://example.com/url",
+             "value": "https://www.amazon.com"},
+            {"action": "click", "sel": "a#nav-link-accountList"},
+        ],
+    }
+    with pytest.raises(ConciergeToolError, match="target host"):
+        propose_concierge_act(
+            tenant="user:1", kind="fill_form", args=args,
+            tenants=tenants, audit=audit, store=ApprovalStore(db),
+        )
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_refused"
+    assert "target host" in str(rows[0]["detail"]["reason"])
+
+
+def test_propose_bare_vault_template_value_refused(tmp_path):
+    """A type step value that is a bare vault template (no step vault_ref, no
+    braces — the model's `vault:s_...:field` habit) is refused at propose and
+    audited before any proposal persists."""
+    tenants, audit, db = make(tmp_path)
+    args = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "type", "sel": "input#ap_email",
+             "value": "vault:s_a7359d2e5d6e:email"},
+        ],
+    }
+    with pytest.raises(ConciergeToolError, match="vault_ref on the step"):
+        propose_concierge_act(
+            tenant="user:1", kind="fill_form", args=args,
+            tenants=tenants, audit=audit, store=ApprovalStore(db),
+        )
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_refused"
+
+
 def test_propose_writes_proposed_audit_row(tmp_path):
-    tenants, audit, _ = make(tmp_path)
+    tenants, audit, db = make(tmp_path)
     propose_concierge_act(
         tenant="user:1", kind="send_email", args=_steps(),
-        tenants=tenants, audit=audit,
+        tenants=tenants, audit=audit, store=ApprovalStore(db),
     )
     rows = audit.tail(limit=5)
     assert rows[0]["action"] == "act_proposed"
@@ -176,19 +254,19 @@ def make_spend(tmp_path, domain="example.com"):
 
 
 def test_propose_approval_ttl_default(tmp_path):
-    tenants, audit, _ = make(tmp_path)  # read tier -> standard window
+    tenants, audit, db = make(tmp_path)  # read tier -> standard window
     res = propose_concierge_act(
         tenant="user:1", kind="fill_form", args=_steps(),
-        tenants=tenants, audit=audit,
+        tenants=tenants, audit=audit, store=ApprovalStore(db),
     )
     assert res["approval_ttl"] == 600.0
 
 
 def test_propose_approval_ttl_short_for_spend_tier(tmp_path):
-    tenants, audit, _ = make_spend(tmp_path)
+    tenants, audit, db = make_spend(tmp_path)
     res = propose_concierge_act(
         tenant="user:1", kind="send_email", args=_steps(),
-        tenants=tenants, audit=audit,
+        tenants=tenants, audit=audit, store=ApprovalStore(db),
     )
     assert res["approval_ttl"] == 120.0
 
@@ -389,3 +467,248 @@ def test_approval_store_terminal_transition_revokes_vault_refs(tmp_path):
     assert store.update_status(pid, "executed") is True
     with pytest.raises(VaultRevokedError):
         vault.resolve("user:1", rec["vault_ref"])
+
+
+def test_approval_store_terminal_keeps_persistent_secret(tmp_path):
+    """User-stored credentials (policy='persistent') survive the proposal
+    lifecycle: captured once for reuse, not vaulted for a single act."""
+    from src.security.vault import Vault
+    db = str(tmp_path / "s.db")
+    vault = Vault(db, master_key="test-master-key")
+    rec = vault.store_fields(
+        tenant="user:1", kind="secret", label="Amazon login",
+        fields={"password|value": "hunter2"}, consumer_scope=["amazon.com"],
+        policy="persistent",
+    )
+    store = ApprovalStore(db)
+    pid = store.create(
+        tenant="user:1", uid="1", kind="fill_form",
+        args={}, steps=[{"action": "type", "sel": "#password",
+                         "value": "\u2022" * 4, "vault_ref": rec["vault_ref"]}],
+    )
+    assert store.update_status(pid, "executed") is True
+    # still resolvable: the credential can log in again
+    payload = json.loads(vault.resolve("user:1", rec["vault_ref"]))
+    assert payload["password|value"] == "hunter2"
+
+
+def test_propose_domain_arg_tolerates_scheme_and_path(tmp_path):
+    """The model habitually passes 'https://amazon.com/...' as the domain arg;
+    the gate must normalize it to a bare host before allowlisting."""
+    tenants, audit, db = make(tmp_path)
+    res = propose_concierge_act(
+        tenant="user:1", kind="fill_form",
+        args={"domain": "https://example.com/login?next=/x", "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "type", "sel": "#user", "value": "alice"},
+        ]},
+        tenants=tenants, audit=audit, store=ApprovalStore(db),
+    )
+    assert res["url"] == "https://example.com"
+
+
+def test_concierge_act_status_reports_post_approval_outcomes(tmp_path):
+    """The status tool surfaces terminal proposal state + outcome text so the
+    model can answer 'is it done / what happened' from stored state."""
+    store = ApprovalStore(str(tmp_path / "s.db"))
+    rolled = store.create(tenant="user:1", uid="1", kind="fill_form",
+                          args={}, url="https://example.com/login", steps=[])
+    assert store.update_status(rolled, "rolled_back", result_detail={
+        "error": "TimeoutError: Page.fill: waiting for #ap_email",
+    })
+    done = store.create(tenant="user:1", uid="1", kind="fill_form",
+                        args={}, url="https://example.com/login", steps=[])
+    assert store.update_status(done, "executed", result_detail={
+        "act_result": {"status": "ok", "summary": "Sign in  Amazon   Hello, alice"},
+    })
+    # Execute granted an auto-pilot mission for the (now executed) proposal.
+    # The status row must hand the model that mission_id so it never passes
+    # the proposal_id to concierge_browser_step.
+    mission = store.grant_mission(done)
+    pending = store.create(tenant="user:1", uid="1", kind="fill_form",
+                           args={}, url="https://example.com/login", steps=[])
+
+    statuses = {s["proposal_id"]: s for s in concierge_act_status(tenant="user:1", store=store)}
+    assert statuses[pending]["status"] == "pending"
+    assert "outcome" not in statuses[pending]
+    assert "mission_id" not in statuses[pending]
+
+    assert statuses[done]["status"] == "executed"
+    assert statuses[done]["mission_id"] == mission["mission_id"]
+    assert statuses[done]["outcome"].startswith("act_status=ok |")
+    assert "Hello, alice" in statuses[done]["outcome"]
+
+    assert statuses[rolled]["status"] == "rolled_back"
+    assert "waiting for #ap_email" in statuses[rolled]["outcome"]
+    # newest first
+    assert list(statuses)[0] == pending
+
+
+def test_status_schema_and_payload_declare_it_is_not_login_proof():
+    """`concierge_act_status` reports a page snapshot from when the act ran,
+    which for a signed-out landing page looks like success. The model was
+    answering "you're logged in" from it without touching the browser, so the
+    tool description and the injected result both say it is not proof."""
+    from src.services.llm import BOT_TOOLS_SCHEMA
+
+    by_name = {
+        t["function"]["name"]: t["function"].get("description", "")
+        for t in BOT_TOOLS_SCHEMA
+    }
+    status_desc = by_name["concierge_act_status"].lower()
+    assert "not proof" in status_desc
+    assert "concierge_browser_step" in status_desc
+
+    step_desc = by_name["concierge_browser_step"].lower()
+    assert "live page" in step_desc
+
+
+def test_mission_grant_and_scope_lookup(tmp_path):
+    """One approval grants an auto-pilot mission scoped to (tenant, kind,
+    www-normalized domain); other scopes never see it."""
+    store = ApprovalStore(str(tmp_path / "m.db"))
+    pid = store.create(tenant="user:1", uid="1", kind="fill_form",
+                       args={}, url="https://www.amazon.com/gp/sign-in.html",
+                       steps=[])
+    mission = store.grant_mission(pid)
+    assert mission is not None
+    assert mission["domain"] == "amazon.com"  # www stripped for scope keying
+    assert mission["status"] == "active"
+
+    # A freshly proposed follow-up on the same scope auto-pilot's
+    followup = {"tenant": "user:1", "kind": "fill_form",
+                "url": "https://amazon.com/login"}
+    assert store.active_mission_for(followup) is not None
+    assert store.active_missions_for_tenant("user:1")[0]["domain"] == "amazon.com"
+
+    # Different domain / kind / tenant: no mission access
+    assert store.active_mission("user:1", "fill_form", "example.com") is None
+    assert store.active_mission("user:1", "send_email", "amazon.com") is None
+    assert store.active_mission("user:2", "fill_form", "amazon.com") is None
+
+
+def test_mission_expires_after_ttl(tmp_path):
+    store = ApprovalStore(str(tmp_path / "m.db"))
+    pid = store.create(tenant="user:1", uid="1", kind="fill_form",
+                       args={}, url="https://amazon.com", steps=[])
+    store.grant_mission(pid)
+    conn = sqlite3.connect(str(tmp_path / "m.db"))
+    try:
+        conn.execute(
+            "UPDATE concierge_act_missions SET expires_at = '2020-01-01T00:00:00.000000Z'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert store.active_mission("user:1", "fill_form", "amazon.com") is None
+
+
+class _OkActuator(Actuator):
+    """Minimal actuator contract for execute_approved_act tests."""
+
+    def __init__(self):
+        self.calls = []
+
+    def navigate(self, url):
+        self.calls.append(("nav", url))
+
+    def click(self, s):
+        self.calls.append(("click", s))
+
+    def type_text(self, s, v):
+        self.calls.append(("type", s, v))
+
+    def screenshot(self):
+        return b"\x89PNG-stub"
+
+    def get_text(self):
+        return "Welcome alice"
+
+    def element_visible(self, s):
+        return True
+
+
+def _approved_flow_proposal(store, url="https://example.com/login"):
+    steps = [
+        {"action": "navigate", "sel": url},
+        {"action": "type", "sel": "#user", "value": "alice"},
+    ]
+    return store.create(
+        tenant="user:1", uid="1", kind="fill_form",
+        args={"domain": "example.com", "steps": steps},
+        url=url, steps=steps, allowed_domains=["example.com"],
+    )
+
+
+def test_execute_approved_act_grants_mission_and_executes(tmp_path):
+    from src.bot.approval_views import execute_approved_act
+    from src.security.vault import Vault
+
+    db = str(tmp_path / "e.db")
+    store = ApprovalStore(db)
+    vault = Vault(db)
+    pid = _approved_flow_proposal(store)
+
+    async def _verify(*a, **k):
+        return {"verdict": "confirmed", "confidence": 0.9}
+
+    result = execute_approved_act(
+        pid, "user:1", store=store, vault=vault,
+        actuator_factory=lambda url, allowed: _OkActuator(),
+        verify_factory=_verify,
+    )
+    assert result["ok"] is True
+    assert result["outcome"] == "executed"
+    # A concise fill_form proposal starts an agentic mission with an initial
+    # observation; opening that page is not proof that the requested task
+    # completed.
+    assert result["execution_phase"] == "started"
+    assert result["mission"]["domain"] == "example.com"
+    assert store.get(pid)["status"] == "executed"
+    assert store.active_mission("user:1", "fill_form", "example.com") is not None
+
+
+def test_execute_approved_act_hard_failure_keeps_mission(tmp_path):
+    from src.bot.approval_views import execute_approved_act
+    from src.security.vault import Vault
+
+    db = str(tmp_path / "e.db")
+    store = ApprovalStore(db)
+    vault = Vault(db)
+    pid = _approved_flow_proposal(store)
+
+    class _FailActuator(_OkActuator):
+        def navigate(self, url):
+            raise RuntimeError("Amazon bot-check wall")
+
+    async def _verify(*a, **k):
+        return {"verdict": "confirmed", "confidence": 0.5}
+
+    result = execute_approved_act(
+        pid, "user:1", store=store, vault=vault,
+        actuator_factory=lambda url, allowed: _FailActuator(),
+        verify_factory=_verify,
+    )
+    # Step-level errors are captured inside the act result (perform_act never
+    # lets the browser die on a caught step failure), so the act completes as
+    # a rolled_back outcome rather than an exception.
+    assert result["ok"] is True
+    assert result["outcome"] == "rolled_back"
+    assert "bot-check" in result["res"]["error"]
+    assert store.get(pid)["status"] == "rolled_back"
+    # approval was real: mission stays live so a corrected plan can continue
+    assert store.active_mission("user:1", "fill_form", "example.com") is not None
+
+
+def test_execute_approved_act_unclaimed_when_already_terminal(tmp_path):
+    from src.bot.approval_views import execute_approved_act
+    from src.security.vault import Vault
+
+    db = str(tmp_path / "e.db")
+    store = ApprovalStore(db)
+    vault = Vault(db)
+    pid = _approved_flow_proposal(store)
+    store.update_status(pid, "rejected")
+    result = execute_approved_act(pid, "user:1", store=store, vault=vault)
+    assert result.get("unclaimed") is True
+    assert result["ok"] is False

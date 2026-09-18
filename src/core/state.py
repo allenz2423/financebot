@@ -62,7 +62,10 @@ ADVISOR_TOOL_NUM_PREDICT = int(os.getenv("ADVISOR_TOOL_NUM_PREDICT", "16384"))
 # NO generation timeout — removed per user request.
 # Turn timeout is a very high safety net only (2 hours).
 # No automatic advisor turn timeout. Use !pause or !cancel for human control.
-MAX_TOOL_ROUNDS = 0  # 0 = unlimited
+# An advisor turn must have a finite ceiling.  Unlimited rounds let a broken
+# browser/model interaction continue consuming tokens and made !cancel less
+# useful when continuations were orphaned.
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "12"))
 MAX_TOOL_CALLS_PER_ROUND = int(os.getenv("MAX_TOOL_CALLS_PER_ROUND", "0"))  # 0 = unlimited
 MAX_TOTAL_TOOL_CALLS = int(os.getenv("MAX_TOTAL_TOOL_CALLS", "100"))  # 0 = unlimited
 

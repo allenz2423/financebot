@@ -42,6 +42,7 @@ RUN pip install --no-cache-dir patchright && \
     playwright install-deps chromium 2>/dev/null || true
 
 COPY sandbox/concierge-browser/entrypoint.sh /entrypoint.sh
+COPY sandbox/concierge-browser/cdp_proxy.py /cdp_proxy.py
 RUN chmod +x /entrypoint.sh
 
 ENV DISPLAY=:99

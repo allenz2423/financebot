@@ -72,3 +72,26 @@ def test_unknown_token_404(tmp_path):
     client, _ = make_client(tmp_path)
     resp = client.get("/concierge/capture/bogus", params={"tenant": "user:1"})
     assert resp.status_code == 404
+
+
+def test_form_action_preserves_tenant_param(tmp_path):
+    client, token = make_client(tmp_path)
+    resp = client.get("/concierge/capture/" + token, params={"tenant": "user:1"})
+    assert "action=\"/concierge/capture/" + token + "?tenant=user:1\"" in resp.text
+
+
+def test_browser_form_submit_works(tmp_path):
+    """The page is a plain HTML form: urlencoded POST must succeed with the
+    tenant carried by the form action (no JSON body, no query on the POST)."""
+    client, token = make_client(tmp_path)
+    page = client.get("/concierge/capture/" + token, params={"tenant": "user:1"})
+    action = "/concierge/capture/" + token + "?tenant=user:1"
+    assert "action=\"" + action + "\"" in page.text
+    resp = client.post(
+        action,  # browsers submit to the form action, which keeps the tenant
+        data={"text|Email": "me@example.com", "password|Password": "hunter2secret"},
+    )
+    assert resp.status_code == 200
+    assert "Submitted" in resp.text
+    assert "hunter2secret" not in resp.text
+    assert "me@example.com" not in resp.text

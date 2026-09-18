@@ -62,6 +62,17 @@ def process_capture_submission(
     any failure; failures never echo submitted values.
     """
     intent = store.redeem(token, tenant)
+    try:
+        from src.services.concierge.credential_capture import forget_pending_capture
+        scopes = intent.get("consumer_scope") or []
+        for scope in scopes:
+            forget_pending_capture(
+                tenant,
+                str(scope).lower().removeprefix("www."),
+                store.db_path,
+            )
+    except Exception:
+        pass
     payload = validate_submission(intent, submitted)
 
     ephemeral_labels: List[str] = []
@@ -83,6 +94,10 @@ def process_capture_submission(
                 label=intent["label"],
                 fields=vault_fields,
                 consumer_scope=intent["consumer_scope"],
+                # user-owned credential entry: reusable across acts, survives
+                # proposal terminal transitions (only per-act vaulted secrets
+                # are auto-revoked).
+                policy="persistent",
             )
         except VaultError as exc:
             raise CaptureIntentError(str(exc)) from exc

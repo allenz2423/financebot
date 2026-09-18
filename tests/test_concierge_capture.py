@@ -190,6 +190,9 @@ def test_9_consumer_scope_immutable_after_capture(tmp_path):
     assert result["consumer_scope"] == ["amazon.com"]
     rec = vault.list_records("user:1")[0]
     assert rec["consumer_scope"] == ["amazon.com"]
+    # captured credentials are user-owned and reusable: they must survive
+    # proposal terminal transitions (see approval_store._revoke_refs)
+    assert rec["policy"] == "persistent"
 
 
 def test_10_model_receives_masks_refs_labels_only(tmp_path):

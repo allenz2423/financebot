@@ -59,11 +59,21 @@ services:
       - QDRANT_URL=http://qdrant:6333
       - OLLAMA_EMBED_URL=http://ollama:11434/api/embed
       - BROWSERLESS_URL=http://browserless:3000
+      - CONCIERGE_DEBUG_SCREENSHOTS=false
+      - CONCIERGE_INTERNAL_SCREENSHOTS=false
+      - OPENROUTER_FREE_MODELS=nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3.5-lightning:free,qwen/qwen3.8-27b:free,poolside/laguna-s-2.1:free
+      - OPENROUTER_FREE_VISION_MODELS=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+      - OPENROUTER_PAID_MODEL=nvidia/nemotron-3.5-lightning:free
+      - ENABLE_CONCIERGE_BROWSER=1
+      - CONCIERGE_VNC_PUBLIC_BASE=https://concierge.incoming.nyc
+      - CONCIERGE_DOCKER_NETWORK=financebot_egress
+      - CONCIERGE_DOCKER_INTERNAL_NETWORK=financebot_financebot-internal
       - MCP_WEB_BROWSER_URL=http://mcp-web-browser:3000/sse
       - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data
       - sandbox-workspace:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - financebot-internal
       - egress
@@ -220,7 +230,10 @@ services:
     environment:
       - CONCURRENT=5
       - QUEUED=10
-      - TIMEOUT=60000
+      # This Browserless image treats TIMEOUT=-1 as a zero-millisecond
+      # timeout, which immediately returns 408. Use a long explicit window;
+      # the bot still closes sessions on cancel/mission cleanup.
+      - TIMEOUT=3600000
       - PREBOOT_CHROME=true
       - KEEP_ALIVE=true
 

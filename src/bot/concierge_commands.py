@@ -14,6 +14,10 @@ refusal is audited (attempts are worth recording).
     !concierge kill    <draft_id>          (deny an in-flight draft)
     !concierge audit   [@user] [n]         (tail the audit chain)
 
+Self-service (any enabled tenant, their OWN tenant only):
+    !concierge creds   <domain>            (issue a secure credential-capture link)
+    !concierge login   <domain>            (noVNC login-intake session; needs ENABLE_CONCIERGE_BROWSER=1)
+
 Wiring: imported for side effects by ``src.bot.commands`` so the command
 registers on the shared bot; services default to data/concierge.db.
 
@@ -25,17 +29,25 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import asyncio
+import io
 from typing import List, Optional
+
+import discord
 
 from src.core.state import bot
 from src.security.vault import DEFAULT_DB_PATH as _DB
 from src.services.concierge.audit import AuditLog
+from src.services.concierge.capture_tokens import CaptureTokenStore
+from src.services.concierge.credential_capture import CaptureRefused, build_credential_capture
 from src.services.concierge.state import DraftStore
 from src.services.concierge.tenants import NotAdminError, TenantError, TenantStore, is_admin
+from src.services.concierge.approval_store import ApprovalStore
 
 AUDIT = AuditLog(_DB)
 TENANTS = TenantStore(_DB)
 DRAFTS = DraftStore(_DB)
+CAPTURES = CaptureTokenStore(_DB)
 
 # Subcommands that read or mutate cross-tenant state: admins only. "login"
 # stays user-facing (a tenant logs into their own vault session).
@@ -84,7 +96,9 @@ async def concierge_admin(ctx, *, raw: str = ""):
 
     if not args:
         await ctx.send(
-            "Usage: `!concierge enable|disable|tier|limit|allow|status|kill|audit` (admins only)"
+            "Usage: `!concierge enable|disable|tier|limit|allow|status|kill|audit` (admins only); "
+            "`!concierge creds <domain>` / `!concierge login <domain>` (self-service); "
+            "`!concierge screenshot [mission_id]` (view current browser page)"
         )
         return
 
@@ -187,6 +201,57 @@ async def concierge_admin(ctx, *, raw: str = ""):
         if action == "login":
             from src.bot.concierge_login import handle_login
             await handle_login(ctx, args[1] if len(args) > 1 else "")
+            return
+
+        if action == "screenshot":
+            self_tenant = "user:" + str(ctx.author.id)
+            missions = ApprovalStore(_DB).active_missions_for_tenant(self_tenant, limit=50)
+            requested = args[1] if len(args) > 1 else ""
+            mission = next((m for m in missions if m["mission_id"] == requested), None) if requested else (missions[0] if missions else None)
+            if not mission:
+                await ctx.send("No active browser mission found. Approve a browser action first.")
+                return
+            from src.bot.approval_views import AGENTIC_BROWSER_SESSIONS
+            actuator = AGENTIC_BROWSER_SESSIONS.get(mission["mission_id"])
+            if actuator is None:
+                await ctx.send("That browser mission is no longer attached. Request a new approval.")
+                return
+            with actuator.operation_lock:
+                shot = await asyncio.to_thread(actuator.screenshot)
+            if not shot:
+                await ctx.send("Could not capture the browser page: the attached browser session is closed or unavailable.")
+                return
+            await ctx.send(
+                f"📸 Current browser page — `{mission['domain']}`",
+                file=discord.File(io.BytesIO(shot), filename="concierge-browser.png"),
+            )
+            return
+
+        if action == "creds":
+            self_tenant = "user:" + str(ctx.author.id)
+            try:
+                res = build_credential_capture(
+                    self_tenant,
+                    args[1] if len(args) > 1 else "",
+                    tenants=TENANTS,
+                    tokens=CAPTURES,
+                )
+            except CaptureRefused as exc:
+                AUDIT.append(actor=self_tenant, action="capture_refused",
+                             tenant=self_tenant, detail={"reason": str(exc)[:200]})
+                await ctx.send("⛔ " + str(exc))
+                return
+            AUDIT.append(actor=self_tenant, action="capture_issued",
+                         tenant=self_tenant, detail={"domain": res["domain"]})
+            await ctx.send(
+                "🔐 **Credential capture: " + res["domain"] + "**\n"
+                "Open this link (one-time, expires in "
+                + str(res["expires_seconds"] // 60) + " min):\n"
+                + res["url"] + "\n\n"
+                "Enter your email + password there — encrypted at rest, used "
+                "only on " + res["domain"] + ", and **reusable** for future "
+                "logins. The raw value never appears in chat."
+            )
             return
 
         await _deny(ctx, "unknown action " + action)

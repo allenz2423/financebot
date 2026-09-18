@@ -45,8 +45,10 @@ def test_bad_slugs_refused():
 
 
 def test_scheme_and_raw_ip_refused():
-    with pytest.raises(ReadGateError, match="read target must be http"):
+    with pytest.raises(ReadGateError, match="read target must be a full http"):
         validate_target_url("ftp://example.com/x", ALLOW)
+    with pytest.raises(ReadGateError, match="https://amazon.com"):
+        validate_target_url("example.com/x", ALLOW)
     with pytest.raises(ReadGateError, match="raw IP"):
         validate_target_url("http://127.0.0.1/admin", ALLOW)
 
@@ -59,6 +61,12 @@ def test_private_host_refused_via_dns():
 def test_non_allowlisted_domain_refused():
     with pytest.raises(ReadGateError, match="not allowed"):
         validate_target_url("http://evil.example.org/x", ALLOW)
+
+
+def test_refusal_lists_tenant_allowlist_for_self_correction():
+    # the model should see what IS allowed so it can retry with the right host
+    with pytest.raises(ReadGateError, match=r"allowed: amazon\.com, example\.com"):
+        validate_target_url("http://amazon.se/x", ALLOW)
 
 
 def test_wildcard_and_subdomain_matching():

@@ -723,7 +723,15 @@ def _eval_category_budget_overpacing(conn: sqlite3.Connection, cfg: dict, user_i
         days_elapsed = period.get("elapsed_days", 1)
         days_in_month = period.get("days_in_month", 30)
 
-        if spent >= min_spent and (spent >= limit or pacing_pct >= pace_threshold_pct):
+        # A projected budget overrun is actionable even when the current
+        # burn-rate percentage is just below the configured threshold. This
+        # keeps the rule based on the actual forecast rather than the calendar
+        # day on which the test/monitor happens to run.
+        if spent >= min_spent and (
+            spent >= limit
+            or pacing_pct >= pace_threshold_pct
+            or projected >= limit
+        ):
             if spent >= limit:
                 msg = (
                     f"{cat} budget BLOWN: ${spent:,.2f} spent of ${limit:,.2f} limit ({pct_used:.1f}%) "

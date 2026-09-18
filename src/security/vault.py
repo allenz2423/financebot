@@ -285,6 +285,37 @@ class Vault:
             "consumer_scope": [s.lower() for s in consumer_scope],
         }
 
+    def store_browser_state(
+        self, tenant: str, label: str, state_bytes: bytes,
+        consumer_scope: List[str], existing_ref: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Store/update an encrypted Playwright storage-state snapshot."""
+        if existing_ref:
+            row = self._row_or_raise(tenant, existing_ref)
+            if row["kind"] != "session_profile" or row["policy"] != "browser_state":
+                raise VaultError("vault: invalid browser state reference")
+            envelope = crypto.encrypt_bytes(self.key, state_bytes)
+            with self._conn() as conn:
+                conn.execute(
+                    "UPDATE vault_records SET ciphertext = ?, updated_at = ? "
+                    "WHERE record_id = ? AND tenant = ?",
+                    (envelope, self._now(), existing_ref, tenant),
+                )
+                conn.commit()
+            return self._mask(row)
+        return self.store_session_profile(
+            tenant, label, state_bytes, consumer_scope, policy="browser_state"
+        )
+
+    def resolve_browser_state(self, tenant: str, vault_ref: str) -> bytes:
+        """Executor-only decrypt path for a browser storage-state snapshot."""
+        row = self._row_or_raise(tenant, vault_ref)
+        if row["kind"] != "session_profile" or row["policy"] != "browser_state":
+            raise VaultError("vault: reference is not a browser state snapshot")
+        if row["status"] != "active" or not row["ciphertext"]:
+            raise VaultRevokedError(f"vault_ref {vault_ref!r} is unavailable")
+        return crypto.decrypt_bytes(self.key, row["ciphertext"])
+
     def _row_or_raise(self, tenant: str, vault_ref: str) -> sqlite3.Row:
         cur = self._conn().cursor()
         cur.execute(

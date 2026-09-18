@@ -26,6 +26,7 @@ class StubActuator(Actuator):
         self.navigate_calls = []
         self.click_calls = []
         self.type_calls = []
+        self.scroll_calls = []
         self.screenshot_calls = 0
         self.get_text_calls = 0
 
@@ -37,6 +38,9 @@ class StubActuator(Actuator):
 
     def type_text(self, selector, value):
         self.type_calls.append((selector, value))
+
+    def scroll(self, value="down", selector=""):
+        self.scroll_calls.append((value, selector))
 
     def screenshot(self):
         self.screenshot_calls += 1
@@ -99,6 +103,21 @@ def test_perform_act_runs_step_verb_chain(tmp_path):
     assert act.click_calls == ["#login"]
     assert act.type_calls == [("#user", "alice")]
     assert act.screenshot_calls == 3  # initial + step screenshot + final post-screenshot
+
+
+def test_perform_act_supports_scroll_step(tmp_path):
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="done")
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "scroll", "value": "bottom"},
+            {"action": "scroll", "sel": "#results", "value": "down"},
+        ],
+    }
+    res = perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    assert res["status"] == "ok"
+    assert act.scroll_calls == [("bottom", ""), ("down", "#results")]
 
 
 def test_perform_act_masks_pan_in_summary_and_step_values(tmp_path):
@@ -311,6 +330,47 @@ def test_perform_act_navigate_internal_host_fails_closed(tmp_path):
     assert rows[0]["action"] == "act_refused"
 
 
+def test_perform_act_navigate_off_target_host_refused(tmp_path):
+    """Same-host enforcement: a navigate to an allowlisted-but-wrong host (the
+    model's cross-domain redirect habit) is refused at execute and audited — the
+    browser never leaves the act's own target host."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="x")
+    plan = {
+        "domain": "amazon.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://amazon.com/ap/signin"},
+            {"action": "navigate", "sel": "https://example.com/url",
+             "value": "https://www.amazon.com"},
+        ],
+    }
+    with pytest.raises(ActActionError, match="target host"):
+        perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    rows = audit.tail(limit=5)
+    assert rows[0]["action"] == "act_refused"
+    assert "target host" in rows[0]["detail"]["reason"]
+    assert act.navigate_calls == []
+
+
+def test_perform_act_bare_vault_template_value_refused(tmp_path):
+    """A type value referencing a vault template WITHOUT a vault_ref (the
+    model's bare `vault:s_...:email` habit) is refused before any typing —
+    the literal template is never typed into the page."""
+    audit = AuditLog(str(tmp_path / "a.db"))
+    act = StubActuator(text="x")
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "type", "sel": "input#ap_email",
+             "value": "vault:s_a7359d2e5d6e:email"},
+        ],
+    }
+    with pytest.raises(ActActionError, match="vault_ref on the step"):
+        perform_act("fill_form", plan, ALLOW, "user:1", act, audit=audit)
+    assert act.type_calls == []
+
+
 def test_perform_act_resolves_vault_ref_secret_into_type_value(tmp_path):
     """Executor-side secret injection: a type step carrying a vault_ref is
     resolved through the caller-provided resolver and the plaintext never
@@ -411,3 +471,63 @@ def test_perform_act_receipt_masks_token_like_values(tmp_path):
         assert "sk-1234567890abcdef" not in str(v)
     rows = audit.tail(limit=5)
     assert "sk-1234567890abcdef" not in str(rows[0]["detail"])
+
+
+class HealingStubActuator(StubActuator):
+    """Stub whose click fails once, then heals to clear an interstitial."""
+
+    def __init__(self, text=""):
+        super().__init__(text=text)
+        self.fail_times = 1
+        self.heal_calls = 0
+
+    def click(self, selector):
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise TimeoutError("Page.click: Timeout 30000ms exceeded")
+        super().click(selector)
+
+    def heal(self) -> bool:
+        self.heal_calls += 1
+        return True
+
+
+def test_perform_act_heals_interstitial_and_continues():
+    """Auto-pilot continuation: a transient step failure (bot-check page that
+    heal() clears) is retried once and the approved plan keeps going."""
+    act = HealingStubActuator()
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "click", "sel": "#continue-shopping"},
+            {"action": "click", "sel": "#welcome"},
+        ],
+    }
+    res = perform_act("fill_form", plan, ALLOW, "user:1", act)
+    assert res["status"] == "ok"
+    assert act.heal_calls >= 1
+    assert act.click_calls == ["#continue-shopping", "#welcome"]
+
+
+def test_perform_act_no_retry_when_heal_finds_nothing():
+    """A step failure with nothing to heal must roll back, not spin."""
+
+    class NoHealStub(StubActuator):
+        def click(self, selector):
+            raise TimeoutError("Page.click: Timeout 30000ms exceeded")
+
+        def heal(self) -> bool:
+            return False
+
+    act = NoHealStub()
+    plan = {
+        "domain": "example.com",
+        "steps": [
+            {"action": "navigate", "sel": "https://example.com/login"},
+            {"action": "click", "sel": "#nope"},
+        ],
+    }
+    res = perform_act("fill_form", plan, ALLOW, "user:1", act)
+    assert res["status"] == "error"
+    assert "TimeoutError" in res["error"]

@@ -29,6 +29,14 @@ from discord.ext import commands
 from typing import Optional, List, Dict, Any, Tuple
 
 
+def _safe_message_log_text(content: str) -> str:
+    return re.sub(
+        r"(?i)\b(?:password|passwd|passcode|secret|token)\b\s*(?:is|=|:)\s*[^\s,;]+",
+        "[credential redacted]",
+        str(content or ""),
+    )
+
+
 # --- UNIVERSAL CLOSE BUTTON PATCH ---
 class _UniversalCloseView(discord.ui.View):
     def __init__(self, ctx):
@@ -5155,6 +5163,19 @@ async def on_ready():
     except Exception as exc:
         print(f" [CONCIERGE MONITOR] Concierge monitor watchdog failed to start: {type(exc).__name__}: {exc}")
 
+    # Concierge browser reaper: reclaim per-session headed Chromium containers
+    # once their login session is terminal or superseded. Without this an
+    # abandoned session leaked a container + noVNC port forever (the login view
+    # removed a container only on an explicit ✕ Cancel).
+    try:
+        from src.bot.concierge_login import concierge_browser_reaper_loop
+        t_reaper = bot.loop.create_task(concierge_browser_reaper_loop())
+        _PERSISTENT_TASKS.add(t_reaper)
+        t_reaper.add_done_callback(_PERSISTENT_TASKS.discard)
+        print(" [CONCIERGE REAPER] started.")
+    except Exception as exc:
+        print(f" [CONCIERGE REAPER] failed to start: {type(exc).__name__}: {exc}")
+
     # Gmail watcher: history-API polling for new mail. Deterministic digest
     # to Discord; LLM triage only for users who opted in via !gmail autoparse.
     try:
@@ -5258,11 +5279,11 @@ async def _send_thinking_placeholder(message: discord.Message, handle: _AdvisorR
 
 @bot.event
 async def on_message(message: discord.Message):
-    user_id = str(message.author.id)
-    src.core.state.CURRENT_USER_ID.set(str(message.author.id))
+    effective_id = os.getenv("SPOOF_USER_ID") or str(message.author.id)
+    user_id = effective_id
+    src.core.state.CURRENT_USER_ID.set(effective_id)
     if message.author.id == bot.user.id:
         return
-    src.core.state.CURRENT_USER_ID.set(str(message.author.id))
 
     message_id = getattr(message, "id", None)
     attachment_count = len(message.attachments or [])
@@ -5270,7 +5291,7 @@ async def on_message(message: discord.Message):
         f" [MESSAGE] received id={message_id} author={message.author.id} "
         f"channel={message.channel.id} guild={message.guild.id if message.guild else None} "
         f"content_chars={len(message.content or '')} attachments={attachment_count} "
-        f"content={message.content!r}",
+        f"content={_safe_message_log_text(message.content)!r}",
         flush=True,
     )
 
@@ -5430,7 +5451,7 @@ async def on_message(message: discord.Message):
         print(f"ℹ [MESSAGE] nothing to process id={message_id}")
         return
 
-    uid = str(message.author.id)
+    uid = effective_id
     handle = _AdvisorReplyHandle(message.channel, source_message_id=message_id)
     placeholder_task = None
 

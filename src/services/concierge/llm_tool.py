@@ -19,13 +19,19 @@ from src.services.concierge.act_actions import (
     ACT_KINDS,
     ActActionError,
     _validate_steps,
+    _validate_step_navigations,
     _act_target_url,
     _secret_field_type,
     _step_vault_refs,
 )
-from src.services.concierge.approval_store import ApprovalStore
+from src.services.concierge.approval_store import ApprovalStore, _host_of
 from src.services.concierge.audit import AuditLog
 from src.services.concierge.browser_gate import READ_KINDS, ReadGateError
+from src.services.concierge.capture_tokens import CaptureTokenStore
+from src.services.concierge.credential_capture import (
+    CaptureRefused,
+    build_credential_capture,
+)
 from src.services.concierge.read_actions import (
     ReadActionError,
     perform_read_action,
@@ -106,6 +112,46 @@ def _await(fn: Callable[[str], Any], url: str) -> Dict[str, Any]:
     if not isinstance(result, dict):
         raise ReadActionError("read fetcher must return a dict")
     return result
+
+
+def request_credential_capture(
+    tenant: str,
+    args: Dict[str, Any],
+    tenants: TenantStore,
+    audit: AuditLog,
+    tokens: Optional[CaptureTokenStore] = None,
+) -> Dict[str, Any]:
+    """Issue a credential-capture link on the model's behalf (self-service).
+
+    The user gets a one-time URL to store login credentials for the
+    requested domain; raw values never reach the model or Discord. ``tenant``
+    is interaction-derived (never model-supplied). Same gates as the
+    ``!concierge creds`` command: tenant enabled + domain allowlisted.
+    Every attempt is audited (capture_issued / capture_refused) carrying
+    domain, never the token.
+    """
+    if not isinstance(args, dict):
+        raise ConciergeToolError("args must be a dict")
+    token_store = tokens or CaptureTokenStore(_DB)
+    try:
+        res = build_credential_capture(
+            tenant,
+            args.get("domain"),
+            tenants=tenants,
+            tokens=token_store,
+            fields=args.get("fields"),
+        )
+    except CaptureRefused as exc:
+        audit.append(
+            actor=tenant, action="capture_refused", tenant=tenant,
+            detail={"reason": str(exc)[:200]},
+        )
+        raise ConciergeToolError(str(exc)) from exc
+    audit.append(
+        actor=tenant, action="capture_issued", tenant=tenant,
+        detail={"domain": res["domain"]},
+    )
+    return res
 
 
 async def request_concierge_action_async(
@@ -197,6 +243,60 @@ def _protect_secret_steps(
     return protected
 
 
+def concierge_act_status(
+    tenant: str,
+    limit: int = 10,
+    store: Optional[ApprovalStore] = None,
+) -> List[Dict[str, Any]]:
+    """Read-only status of the tenant's recent concierge proposals.
+
+    Lets the model answer "is the login done / what happened" truthfully
+    from post-approval state instead of guessing from the approval prompt.
+    Each entry carries the terminal status (pending/executed/rolled_back/
+    rejected/expired) plus a short outcome note (error text or the act's
+    page-text summary) when one exists. Never executes or mutates anything.
+    """
+    store = store or ApprovalStore(_DB)
+    rows = store.recent_for_tenant(tenant, limit=max(1, min(int(limit or 10), 25)))
+    # Map any still-active mission back to the proposal that created it, so a
+    # proposal row can tell the model the *mission_id* to pass to
+    # concierge_browser_step instead of the model reusing the proposal_id
+    # (which is never a valid mission id and stalled the whole mission).
+    mission_by_proposal = {
+        m.get("origin_proposal_id"): m["mission_id"]
+        for m in store.active_missions_for_tenant(tenant, limit=50)
+        if m.get("origin_proposal_id")
+    }
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        item: Dict[str, Any] = {
+            "proposal_id": r["proposal_id"],
+            "kind": r["kind"],
+            "status": r["status"],
+            "created_at": r["created_at"],
+        }
+        mission_id = mission_by_proposal.get(r["proposal_id"])
+        if mission_id:
+            item["mission_id"] = mission_id
+        detail = r.get("result_detail") or {}
+        if detail.get("error"):
+            item["outcome"] = str(detail["error"])[:240]
+        elif isinstance(detail.get("act_result"), dict):
+            ar = detail["act_result"]
+            outcome_note = ""
+            if ar.get("status"):
+                outcome_note = f"act_status={ar['status']}"
+            summary = str(ar.get("summary") or "")[:240].replace("\n", " ")
+            if summary:
+                outcome_note = (outcome_note + " | " if outcome_note else "") + summary
+            item["outcome"] = outcome_note or None
+        elif detail.get("verification"):
+            v = detail["verification"]
+            item["outcome"] = f"verify={v.get('verdict')} ({v.get('confidence', 0)})"
+        out.append(item)
+    return out
+
+
 def propose_concierge_act(
     tenant: str,
     kind: str,
@@ -245,18 +345,36 @@ def propose_concierge_act(
             "(needs write or spend)"
         )
 
+    if kind == "fill_form" and not args.get("steps"):
+        # Browser fill-form missions are agentic after approval. If the model
+        # follows the concise schema, persist only a marker so approval starts
+        # with a live observation instead of requiring a blind plan.
+        steps = [{"action": "screenshot"}]
+    else:
+        try:
+            steps = _validate_steps(args.get("steps"), allowed_domains=allowed)
+        except ActActionError as exc:
+            audit.append(
+                actor=tenant, action="act_refused", tenant=tenant,
+                subject=kind, detail={"reason": str(exc)[:300], "kind": kind},
+            )
+            raise ConciergeToolError(str(exc)) from exc
+
     try:
-        steps = _validate_steps(args.get("steps"), allowed_domains=allowed)
-    except ActActionError as exc:
+        url = _act_target_url(kind, args, allowed)
+    except ReadGateError as exc:
         audit.append(
             actor=tenant, action="act_refused", tenant=tenant,
             subject=kind, detail={"reason": str(exc)[:300], "kind": kind},
         )
         raise ConciergeToolError(str(exc)) from exc
 
+    # Every step-level navigate must stay on the act's own target host. This
+    # refuses the model's redirect-through-another-allowlisted-domain habit
+    # at propose time — before a human ever sees an approval prompt.
     try:
-        url = _act_target_url(kind, args, allowed)
-    except ReadGateError as exc:
+        _validate_step_navigations(steps, allowed, target_host=_host_of(url))
+    except (ReadGateError, ActActionError) as exc:
         audit.append(
             actor=tenant, action="act_refused", tenant=tenant,
             subject=kind, detail={"reason": str(exc)[:300], "kind": kind},
@@ -305,6 +423,7 @@ def propose_concierge_act(
 __all__ = [
     "request_concierge_action",
     "request_concierge_action_async",
+    "request_credential_capture",
     "propose_concierge_act",
     "tool_result_json",
     "ConciergeToolError",

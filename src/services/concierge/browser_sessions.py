@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import socket
 import sqlite3
 import string
 import threading
@@ -92,19 +93,63 @@ class BrowserSessionStore:
     def _now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-    def next_vnc_port(self, base: int = 6081) -> int:
-        """First base+offset port not already in use by an open session."""
+    def next_vnc_port(
+        self,
+        base: int = 6081,
+        check_host: Optional[bool] = None,
+        exclude: Optional[set] = None,
+    ) -> int:
+        """First base+offset port free in the registry, the OS, and ``exclude``.
+
+        The registry can outlive a container (daemon restart, manual removal,
+        or an earlier failed spawn), so a database-only check is insufficient.
+
+        ``exclude`` lets the caller pass host ports it knows are taken by
+        something this process cannot see — e.g. the published ports of sibling
+        Docker containers. The bot itself runs inside a container, so the OS
+        bind probe below only sees the container's own loopback and would
+        happily reuse a host port a concierge container still holds.
+        """
+        # Production uses the default range and must account for orphaned
+        # Docker containers. Custom bases are retained as registry-only for
+        # deterministic callers/tests that reserve ports abstractly.
+        if check_host is None:
+            check_host = base == 6081
+        exclude = exclude or set()
         offset = 0
         while offset < 200:
             port = base + offset
             cur = self._conn().cursor()
             cur.execute(
-                "SELECT 1 FROM concierge_browser_sessions WHERE vnc_port = ? AND status = 'open'",
+                "SELECT 1 FROM concierge_browser_sessions WHERE vnc_port = ? "
+                "AND status IN ('open', 'done')",
                 (port,),
             )
-            if cur.fetchone() is None:
+            if cur.fetchone() is not None:
+                offset += 1
+                continue
+            if port in exclude:
+                offset += 1
+                continue
+            if not check_host:
                 return port
-            offset += 1
+            try:
+                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            except OSError:
+                # Some test sandboxes and restricted runtimes disallow socket
+                # creation entirely.  The registry reservation is still
+                # authoritative there; production runtimes continue to use
+                # the OS probe when socket access is available.
+                return port
+            try:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                offset += 1
+                continue
+            finally:
+                probe.close()
+            return port
         raise BrowserSessionError("no free VNC port in range")
 
     def create(
@@ -217,6 +262,92 @@ class BrowserSessionStore:
         )
         return [self.get(r["session_id"]) for r in cur.fetchall()]
 
+    def latest_ready_for_domain(self, tenant: str, domain: str) -> Optional[Dict[str, Any]]:
+        """Return the newest completed headed browser for this tenant/domain.
+
+        The active login browser is the browser the user can see in VNC. It is
+        eligible both before and after the Done button so an approved action
+        cannot silently jump to a second headless browser.
+        """
+        host = str(domain or "").strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        cur = self._conn().cursor()
+        # Sessions are stored under the raw host the user typed, which may keep
+        # a "www." prefix, while every caller looks up the stripped host. Match
+        # both forms so a www. login is still found and reused (and the agentic
+        # mission attaches to the live authenticated browser instead of opening
+        # a fresh headless one).
+        cur.execute(
+            "SELECT session_id FROM concierge_browser_sessions "
+            "WHERE tenant = ? AND (domain = ? OR domain = ?) "
+            "AND status IN ('open', 'done') "
+            "ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, "
+            "updated_at DESC LIMIT 1",
+            (tenant, host, "www." + host),
+        )
+        row = cur.fetchone()
+        return self.get(row["session_id"], tenant=tenant) if row else None
+
+    def retirable(self) -> List[Dict[str, Any]]:
+        """Sessions whose disposable container should be reclaimed.
+
+        Terminal sessions (expired / killed) are always retirable, and so is
+        any open/done session that is not the newest ready browser for its
+        (tenant, domain): only the newest login per tenant/domain can still be
+        attached to, so an older headed Chromium (and its published noVNC
+        port) is dead weight.  Previously nothing removed them — the login
+        view only removed a container on an explicit Cancel — so an abandoned
+        or superseded session leaked a Chromium per attempt, forever.
+
+        The newest ready browser is NEVER retired, even when old: it is the
+        one a mission can still attach to and the user may still be using, so
+        ageing it out here would yank a live VNC session out from under them.
+        A session only becomes reclaimable once it is superseded by a newer
+        login for the same (tenant, domain), or is already terminal.
+        """
+        dead: Dict[str, Dict[str, Any]] = {}
+        cur = self._conn().cursor()
+        cur.execute(
+            "SELECT session_id FROM concierge_browser_sessions "
+            "WHERE status IN ('expired', 'killed')"
+        )
+        for row in cur.fetchall():
+            dead[row["session_id"]] = self.get(row["session_id"])
+
+        cur.execute(
+            "SELECT session_id, tenant, domain FROM concierge_browser_sessions "
+            "WHERE status IN ('open', 'done') ORDER BY updated_at DESC"
+        )
+        seen = set()
+        for row in cur.fetchall():
+            host = str(row["domain"] or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            key = (row["tenant"], host)
+            if key in seen:
+                dead[row["session_id"]] = self.get(row["session_id"])
+            else:
+                seen.add(key)
+        return list(dead.values())
+
+    def retire(self, session_id: str) -> None:
+        """Mark a reclaimed session terminal so the reaper never re-sweeps it.
+
+        ``'reaped'`` is deliberately distinct from ``'expired'``: the reaper
+        selects ``expired``/``killed`` rows, so a row must leave those states
+        once its container is gone, or every sweep would retry a container
+        that no longer exists. ``'reaped'`` is excluded from the ready-browser
+        lookups too, so it can never be attached to again.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE concierge_browser_sessions SET status = 'reaped', updated_at = ? "
+                "WHERE session_id = ?",
+                (self._now(), session_id),
+            )
+            conn.commit()
+
 
 def build_docker_run(
     session: Dict[str, Any],
@@ -226,6 +357,7 @@ def build_docker_run(
     bind_host: str = "127.0.0.1",
     drm_device: str = "",
     drm_gid: str = "",
+    docker_network: str = "",
     extra_env: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """docker-run argv for one disposable login-intake container.
@@ -244,6 +376,8 @@ def build_docker_run(
         "-p", bind_host + ":" + str(session["vnc_port"]) + ":6080",
         "--tmpfs", profile_tmpfs + ":size=256m",
     ]
+    if docker_network:
+        argv.extend(["--network", docker_network])
     if accel == "igpu":
         if not drm_device or not drm_gid:
             raise BrowserSessionError(
@@ -286,6 +420,9 @@ def complete_login_session(
     blob = pack_profile_dir(profile_dir)
     rec = vault.store_session_profile(
         tenant, label or sess["label"], blob, consumer_scope,
+        # a logged-in cookie profile is meant to be reused across acts, not
+        # revoked when one proposal referencing it reaches a terminal state.
+        policy="persistent",
     )
     store.finish(session_id, tenant, rec["vault_ref"])
     return {
