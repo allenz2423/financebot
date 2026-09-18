@@ -2373,21 +2373,40 @@ def agentic_browser_step(
             if not browser_auth_challenge(settled_summary, settled_urls):
                 summary, blocked = settled_summary, False
         page_stage = actuator.page_stage()
-        # If a login mission is still on a page with no credential field — the
-        # sign-in form was not reachable (a bot/consent wall) or the landing
-        # page simply has none — steer the model to the sign-in page instead of
-        # letting it click an unrelated control (a marketing tab, a cookie
-        # banner) and then stall on "page did not change".
+        # A login mission lands on a credential-free page TWICE: before the form
+        # (a marketing/consent landing page → steer to /signin) and after a
+        # successful submit (the signed-in account page → STOP). Steering on the
+        # second case is what made the bot click "LOG OUT" on PayPal's already
+        # signed-in summary page, undoing the login it had just completed. So
+        # remember per mission whether the sign-in form was ever reached, and
+        # never steer away from a page that shows a log-out control.
+        seen_credentials = bool(getattr(actuator, "_seen_credential_stage", False))
+        if page_stage in _CREDENTIAL_STAGES:
+            actuator._seen_credential_stage = True
+            seen_credentials = True
         if missions[0].get("kind") == "fill_form" and page_stage == "page" and not blocked:
-            _signin_host = str(missions[0].get("domain") or "").strip().lower().lstrip(".")
-            summary = (
-                f"{summary}\n\n[NO SIGN-IN FORM ON THIS PAGE] This page exposes no "
-                f"login or credential field. Do not click unrelated controls — a "
-                f"marketing tab or a cookie banner is not a way to sign in. To reach "
-                f"the sign-in form, call concierge_browser_step with action=\"navigate\" "
-                f"and url=\"https://{_signin_host}/signin\" (try /login if no form "
-                f"loads). Once the form is on screen, type into its fields by id."
-            )
+            # A log-out / sign-out control (in the control inventory, not the
+            # marketing copy) only appears once authenticated — a
+            # merchant-independent "you are signed in".
+            _controls_region = summary.split("[PAGE TEXT]", 1)[0]
+            if re.search(r"log\s?out|sign\s?out", _controls_region, re.IGNORECASE):
+                summary = (
+                    f"{summary}\n\n[LOGIN SUCCEEDED] This page offers a log-out / "
+                    f"sign-out control, so the sign-in was accepted and the login "
+                    f"mission is DONE. Do NOT click log out, sign out, or any other "
+                    f"control. Report to the user that the sign-in succeeded (name "
+                    f"the account/page shown) and stop."
+                )
+            elif not seen_credentials:
+                _signin_host = str(missions[0].get("domain") or "").strip().lower().lstrip(".")
+                summary = (
+                    f"{summary}\n\n[NO SIGN-IN FORM ON THIS PAGE] This page exposes no "
+                    f"login or credential field. Do not click unrelated controls — a "
+                    f"marketing tab or a cookie banner is not a way to sign in. To reach "
+                    f"the sign-in form, call concierge_browser_step with action=\"navigate\" "
+                    f"and url=\"https://{_signin_host}/signin\" (try /login if no form "
+                    f"loads). Once the form is on screen, type into its fields by id."
+                )
         page_url = getattr(actuator, "_page", None).url if getattr(actuator, "_page", None) else missions[0]["url"]
         internal_shots = os.getenv("CONCIERGE_INTERNAL_SCREENSHOTS", "0").lower() in {
             "1", "true", "yes", "on"

@@ -1657,3 +1657,117 @@ def test_adversarial_reach_login_form_returns_to_fallback_when_absent():
         assert act._page.url.rstrip("/") == base.rstrip("/")
     finally:
         act.close()
+
+
+# ============================================================================
+# Login completion: a signed-in page STOPS the mission — it must never be
+# steered back to the sign-in form (which on PayPal made the bot click the
+# "LOG OUT" control and undo the login it had just completed).
+# ============================================================================
+
+
+ACCOUNT_LOGGED_IN = """<!DOCTYPE html><html><body>
+  <header><nav>
+    <a id="header-settings" name="header-settings" href="/settings">Settings</a>
+    <a id="header-logout" name="header-logout" href="/signout">LOG OUT</a>
+  </nav></header>
+  <main><h1>Account summary</h1><a href="/activity">Activity</a></main>
+</body></html>"""
+
+NEUTRAL_AFTER_LOGIN = """<!DOCTYPE html><html><body>
+  <main><h1>Redirecting…</h1><a href="/">Home</a></main>
+</body></html>"""
+
+
+def _login_mission(tmp_path, monkeypatch, domain, url, pages, tenant="user:adv-login-done"):
+    """Build an approved fill_form mission whose actuator serves ``pages``."""
+    db_path = str(tmp_path / "adv_login_done.db")
+    store = ApprovalStore(db_path)
+    vault = Vault(db_path, master_key=MASTER_KEY)
+    p_id = store.create(
+        tenant=tenant, uid="u1", kind="fill_form",
+        args={"domain": domain, "steps": [{"action": "observe"}]},
+        url=url, steps=[{"action": "observe"}], allowed_domains=[domain],
+    )
+    store.claim(p_id)
+    mission_id = store.grant_mission(p_id)["mission_id"]
+    act = BrowserlessActuator(url, allowed_domains=[domain], cdp_url=CDP_TEST_URL)
+    _serve(act, domain, pages)
+    monkeypatch.setattr("src.bot.approval_views.ApprovalStore", lambda db=None: store)
+    monkeypatch.setattr("src.bot.approval_views.Vault", lambda db=None: vault)
+    AGENTIC_BROWSER_SESSIONS[mission_id] = act
+    return tenant, mission_id, act
+
+
+def test_adversarial_signed_in_page_signals_success_not_signin_steer(tmp_path, monkeypatch):
+    """Once the sign-in form was reached and the mission lands on a page that
+    offers a log-out control, the observe summary must declare success and
+    forbid clicking anything — NOT steer back to /signin. Regression for the
+    live PayPal run where the steer made the bot click 'LOG OUT'."""
+    domain = "login-done.test"
+    base = f"https://{domain}/"
+    account = f"https://{domain}/myaccount/summary"
+    tenant, mission_id, act = _login_mission(
+        tmp_path, monkeypatch, domain, base,
+        {"/signin": SIGNIN_FORM, "/myaccount/summary": ACCOUNT_LOGGED_IN},
+    )
+    try:
+        act.navigate(base + "signin")
+        first = agentic_browser_step(tenant, mission_id, "observe")
+        assert first["page_stage"] in {"password", "identifier"}
+        assert getattr(act, "_seen_credential_stage", False) is True
+
+        act.navigate(account)
+        done = agentic_browser_step(tenant, mission_id, "observe")
+        assert "[LOGIN SUCCEEDED]" in done["summary"], done["summary"]
+        assert "[NO SIGN-IN FORM ON THIS PAGE]" not in done["summary"], done["summary"]
+    finally:
+        act_saved = AGENTIC_BROWSER_SESSIONS.pop(mission_id, None)
+        if act_saved:
+            act_saved.close()
+
+
+def test_adversarial_credential_free_page_steers_to_signin_before_form(tmp_path, monkeypatch):
+    """Before the sign-in form has ever been reached, a credential-free landing
+    page still steers the model to /signin (the original fix)."""
+    domain = "login-steer.test"
+    base = f"https://{domain}/"
+    tenant, mission_id, act = _login_mission(
+        tmp_path, monkeypatch, domain, base,
+        {"/": HOME_NO_LOGIN, "/signin": SIGNIN_FORM},
+    )
+    try:
+        act.navigate(base)
+        obs = agentic_browser_step(tenant, mission_id, "observe")
+        assert "[NO SIGN-IN FORM ON THIS PAGE]" in obs["summary"], obs["summary"]
+        assert "[LOGIN SUCCEEDED]" not in obs["summary"], obs["summary"]
+    finally:
+        act_saved = AGENTIC_BROWSER_SESSIONS.pop(mission_id, None)
+        if act_saved:
+            act_saved.close()
+
+
+def test_adversarial_no_steer_after_form_seen_on_neutral_page(tmp_path, monkeypatch):
+    """After the form was reached, a later credential-free page with no log-out
+    control must NOT be steered back to /signin — steering there is what led the
+    model to hunt for a login route and click 'LOG OUT'."""
+    domain = "login-neutral.test"
+    base = f"https://{domain}/"
+    neutral = f"https://{domain}/interstitial"
+    tenant, mission_id, act = _login_mission(
+        tmp_path, monkeypatch, domain, base,
+        {"/signin": SIGNIN_FORM, "/interstitial": NEUTRAL_AFTER_LOGIN},
+    )
+    try:
+        act.navigate(base + "signin")
+        assert agentic_browser_step(tenant, mission_id, "observe")["page_stage"] in {
+            "password", "identifier"
+        }
+        act.navigate(neutral)
+        obs = agentic_browser_step(tenant, mission_id, "observe")
+        assert "[NO SIGN-IN FORM ON THIS PAGE]" not in obs["summary"], obs["summary"]
+        assert "[LOGIN SUCCEEDED]" not in obs["summary"], obs["summary"]
+    finally:
+        act_saved = AGENTIC_BROWSER_SESSIONS.pop(mission_id, None)
+        if act_saved:
+            act_saved.close()
