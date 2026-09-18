@@ -1317,6 +1317,22 @@ def test_adversarial_mission_id_resolved_from_proposal_id(tmp_path, monkeypatch)
             act_saved.close()
 
 
+def test_adversarial_missing_mission_error_is_actionable(tmp_path, monkeypatch):
+    """With no active mission the error must tell the model to propose one —
+    not the bare 'mission is not active' that made it give up and ask the user
+    for permission. It must also say a proposal_id / `profile_…` ref is not a
+    mission_id (the model passed `profile_70ed58ac0d4f` in production)."""
+    store = ApprovalStore(str(tmp_path / "none.db"))
+    monkeypatch.setattr("src.bot.approval_views.ApprovalStore", lambda db=None: store)
+
+    with pytest.raises(ValueError) as exc:
+        agentic_browser_step("user:none", "profile_70ed58ac0d4f", "observe")
+    msg = str(exc.value)
+    assert "request_concierge_action" in msg
+    assert "fill_form" in msg
+    assert "profile_" in msg
+
+
 def test_adversarial_handle_survives_id_rename_via_fingerprint():
     """Site-agnostic recovery: if the page re-renders and the id the observation
     recorded disappears, the control must still be found by its semantic

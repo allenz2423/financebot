@@ -514,6 +514,11 @@ def test_live_state_guard_recognises_unbacked_account_verdicts():
         "your account).",
         _FABRICATED_VERDICT,
         "The active session shows your name in the top-right corner.",
+        # First-person is just as much a live-state claim: the model shipped
+        # this with zero tool calls and the second-person-only detector missed it.
+        "I am already logged in to PayPal.",
+        "I'm logged into your PayPal account.",
+        "I've signed in to your account.",
     ):
         assert llm._claims_live_browser_state(text) is True, text
 
@@ -521,6 +526,7 @@ def test_live_state_guard_recognises_unbacked_account_verdicts():
         "Your balance is $0.00 and there are no pending transactions.",
         "I filed the receipt and updated the category for that payment.",
         "Your PayPal Savings offer is 3.30% APY.",
+        llm._LIVE_STATE_FALLBACK,
     ):
         assert llm._claims_live_browser_state(text) is False, text
 

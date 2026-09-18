@@ -3772,7 +3772,12 @@ def _drop_images_from_messages(messages: list) -> list:
 # not ship unless the model actually touched the live page this turn.
 _LIVE_STATE_CLAIM_RE = re.compile(
     r"(?:"
-    r"\b(?:you(?:'re| are)|your)\b[^\n.]{0,60}?\b(?:logged|signed)\s?(?:in|into|out)\b"
+    r"\b(?:you(?:'re| are)|your)\b[^\n.]{0,60}?\b(?:logged|signed)[\s-]?(?:in|into|out)\b"
+    # First-person is just as much a live-state claim: the model shipped
+    # "I am already logged in to PayPal." with zero tool calls, which the
+    # second-person-only alternative above missed.
+    r"|\b(?:i(?:'m| am|'ve| have)|we(?:'re| are|'ve| have))\b[^\n.]{0,40}?"
+    r"\b(?:logged|signed)[\s-]?(?:in|into|out)\b"
     r"|\byour own\b[^\n.]{0,30}?\baccount\b"
     r"|\b(?:active|current|live)\s+(?:session|browser|mission)\b[^\n.]{0,40}?"
     r"\b(?:shows?|belongs?|is)\b"
@@ -4230,6 +4235,24 @@ RUNTIME CONTRACT:
                         f"mission list without a fresh approval prompt. For shopping "
                         f"research, stay on the requested retailer/merchant; do not "
                         f"substitute another marketplace or retailer.\n"
+                        f"Each mission's `mission_id` is the id you pass to "
+                        f"concierge_browser_step. It is NOT a proposal_id and NOT a "
+                        f"`profile_…` vault_ref.\n"
+                    )
+                else:
+                    # No mission is live. Say so explicitly: otherwise the model
+                    # has no id to use, grabs a proposal_id or a `profile_…`
+                    # vault_ref from the session records below, and every
+                    # concierge_browser_step fails with "mission is not active".
+                    missions_line = (
+                        f"\nNO ACTIVE BROWSER MISSION. concierge_browser_step cannot run "
+                        f"until one exists. When the user asks you to log in or do "
+                        f"anything on a site, call request_concierge_action with "
+                        f"kind='fill_form' and args={{'domain': '<site>'}} — that creates "
+                        f"the approval the user clicks ✅ on, and approval grants the "
+                        f"mission. Do not ask 'would you like me to?' first; propose it. "
+                        f"Do not pass a proposal_id or a `profile_…` vault_ref as a "
+                        f"mission_id.\n"
                     )
             except Exception:
                 pass

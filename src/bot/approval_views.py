@@ -2079,7 +2079,12 @@ def agentic_browser_step(
                 "active mission id(s) are: " + ids + " (a proposal_id is NOT a "
                 "mission_id — pass one of these)"
             )
-        raise ValueError("browser mission is not active (permission may have expired or been denied)")
+        raise ValueError(
+            "no active browser mission for this user. Start one by calling "
+            "request_concierge_action with kind='fill_form' and args={'domain': '<site>'} "
+            "(the user approves it once), then observe the live page. A mission_id is "
+            "neither a proposal_id nor a vault_ref such as 'profile_…'."
+        )
     # Canonicalize onto the resolved mission so the actuator registry and the
     # persisted state ref are keyed by the real id, not whatever the model sent.
     mission_id = missions[0]["mission_id"]
