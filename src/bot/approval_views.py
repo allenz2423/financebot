@@ -30,7 +30,7 @@ from src.services.concierge.browser_gate import validate_target_url
 from src.services.concierge.tenants import TenantStore
 from src.services.concierge.vlm_verify import verify_act
 from src.services.concierge.browser_driver import DEFAULT_TIMEOUT_MS
-from src.services.concierge.browser_sessions import BrowserSessionStore
+from src.services.concierge.browser_sessions import BrowserSessionStore, container_alive
 from src.security.vault import DEFAULT_DB_PATH as _DB, Vault
 
 # Approved browser missions stay attached to a live page.  The model receives
@@ -1681,7 +1681,7 @@ def _shared_cdp_url(tenant: str, url: str) -> Optional[str]:
     if not host:
         return None
     try:
-        session = BrowserSessionStore(_DB).latest_ready_for_domain(tenant, host)
+        session = BrowserSessionStore(_DB).latest_ready_for_domain(tenant, host, alive=container_alive)
     except Exception:
         return None
     if not session:

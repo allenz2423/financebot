@@ -269,3 +269,40 @@ def test_retirable_never_reclaims_the_newest_live_session(tmp_path):
     )
     assert store.retirable() == []
     assert store.get(sess["session_id"])["status"] == "open"
+
+
+def test_latest_ready_alive_filter_skips_dead_container(tmp_path):
+    """A newer row whose container is gone must not shadow an older live one.
+
+    Before this, ``handle_login`` reused the newest *row* even after Docker
+    removed its ``--rm`` container, DMing the user a VNC link that 502s (an
+    edge "Host Error")."""
+    from datetime import timedelta
+
+    store, _ = make(tmp_path)
+    live = store.create("user:1", "amazon login", "amazon.com", 7450)
+    store.expire_stale(ttl=timedelta(seconds=-1))  # lapsed but still running
+    dead = store.create("user:1", "amazon login", "amazon.com", 7451)
+
+    def alive(name):
+        return name == live["container_name"]
+
+    got = store.latest_ready_for_domain("user:1", "amazon.com", alive=alive)
+    assert got is not None and got["session_id"] == live["session_id"]
+    assert got["session_id"] != dead["session_id"]
+    # With no liveness filter the pure-SQL lookup still prefers the newest.
+    assert store.latest_ready_for_domain("user:1", "amazon.com")["session_id"] == dead["session_id"]
+
+
+def test_latest_ready_alive_filter_includes_lapsed_session(tmp_path):
+    from datetime import timedelta
+
+    store, _ = make(tmp_path)
+    sess = store.create("user:1", "amazon login", "amazon.com", 7452)
+    store.expire_stale(ttl=timedelta(seconds=-1))
+    assert store.get(sess["session_id"])["status"] == "expired"
+    # Pure-SQL lookup ignores a lapsed row...
+    assert store.latest_ready_for_domain("user:1", "amazon.com") is None
+    # ...but with a liveness check a lapsed-but-running browser is still reused.
+    got = store.latest_ready_for_domain("user:1", "amazon.com", alive=lambda n: True)
+    assert got is not None and got["session_id"] == sess["session_id"]

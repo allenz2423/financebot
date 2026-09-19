@@ -35,6 +35,7 @@ from src.services.concierge.browser_sessions import (
     BrowserSessionStore,
     build_docker_run,
     complete_login_session,
+    container_alive,
 )
 from src.services.concierge.tenants import TenantStore
 
@@ -354,8 +355,10 @@ async def handle_login(ctx, raw_domain: str) -> None:
 
     # The headed browser is the user's visible session and is also the session
     # agentic missions attach to. Never create a second VNC for the same
-    # tenant/domain while one is still available.
-    existing = SESSIONS.latest_ready_for_domain(tenant, lstrip)
+    # tenant/domain while one is still available — but only reuse a session
+    # whose container is actually still running: a row can outlive its
+    # ``--rm`` container, and reusing it would DM the user a link that 502s.
+    existing = SESSIONS.latest_ready_for_domain(tenant, lstrip, alive=container_alive)
     if existing:
         public_base = os.getenv(PUBLIC_BASE_ENV, "").strip().rstrip("/")
         if public_base:

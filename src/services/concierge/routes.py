@@ -34,6 +34,14 @@ capture_router = APIRouter(prefix="/concierge/capture")
 vnc_router = APIRouter(prefix="/concierge/vnc")
 
 
+# A session whose TTL lapsed ('expired') may still have a running chromium:
+# expiry is a reclaim hint, not proof the container is gone. Only a session
+# the reaper actually removed ('reaped') or the owner cancelled ('killed') is
+# truly unservable. Serving 'expired' keeps the user's live VNC link working
+# until the container is genuinely reclaimed.
+_SERVABLE_STATUSES = frozenset({"open", "done", "expired"})
+
+
 def _vnc_session(session_id: str):
     try:
         session = BrowserSessionStore(_VAULT_DB).get(session_id)
@@ -41,13 +49,31 @@ def _vnc_session(session_id: str):
         return None
     # A completed login remains attached to its headed Chromium process so
     # agentic actions and the user's VNC view share the same browser.
-    return session if session.get("status") in {"open", "done"} else None
+    return session if session.get("status") in _SERVABLE_STATUSES else None
+
+
+def _session_ended() -> HTMLResponse:
+    """Readable "session is over" page for a dead/unknown VNC link.
+
+    Returning HTML (not a bare 5xx/JSON) matters because the link is opened in
+    the user's browser through the public reverse proxy: a raw 502 surfaces as
+    an opaque edge "Host Error" page, while this tells the user what to do next.
+    """
+    return HTMLResponse(
+        _html(
+            "Browser session ended",
+            "<h2>Browser session ended</h2>"
+            "<p>This noVNC browser is no longer available. Ask me for a fresh "
+            "login link and open the new one.</p>",
+        ),
+        status_code=404,
+    )
 
 
 @vnc_router.get("/{session_id}")
 async def vnc_entry(session_id: str):
     if _vnc_session(session_id) is None:
-        return JSONResponse({"detail": "VNC session not found or closed"}, status_code=404)
+        return _session_ended()
     return RedirectResponse("/concierge/vnc/" + session_id + "/vnc.html")
 
 
@@ -56,7 +82,7 @@ async def vnc_http_proxy(session_id: str, asset_path: str, request: Request):
     """Proxy noVNC HTTP assets to the tenant's disposable browser container."""
     session = _vnc_session(session_id)
     if session is None:
-        return JSONResponse({"detail": "VNC session not found or closed"}, status_code=404)
+        return _session_ended()
     target = "http://" + session["container_name"] + ":6080/" + asset_path
     if request.url.query:
         target += "?" + request.url.query
@@ -68,7 +94,10 @@ async def vnc_http_proxy(session_id: str, asset_path: str, request: Request):
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
             upstream = await client.request(request.method, target, headers=headers)
     except httpx.HTTPError:
-        return JSONResponse({"detail": "VNC session is unavailable"}, status_code=502)
+        # The row still exists but its container is unreachable (removed or
+        # crashed). Show the same readable "ended" page instead of a 502 that
+        # the edge proxy would mask as an opaque "Host Error".
+        return _session_ended()
     response_headers = {
         k: v for k, v in upstream.headers.items()
         if k.lower() not in {"content-length", "connection", "transfer-encoding"}

@@ -262,3 +262,37 @@ async def test_login_retries_next_port_when_host_port_is_taken(stores, monkeypat
         s for s in stores["sessions"].list_for("user:1") if s["status"] == "open"
     ]
     assert len(open_sessions) == 1
+
+
+async def test_login_reuses_a_live_container(stores, monkeypatch):
+    enable(stores["tenants"], "user:1", "amazon.com")
+    live = cl.SESSIONS.create("user:1", "amazon.com login", "amazon.com", 7410)
+
+    spawned = []
+    monkeypatch.setattr(cl, "container_alive", lambda name: True)
+    monkeypatch.setattr(cl, "docker_spawn", lambda argv: spawned.append(argv) or "ok")
+
+    ctx = FakeCtx(1)
+    await cl.handle_login(ctx, "amazon.com")
+    assert not spawned  # a live browser was reused, no second container
+    assert ctx.sent_replies  # the reuse notice is a channel reply
+    msg = ctx.sent_replies[0]
+    assert "reused" in msg.lower()
+    assert ":" + str(live["vnc_port"]) + "/vnc.html" in msg
+
+
+async def test_login_does_not_reuse_a_dead_container(stores, monkeypatch):
+    """A reused row whose ``--rm`` container is gone must not be handed to the
+    user as a VNC link (it would 502 through the edge proxy)."""
+    enable(stores["tenants"], "user:1", "amazon.com")
+    cl.SESSIONS.create("user:1", "amazon.com login", "amazon.com", 7411)
+
+    spawned = []
+    monkeypatch.setattr(cl, "container_alive", lambda name: False)
+    monkeypatch.setattr(cl, "docker_spawn", lambda argv: spawned.append(argv) or "ok")
+
+    ctx = FakeCtx(1)
+    await cl.handle_login(ctx, "amazon.com")
+    assert spawned, "a fresh browser must be spawned instead of reusing a dead one"
+    msg = ctx.author.sent_messages[0]["content"]
+    assert "reused" not in msg.lower()

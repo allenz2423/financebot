@@ -17,6 +17,7 @@ import secrets
 import socket
 import sqlite3
 import string
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,6 +51,32 @@ def generate_vnc_password(length: int = VNC_PASSWORD_LENGTH) -> str:
     for _ in range(length):
         chars.append(secrets.choice(VNC_PASSWORD_ALPHABET))
     return "".join(chars)
+
+
+def container_alive(container_name: str) -> bool:
+    """Best-effort liveness check for a session's disposable container.
+
+    A session row can outlive its container: the container uses ``--rm`` and
+    may be reaped, crash, or be removed by hand while the row still says
+    ``open``/``done``.  Reusing such a row hands the user a VNC link whose
+    upstream is gone (an edge 502).  Ask Docker first; fall back to resolving
+    the container's name on the shared Docker network (the bot's own DNS
+    view), which fails once the container is gone.
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip().lower() == "true"
+    except Exception:  # noqa: BLE001 — no daemon: fall through to DNS
+        pass
+    try:
+        socket.gethostbyname(container_name)
+        return True
+    except OSError:
+        return False
 
 
 class BrowserSessionStore:
@@ -262,16 +289,30 @@ class BrowserSessionStore:
         )
         return [self.get(r["session_id"]) for r in cur.fetchall()]
 
-    def latest_ready_for_domain(self, tenant: str, domain: str) -> Optional[Dict[str, Any]]:
+    def latest_ready_for_domain(
+        self,
+        tenant: str,
+        domain: str,
+        alive: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Return the newest completed headed browser for this tenant/domain.
 
         The active login browser is the browser the user can see in VNC. It is
         eligible both before and after the Done button so an approved action
         cannot silently jump to a second headless browser.
+
+        ``alive`` is an optional container-liveness predicate.  When given,
+        rows whose container is no longer running are skipped and lapsed
+        (``expired``) sessions are considered too — a lapsed-but-running
+        browser is still attachable, whereas a dead row must never be handed to
+        the user as a VNC link or a CDP target.  Without it the lookup stays
+        pure-SQLite (``open``/``done``) so the store needs no Docker access.
         """
         host = str(domain or "").strip().lower()
         if host.startswith("www."):
             host = host[4:]
+        statuses = ("open", "done", "expired") if alive is not None else ("open", "done")
+        placeholders = ", ".join("?" for _ in statuses)
         cur = self._conn().cursor()
         # Sessions are stored under the raw host the user typed, which may keep
         # a "www." prefix, while every caller looks up the stripped host. Match
@@ -279,15 +320,17 @@ class BrowserSessionStore:
         # mission attaches to the live authenticated browser instead of opening
         # a fresh headless one).
         cur.execute(
-            "SELECT session_id FROM concierge_browser_sessions "
+            "SELECT session_id, container_name FROM concierge_browser_sessions "
             "WHERE tenant = ? AND (domain = ? OR domain = ?) "
-            "AND status IN ('open', 'done') "
-            "ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, "
-            "updated_at DESC LIMIT 1",
-            (tenant, host, "www." + host),
+            "AND status IN (" + placeholders + ") "
+            "ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'done' THEN 1 ELSE 2 END, "
+            "updated_at DESC",
+            (tenant, host, "www." + host, *statuses),
         )
-        row = cur.fetchone()
-        return self.get(row["session_id"], tenant=tenant) if row else None
+        for row in cur.fetchall():
+            if alive is None or alive(row["container_name"]):
+                return self.get(row["session_id"], tenant=tenant)
+        return None
 
     def retirable(self) -> List[Dict[str, Any]]:
         """Sessions whose disposable container should be reclaimed.
