@@ -57,3 +57,9 @@ openai>=1.40.0
 # Local GPU path (optional, used when STT_BACKEND=local)
 faster-whisper>=1.1.0
 psutil
+
+# System 1 Fast Browser Actions & Form Scoring (CUA-S1 / TypeSafe Jev)
+onnxruntime>=1.18.0
+typesafe-sdk>=0.1.0
+numpy>=1.24.0
+

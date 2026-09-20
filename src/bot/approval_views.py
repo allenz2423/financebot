@@ -2281,6 +2281,22 @@ def execute_approved_act(
                 subject=login_domain,
                 detail={"proposal_id": proposal_id, "result": res["login_entry"]},
             )
+            # Opportunistic System 1 autonomous form filling pass (CUA-S1 + Jev)
+            if os.getenv("CONCIERGE_ENABLE_SYSTEM1", "1").lower() in {"1", "true", "yes", "on"}:
+                try:
+                    from src.services.concierge.system1_agent import System1FormAgent
+                    s1 = System1FormAgent(cdp_actuator=actuator, tenant=tenant, domain=str(login_domain), vault=vault)
+                    if s1._resolve_vault_fields():
+                        s1_res = s1.run_autonomous_step(max_steps=4)
+                        res["system1_auto"] = s1_res
+                        if s1_res.get("actions_executed"):
+                            audit.append(
+                                actor=tenant, action="act_system1_auto", tenant=tenant,
+                                subject=proposal["kind"],
+                                detail={"actions": s1_res["actions_executed"], "latency_ms": s1_res.get("latency_ms")},
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    print(f" [CONCIERGE SYSTEM1] auto-pilot execution note: {exc}", flush=True)
         verification = asyncio.run(verify(
             proposal["url"], proposal["steps"],
             page_text=res.get("summary", "") or "",
@@ -2428,9 +2444,19 @@ def agentic_browser_step(
     # control by its observed id), fed to the credential resolver's field
     # matching so it can choose username/email versus password.
     hint = actuator._resolve_handle(selector)
+    s1_result: Optional[Dict[str, Any]] = None
     with actuator.operation_lock:
         if action in {"observe", "screenshot"}:
             pass
+        elif action == "auto":
+            from src.services.concierge.system1_agent import System1FormAgent
+            s1_agent = System1FormAgent(
+                cdp_actuator=actuator,
+                tenant=tenant,
+                domain=missions[0]["domain"],
+                vault=Vault(_DB),
+            )
+            s1_result = s1_agent.run_autonomous_step()
         elif action == "navigate":
             # `url` is the navigation target. A bare observation id (eN) or a
             # CSS selector accidentally passed here is NOT a path — treating it
@@ -2479,7 +2505,7 @@ def agentic_browser_step(
         elif action == "scroll":
             actuator.scroll(value=value, selector=selector)
         else:
-            raise ValueError("action must be observe, screenshot, navigate, click, type, or scroll")
+            raise ValueError("action must be observe, screenshot, navigate, click, type, scroll, or auto")
         debug_shots = os.getenv("CONCIERGE_DEBUG_SCREENSHOTS", "0").lower() in {
             "1", "true", "yes", "on"
         }
@@ -2529,13 +2555,27 @@ def agentic_browser_step(
             return summary, urls
 
         summary, challenge_urls = _sample_observation()
+        if s1_result:
+            s1_report = (
+                f"[SYSTEM 1 AUTONOMOUS FORM RESULT]\n"
+                f"Status: {s1_result.get('status')}\n"
+                f"Model: {s1_result.get('model')}\n"
+                f"Latency: {s1_result.get('latency_ms')}ms\n"
+                f"Actions Executed: {json.dumps(s1_result.get('actions_executed', []))}\n"
+            )
+            if s1_result.get("block_reason"):
+                s1_report += f"Block Reason: {s1_result.get('block_reason')}\n"
+            summary = s1_report + "\n" + summary
+
         # A `type` action carries input the *user* supplied — a login field, or
         # a verification code the user pasted into chat. It is never a
         # bot-driven attempt to defeat a wall, so a challenge page must not
         # block it; otherwise the mission can never enter a code the user
         # provides and the login dead-ends. Every other action still hard-blocks
         # on a detected wall.
-        blocked = action != "type" and browser_auth_challenge(summary, challenge_urls)
+        blocked = action not in {"type", "auto"} and browser_auth_challenge(summary, challenge_urls)
+        if action == "auto" and s1_result and s1_result.get("status") == "blocked":
+            blocked = True
         if blocked:
             # A single sample can land while the page is still loading: an
             # empty/partial document or a frame mid-navigation can read as a
@@ -2593,17 +2633,23 @@ def agentic_browser_step(
             if user_requested_screenshot or debug_shots or needs_visual_recovery
             else None
         )
-        return {
+        res_dict = {
             "mission_id": mission_id,
             "action": action,
             "url": page_url,
             "summary": summary,
             "page_stage": page_stage,
             "blocked": blocked,
-            "block_reason": "user authentication/verification is required" if blocked else "",
+            "block_reason": (
+                (s1_result.get("block_reason") if s1_result and s1_result.get("block_reason") else "")
+                or ("user authentication/verification is required" if blocked else "")
+            ),
             "screenshot_png": shot,
             "screenshot_user_requested": user_requested_screenshot,
         }
+        if s1_result:
+            res_dict["s1_result"] = s1_result
+        return res_dict
 
 
 def _result_detail(res: Dict[str, Any]) -> Dict[str, Any]:
