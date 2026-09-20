@@ -1,6 +1,19 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from src.services.search import fetch_webpage
+from src.services.search import fetch_webpage, _text_artifact_filename
+
+
+@pytest.mark.parametrize(
+    ("requested", "default", "expected"),
+    [
+        ("original_urls_spreadsheet.xlsx", "google_export.txt", "original_urls_spreadsheet_raw.txt"),
+        ("notes.txt", "google_export.txt", "notes.txt"),
+        ("", "google_sheet_123_all_tabs.txt", "google_sheet_123_all_tabs.txt"),
+        ("artifact", "google_export.txt", "artifact.txt"),
+    ],
+)
+def test_text_artifact_filename_is_truthful(requested, default, expected):
+    assert _text_artifact_filename(requested, default) == expected
 
 @pytest.mark.asyncio
 async def test_fetch():

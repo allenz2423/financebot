@@ -65,9 +65,33 @@ ADVISOR_TOOL_NUM_PREDICT = int(os.getenv("ADVISOR_TOOL_NUM_PREDICT", "16384"))
 # An advisor turn must have a finite ceiling.  Unlimited rounds let a broken
 # browser/model interaction continue consuming tokens and made !cancel less
 # useful when continuations were orphaned.
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "12"))
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "0"))  # 0 = unlimited
 MAX_TOOL_CALLS_PER_ROUND = int(os.getenv("MAX_TOOL_CALLS_PER_ROUND", "0"))  # 0 = unlimited
-MAX_TOTAL_TOOL_CALLS = int(os.getenv("MAX_TOTAL_TOOL_CALLS", "100"))  # 0 = unlimited
+MAX_TOTAL_TOOL_CALLS = int(os.getenv("MAX_TOTAL_TOOL_CALLS", "0"))  # 0 = unlimited
+# Unlimited total calls still need a progress watchdog. This only applies to
+# repeated inspection-only rounds in artifact tasks; it does not cap normal
+# tool use or successful multi-step workflows.
+ARTIFACT_STALL_NUDGE_AFTER = int(os.getenv("ARTIFACT_STALL_NUDGE_AFTER", "3"))
+ARTIFACT_STALL_BREAK_AFTER = int(os.getenv("ARTIFACT_STALL_BREAK_AFTER", "5"))
+
+# Semantic tool-router shadow instrumentation (observational, off by default).
+# 0 = inert: the loop performs no router import, no retrieval, and no writes.
+# Accept truthy spellings ("true"/"yes"/"on") so a natural value cannot crash
+# import, matching src/services/tool_router.py's own parser.
+def _env_int_flag(name: str, default: int = 0) -> int:
+    raw = os.getenv(name, str(default)).strip().lower()
+    if raw in ("true", "yes", "on"):
+        return 1
+    if raw in ("false", "no", "off", ""):
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+TOOL_ROUTER_SHADOW = _env_int_flag("TOOL_ROUTER_SHADOW", 0)
+TOOL_ROUTER_SHADOW_SAMPLE = _env_int_flag("TOOL_ROUTER_SHADOW_SAMPLE", 1)  # 1-in-N turns
 
 MAX_SEARCH_ATTEMPTS_PER_ITEM = int(os.getenv("MAX_SEARCH_ATTEMPTS_PER_ITEM", "8"))
 MAX_RESEARCH_FETCHES_PER_SEARCH = int(os.getenv("MAX_RESEARCH_FETCHES_PER_SEARCH", "6"))
@@ -138,6 +162,11 @@ ADVISOR_TASK_REGISTRATION_LOCK = asyncio.Lock()
 USER_INTERRUPTS: dict[str, str] = {}
 STATUS_MESSAGES: dict[str, discord.Message] = {}
 STATUS_UPDATE_TASKS: dict[str, asyncio.Task] = {}
+# Preserve messages received during an active turn instead of dropping them.
+# The advisor itself remains single-flight per user so tool/session state cannot
+# race; queued items are drained in arrival order after the active turn.
+PENDING_ADVISOR_MESSAGES: dict[str, list[dict]] = {}
+MAX_PENDING_ADVISOR_MESSAGES = int(os.getenv("MAX_PENDING_ADVISOR_MESSAGES", "8"))
 
 def _advisor_status_snapshot(uid: str) -> dict:
     state = ADVISOR_STATUS.get(str(uid), {})
@@ -1213,7 +1242,7 @@ conn.commit()
 
 
 
-__all__ = ['get_db', 'DB_PATH', 'SEARCH_CONCURRENCY', 'SEARCH_SCRAPE_MAX_CHARS', 'ACTIVE_ADVISOR_TASKS', 'MAX_SEARCH_ENGINES_PER_QUERY', 'STATUS_UPDATE_TASKS', 'SESSION_HISTORY_MAX_TURNS', 'SESSION_COMPRESSED', 'SESSION_COMPRESSION_ENABLED', 'SESSION_COMPRESSION_MIN_ENTRIES', 'SESSION_COMPRESSION_BLOCK_ENTRIES', 'SESSION_COMPRESSION_KEEP_ENTRIES', 'SESSION_COMPRESSION_MAX_DIGESTS', 'SESSION_COMPRESSION_DIGEST_MAX_CHARS', 'SESSION_COMPRESSION_INJECT_MAX_CHARS', 'SESSION_COMPRESSION_INFLIGHT', 'DISCORD_TOKEN', 'DISCORD_CHANNEL_ID', '_ensure_column', 'MAX_SEARCH_RESULTS_PER_ENGINE', 'USER_INTERRUPTS', 'ADVISOR_FINAL_NUM_PREDICT', 'tx_queue', 'health_check', 'conn', 'SEARXNG_URL', 'app', 'PLAYWRIGHT_WAIT_MS', 'AUDIT_SESSION_STATE', '_decode_b64_arg', '_resolve_known_merchant', 'PDF_RENDER_SCALE', 'MAX_RESEARCH_LINKS_PER_PAGE', '_advisor_status_snapshot', 'load_history_on_boot', 'MAX_RESEARCH_FETCHES_PER_SEARCH', 'SUPPORTED_PDF_CONTENT_TYPES', 'ADVISOR_TASK_REGISTRATION_LOCK', 'CHAT_HISTORY_TURNS', 'MAX_TOTAL_TOOL_CALLS', 'ADVISOR_STATUS_LOCK', '_RESEARCHED_MERCHANTS', 'MAX_SEARCH_ATTEMPTS_PER_ITEM', 'ADVISOR_TOOL_NUM_PREDICT', 'ADVISOR_STATUS', 'MAX_TOOL_ROUNDS', 'ADVISOR_NUM_PREDICT', 'SEARCH_CACHE_TTL_SECONDS', 'ADVISOR_MODEL', 'OLLAMA_URL', '_merchant_key', 'DELILAH_BUILD', 'PLAYWRIGHT_ENABLED', 'JINA_API_KEY', 'MAX_TOOL_CALLS_PER_ROUND', 'bot', 'PLAID_SYNC_STATE', 'SESSION_HISTORY', 'MODEL_KEEP_ALIVE', 'PLAYWRIGHT_CONCURRENCY', 'c', 'MAX_RESEARCH_LEDGER_ITEMS', '_research_set', 'SEARCH_HTTP_TIMEOUT', 'PDF_MAX_PAGES', 'ADVISOR_NUM_CTX', 'RESEARCH_PAGE_CACHE_TTL_SECONDS', 'MAX_RESEARCH_CRAWL_PAGES_PER_ITEM', 'MAX_SEARCH_UNIQUE_RESULTS', 'SEARCH_SCRAPE_TOP_N', 'intents', '_set_advisor_status', 'MAX_RESEARCH_QUEUE_SIZE', 'PLAYWRIGHT_TIMEOUT_MS', 'STATUS_MESSAGES', 'MAX_RESEARCH_CRAWL_DEPTH', '_audit_remaining_from_result', '_original_count', 'PLAYWRIGHT_HEADLESS', 'SEARCH_TIME_RANGE']
+__all__ = ['get_db', 'DB_PATH', 'SEARCH_CONCURRENCY', 'SEARCH_SCRAPE_MAX_CHARS', 'ACTIVE_ADVISOR_TASKS', 'MAX_SEARCH_ENGINES_PER_QUERY', 'STATUS_UPDATE_TASKS', 'SESSION_HISTORY_MAX_TURNS', 'SESSION_COMPRESSED', 'SESSION_COMPRESSION_ENABLED', 'SESSION_COMPRESSION_MIN_ENTRIES', 'SESSION_COMPRESSION_BLOCK_ENTRIES', 'SESSION_COMPRESSION_KEEP_ENTRIES', 'SESSION_COMPRESSION_MAX_DIGESTS', 'SESSION_COMPRESSION_DIGEST_MAX_CHARS', 'SESSION_COMPRESSION_INJECT_MAX_CHARS', 'SESSION_COMPRESSION_INFLIGHT', 'DISCORD_TOKEN', 'DISCORD_CHANNEL_ID', '_ensure_column', 'MAX_SEARCH_RESULTS_PER_ENGINE', 'USER_INTERRUPTS', 'ADVISOR_FINAL_NUM_PREDICT', 'tx_queue', 'health_check', 'conn', 'SEARXNG_URL', 'app', 'PLAYWRIGHT_WAIT_MS', 'AUDIT_SESSION_STATE', '_decode_b64_arg', '_resolve_known_merchant', 'PDF_RENDER_SCALE', 'MAX_RESEARCH_LINKS_PER_PAGE', '_advisor_status_snapshot', 'load_history_on_boot', 'MAX_RESEARCH_FETCHES_PER_SEARCH', 'SUPPORTED_PDF_CONTENT_TYPES', 'ADVISOR_TASK_REGISTRATION_LOCK', 'CHAT_HISTORY_TURNS', 'MAX_TOTAL_TOOL_CALLS', 'ARTIFACT_STALL_NUDGE_AFTER', 'ARTIFACT_STALL_BREAK_AFTER', 'TOOL_ROUTER_SHADOW', 'TOOL_ROUTER_SHADOW_SAMPLE', 'ADVISOR_STATUS_LOCK', '_RESEARCHED_MERCHANTS', 'MAX_SEARCH_ATTEMPTS_PER_ITEM', 'ADVISOR_TOOL_NUM_PREDICT', 'ADVISOR_STATUS', 'MAX_TOOL_ROUNDS', 'ADVISOR_NUM_PREDICT', 'SEARCH_CACHE_TTL_SECONDS', 'ADVISOR_MODEL', 'OLLAMA_URL', '_merchant_key', 'DELILAH_BUILD', 'PLAYWRIGHT_ENABLED', 'JINA_API_KEY', 'MAX_TOOL_CALLS_PER_ROUND', 'bot', 'PLAID_SYNC_STATE', 'SESSION_HISTORY', 'MODEL_KEEP_ALIVE', 'PLAYWRIGHT_CONCURRENCY', 'c', 'MAX_RESEARCH_LEDGER_ITEMS', '_research_set', 'SEARCH_HTTP_TIMEOUT', 'PDF_MAX_PAGES', 'ADVISOR_NUM_CTX', 'RESEARCH_PAGE_CACHE_TTL_SECONDS', 'MAX_RESEARCH_CRAWL_PAGES_PER_ITEM', 'MAX_SEARCH_UNIQUE_RESULTS', 'SEARCH_SCRAPE_TOP_N', 'intents', '_set_advisor_status', 'MAX_RESEARCH_QUEUE_SIZE', 'PLAYWRIGHT_TIMEOUT_MS', 'STATUS_MESSAGES', 'MAX_RESEARCH_CRAWL_DEPTH', '_audit_remaining_from_result', '_original_count', 'PLAYWRIGHT_HEADLESS', 'SEARCH_TIME_RANGE', 'PENDING_ADVISOR_MESSAGES', 'MAX_PENDING_ADVISOR_MESSAGES']
 
 import contextvars
 CURRENT_USER_ID = contextvars.ContextVar('current_user_id', default='1')

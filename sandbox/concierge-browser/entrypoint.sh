@@ -53,6 +53,8 @@ CHROMIUM_FLAGS=(
     --disable-notifications
     --no-sandbox
     --disable-dev-shm-usage
+    --disable-blink-features=AutomationControlled
+    --disable-infobars
     --remote-debugging-address=0.0.0.0
     --remote-debugging-port="${CDP_PORT:-9222}"
 )

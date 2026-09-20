@@ -26,6 +26,11 @@ networks:
   sandbox-egress:
     driver: bridge
     internal: true
+  # Public internet is opt-in for the isolated execution sandbox. Keep this
+  # separate from the shared egress network so sandbox code can reach public
+  # HTTPS endpoints without gaining peer access to OmniRoute/browser services.
+  sandbox-internet:
+    driver: bridge
   egress:
     driver: bridge
 
@@ -51,6 +56,9 @@ services:
     environment:
       - OLLAMA_URL=http://ollama:11434/api/chat
       - SEARXNG_URL=http://searxng:8080/search
+      - OMNIROUTE_SEARCH_ENABLED=${OMNIROUTE_SEARCH_ENABLED:-1}
+      - OMNIROUTE_SEARCH_URL=http://omniroute:20128/v1/search
+      - OMNIROUTE_SEARCH_PROVIDER=${OMNIROUTE_SEARCH_PROVIDER:-duckduckgo-free}
       - SANDBOX_URL=http://sandbox:8100/execute
       - SANDBOX_SHELL_URL=http://sandbox:8100/shell
       - SANDBOX_INSTALL_URL=http://sandbox-installer:8100/install
@@ -61,9 +69,9 @@ services:
       - BROWSERLESS_URL=http://browserless:3000
       - CONCIERGE_DEBUG_SCREENSHOTS=false
       - CONCIERGE_INTERNAL_SCREENSHOTS=false
-      - OPENROUTER_FREE_MODELS=nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3.5-lightning:free,qwen/qwen3.8-27b:free,poolside/laguna-s-2.1:free
+      - OPENROUTER_FREE_MODELS=poolside/laguna-s-2.1:free,qwen/qwen3.8-27b:free,nvidia/nemotron-3-super-120b-a12b:free
       - OPENROUTER_FREE_VISION_MODELS=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
-      - OPENROUTER_PAID_MODEL=nvidia/nemotron-3.5-lightning:free
+      - OPENROUTER_PAID_MODEL=openrouter/auto
       - ENABLE_CONCIERGE_BROWSER=1
       - CONCIERGE_VNC_PUBLIC_BASE=https://concierge.incoming.nyc
       - CONCIERGE_DOCKER_NETWORK=financebot_egress
@@ -200,7 +208,6 @@ services:
       - API_KEY_SECRET=${OMNIROUTE_API_KEY_SECRET}
       - STORAGE_ENCRYPTION_KEY=${OMNIROUTE_STORAGE_ENCRYPTION_KEY}
       - OMNIROUTE_MEMORY_MB=${OMNIROUTE_MEMORY_MB:-2048}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
       - JINA_API_KEY=${JINA_API_KEY:-}
@@ -266,17 +273,24 @@ services:
     restart: unless-stopped
     environment:
       - SANDBOX_DEFAULT_TIMEOUT=90
-      - SANDBOX_MAX_TIMEOUT=300
+      - SANDBOX_MAX_TIMEOUT=14400
       - SANDBOX_INTERNAL_TOKEN=${SANDBOX_INTERNAL_TOKEN}
       - SANDBOX_MEMORY_LIMIT_MB=1536
       - SANDBOX_PACKAGES_DIR=/opt/packages
       - SANDBOX_HOST_PROJECT_DIR=/host/project
       - SANDBOX_HOST_DB_PATH=/host/data/finances.db
+      # Bulk scripts cannot invoke Delilah-native tools; they use these
+      # internal HTTP search services directly from the internet-enabled
+      # sandbox network.
+      - OMNIROUTE_SEARCH_URL=http://omniroute:20128/v1/search
+      - OMNIROUTE_SEARCH_PROVIDER=${OMNIROUTE_SEARCH_PROVIDER:-duckduckgo-free}
+      - SEARXNG_URL=http://searxng:8080/search
     volumes:
       - sandbox-packages:/opt/packages:ro
       - sandbox-workspace:/workspace
     networks:
       - financebot-internal
+      - sandbox-internet
     mem_limit: 3072m
     cpus: 8.0
     pids_limit: 1024

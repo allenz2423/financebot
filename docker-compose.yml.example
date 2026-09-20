@@ -144,7 +144,7 @@ services:
 
     environment:
       - SANDBOX_DEFAULT_TIMEOUT=90
-      - SANDBOX_MAX_TIMEOUT=300
+      - SANDBOX_MAX_TIMEOUT=14400
       - SANDBOX_MEMORY_LIMIT_MB=1536
       - SANDBOX_PACKAGES_DIR=/opt/packages
       - SANDBOX_HOST_PROJECT_DIR=/host/project
@@ -312,7 +312,6 @@ services:
       - API_KEY_SECRET=${OMNIROUTE_API_KEY_SECRET}
       - STORAGE_ENCRYPTION_KEY=${OMNIROUTE_STORAGE_ENCRYPTION_KEY}
       - OMNIROUTE_MEMORY_MB=${OMNIROUTE_MEMORY_MB:-2048}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
       - JINA_API_KEY=${JINA_API_KEY:-}
@@ -356,4 +355,3 @@ services:
       - egress
     depends_on:
       - browserless
-

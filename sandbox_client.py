@@ -53,6 +53,11 @@ SANDBOX_WORKSPACE_LIST_URL = os.getenv(
     "http://sandbox:8100/workspace/list",
 )
 
+SANDBOX_WORKSPACE_WRITE_URL = os.getenv(
+    "SANDBOX_WORKSPACE_WRITE_URL",
+    "http://sandbox:8100/workspace/write",
+)
+
 SANDBOX_DEFAULT_TIMEOUT = int(
     os.getenv("SANDBOX_DEFAULT_TIMEOUT", "60")
 )
@@ -601,6 +606,32 @@ async def list_workspace_files(
 
     except Exception:
         return []
+
+
+async def save_workspace_file(
+    user_id: str,
+    filename: str,
+    content: bytes,
+) -> str | None:
+    """Save an uploaded attachment into the current user's workspace."""
+    if not content or len(content) > 100 * 1024 * 1024:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                SANDBOX_WORKSPACE_WRITE_URL,
+                headers=_sandbox_headers(),
+                json={
+                    "user_id": str(user_id),
+                    "filename": str(filename or "attachment.bin"),
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                },
+            )
+            resp.raise_for_status()
+            return str(resp.json().get("path") or "") or None
+    except Exception as exc:
+        print(f" [WORKSPACE UPLOAD] failed: {type(exc).__name__}: {exc}")
+        return None
 
 
 async def read_workspace_file(

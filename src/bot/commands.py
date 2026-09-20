@@ -5277,6 +5277,93 @@ async def _send_thinking_placeholder(message: discord.Message, handle: _AdvisorR
         print(f" [MESSAGE] Thinking placeholder failed: {type(exc).__name__}: {exc}")
 
 
+async def _run_queued_advisor_item(uid: str, item: dict) -> None:
+    """Drain one queued message after the user's active turn completes."""
+    handle = item["handle"]
+    task = asyncio.create_task(
+        chat_with_delilah(
+            item["prompt"],
+            item["author_id"],
+            handle,
+            image_b64_list=item.get("images") or [],
+        ),
+        name=f"advisor:queued:{item['author_id']}:{item['message_id']}",
+    )
+    ACTIVE_ADVISOR_TASKS[uid] = task
+    await _set_advisor_status(
+        uid,
+        phase="starting",
+        started_at=time.monotonic(),
+        cancelled=False,
+        cancel_requested=False,
+        attempts=0,
+        tool_calls=0,
+        output_chars=0,
+        last_tool=None,
+        pending_tools=[],
+        queued=False,
+    )
+    placeholder = asyncio.create_task(
+        _send_thinking_placeholder(item["message"], handle),
+        name=f"thinking:queued:{item['author_id']}:{item['message_id']}",
+    )
+    try:
+        await task
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f" [QUEUE] advisor task crashed uid={uid}: {type(exc).__name__}: {exc}", flush=True)
+    finally:
+        if not placeholder.done():
+            placeholder.cancel()
+        try:
+            await placeholder
+        except BaseException:
+            pass
+        if ACTIVE_ADVISOR_TASKS.get(uid) is task:
+            ACTIVE_ADVISOR_TASKS.pop(uid, None)
+        pending = PENDING_ADVISOR_MESSAGES.get(uid) or []
+        if pending:
+            next_item = pending.pop(0)
+            if not pending:
+                PENDING_ADVISOR_MESSAGES.pop(uid, None)
+            asyncio.create_task(_run_queued_advisor_item(uid, next_item), name=f"advisor:queue-drain:{uid}")
+
+
+def _queue_advisor_item(uid: str, item: dict) -> int | None:
+    queue = PENDING_ADVISOR_MESSAGES.setdefault(uid, [])
+    if len(queue) >= MAX_PENDING_ADVISOR_MESSAGES:
+        return None
+    queue.append(item)
+    return len(queue)
+
+
+@bot.command(name="btw")
+async def btw_command(ctx: commands.Context, *, message: str = ""):
+    """Queue a side note/question without cancelling the active advisor turn."""
+    uid = str(ctx.author.id)
+    if not message.strip():
+        await ctx.send("Usage: `!btw your side question or note`")
+        return
+    if not (ACTIVE_ADVISOR_TASKS.get(uid) and not ACTIVE_ADVISOR_TASKS[uid].done()):
+        await ctx.send("No active turn—send it normally and I’ll answer it.")
+        return
+    item = {
+        "prompt": "[SIDE NOTE FROM USER — answer this after the current task]\n" + message.strip(),
+        "images": [],
+        "author_id": ctx.author.id,
+        "message_id": getattr(ctx.message, "id", "btw"),
+        "channel": ctx.channel,
+        "message": ctx.message,
+        "handle": _AdvisorReplyHandle(ctx.channel, source_message_id=getattr(ctx.message, "id", None)),
+    }
+    position = _queue_advisor_item(uid, item)
+    if position is None:
+        await ctx.send(f"The side-message queue is full ({MAX_PENDING_ADVISOR_MESSAGES}). Use `!cancel` or wait for the current task.")
+    else:
+        await ctx.send(f"Queued your side note as #{position}; I’ll answer it after the current task.")
+
+
 @bot.event
 async def on_message(message: discord.Message):
     effective_id = os.getenv("SPOOF_USER_ID") or str(message.author.id)
@@ -5381,20 +5468,75 @@ async def on_message(message: discord.Message):
         return
 
     prompt = message.content.strip()
+    # Preserve pasted/raw message content as a workspace artifact. This keeps
+    # large pasted tables or documents available for later sandbox processing
+    # without relying on the model context to retain the entire payload.
+    if prompt:
+        try:
+            import sandbox_client
+            raw_path = await sandbox_client.save_workspace_file(
+                str(user_id), "message.txt", prompt.encode("utf-8")
+            )
+            if raw_path:
+                prompt = (
+                    f"[RAW MESSAGE SAVED TO WORKSPACE: {raw_path}]\n"
+                    f"Original user request: {prompt[:2000]}\n"
+                    "Work from this saved artifact when the user asks you to inspect, filter, "
+                    "transform, or summarize the pasted content."
+                )
+        except Exception as exc:
+            print(f" [MESSAGE] raw message preservation failed: {type(exc).__name__}: {exc}")
     if pdf_texts:
         prompt = (prompt + "\n" if prompt else "") + "\n".join(pdf_texts)
+
+    # Preserve originals in the user's persistent workspace. Large text files
+    # (especially CSV/XLSX exports) are represented by metadata below instead
+    # of being dumped into the advisor prompt.
+    saved_attachment_notes = []
+    try:
+        import sandbox_client
+        for att in message.attachments:
+            if int(getattr(att, "size", 0) or 0) > 100 * 1024 * 1024:
+                saved_attachment_notes.append(
+                    f"Attachment {att.filename!r} was not saved: exceeds the 100 MB workspace limit."
+                )
+                continue
+            raw_attachment = await att.read(use_cached=False)
+            saved_path = await sandbox_client.save_workspace_file(
+                str(user_id), att.filename, raw_attachment
+            )
+            if saved_path:
+                saved_attachment_notes.append(
+                    f"Attachment saved to workspace: {saved_path}"
+                )
+            else:
+                saved_attachment_notes.append(
+                    f"Attachment {att.filename!r} could not be saved to workspace."
+                )
+    except Exception as exc:
+        print(f" [MESSAGE] workspace attachment preservation failed: {type(exc).__name__}: {exc}")
+
+    if saved_attachment_notes:
+        prompt = (prompt + "\n\n" if prompt else "") + "[UPLOADED FILES]\n" + "\n".join(saved_attachment_notes)
 
     text_attachments = []
     text_extensions = (
         '.txt', '.py', '.csv', '.json', '.md', '.log', '.yml', 
         '.yaml', '.xml', '.ini', '.sh', '.js', '.html', '.css'
     )
+    spreadsheet_extensions = ('.csv', '.tsv', '.xlsx', '.xls', '.ods')
     for att in message.attachments:
         mime = att.content_type or ""
         fname = att.filename.lower()
         if att.size > 2_000_000:
             continue
-        if mime.startswith('text/') or mime.startswith('application/json') or fname.endswith(text_extensions):
+        # Keep small text snippets convenient, but never inline a large upload;
+        # the original is already available at the workspace path above.
+        if (
+            att.size <= 200_000
+            and not fname.endswith(spreadsheet_extensions)
+            and (mime.startswith('text/') or mime.startswith('application/json') or fname.endswith(text_extensions))
+        ):
             try:
                 file_bytes = await att.read()
                 file_text = file_bytes.decode('utf-8')
@@ -5467,12 +5609,20 @@ async def on_message(message: discord.Message):
             if existing is not None and not existing.done():
                 print(f" [MESSAGE] existing advisor task uid={uid}")
                 try:
-                    await asyncio.wait_for(
-                        message.channel.send(
-                            " **I'm already working on your previous request.** "
-                            "Use `!status` to check progress or `!cancel` to stop it."
-                        ),
-                        timeout=8.0,
+                    position = _queue_advisor_item(uid, {
+                        "prompt": prompt,
+                        "images": images,
+                        "author_id": message.author.id,
+                        "message_id": message_id,
+                        "channel": message.channel,
+                        "message": message,
+                        "handle": handle,
+                    })
+                    if position is None:
+                        response = f" **I'm already working on your previous request, and the queue is full ({MAX_PENDING_ADVISOR_MESSAGES}).** Use `!status` or `!cancel`."
+                    else:
+                        response = f" **Queued this request as #{position}.** I’ll start it after the current task finishes. Use `!status` to check progress."
+                    await asyncio.wait_for(message.channel.send(response), timeout=8.0
                     )
                 except Exception as exc:
                     print(f" [MESSAGE] busy response failed: {type(exc).__name__}: {exc}")
@@ -5538,6 +5688,14 @@ async def on_message(message: discord.Message):
                 pass
             except Exception:
                 pass
+        # Start exactly one queued request after this turn.  The active task
+        # itself is removed by chat_with_delilah's finally block.
+        pending = PENDING_ADVISOR_MESSAGES.get(uid) or []
+        if pending and not (ACTIVE_ADVISOR_TASKS.get(uid) and not ACTIVE_ADVISOR_TASKS[uid].done()):
+            next_item = pending.pop(0)
+            if not pending:
+                PENDING_ADVISOR_MESSAGES.pop(uid, None)
+            asyncio.create_task(_run_queued_advisor_item(uid, next_item), name=f"advisor:queue-drain:{uid}")
 
 import uvicorn
 

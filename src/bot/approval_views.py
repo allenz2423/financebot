@@ -192,45 +192,130 @@ def browser_auth_challenge(text: str, url: str = "") -> bool:
 
 _STEALTH_INIT_SCRIPT = """
 (() => {
-    // 1. Mask navigator.webdriver
+    // 1. Mask navigator.webdriver cleanly without leaking an own-property
     try {
-        Object.defineProperty(navigator, 'webdriver', {
+        const navProto = Object.getPrototypeOf(navigator);
+        delete navProto.webdriver;
+        delete navigator.webdriver;
+        Object.defineProperty(navProto, 'webdriver', {
             get: () => undefined,
             configurable: true,
+            enumerable: true,
         });
-        delete Object.getPrototypeOf(navigator).webdriver;
     } catch (e) {}
 
     // 2. Standardize userAgent and appVersion by removing HeadlessChrome
     try {
-        const ua = navigator.userAgent.replace(/HeadlessChrome/gi, 'Chrome');
-        Object.defineProperty(navigator, 'userAgent', {
-            get: () => ua,
-            configurable: true,
-        });
-        const appVer = navigator.appVersion.replace(/HeadlessChrome/gi, 'Chrome');
-        Object.defineProperty(navigator, 'appVersion', {
-            get: () => appVer,
-            configurable: true,
-        });
+        const currentUA = navigator.userAgent;
+        if (currentUA.includes('HeadlessChrome')) {
+            const cleanUA = currentUA.replace(/HeadlessChrome/gi, 'Chrome');
+            Object.defineProperty(navigator, 'userAgent', {
+                get: () => cleanUA,
+                configurable: true,
+            });
+        }
+        const currentAppVer = navigator.appVersion;
+        if (currentAppVer.includes('HeadlessChrome')) {
+            const cleanAppVer = currentAppVer.replace(/HeadlessChrome/gi, 'Chrome');
+            Object.defineProperty(navigator, 'appVersion', {
+                get: () => cleanAppVer,
+                configurable: true,
+            });
+        }
     } catch (e) {}
 
-    // 3. Ensure window.chrome exists
+    // 3. Ensure realistic window.chrome with app, runtime, csi, loadTimes
     try {
         if (!window.chrome) {
             window.chrome = {};
         }
+        if (!window.chrome.app) {
+            window.chrome.app = {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+                getDetails: function() {},
+                getIsInstalled: function() {},
+                runningState: function() {},
+            };
+        }
         if (!window.chrome.runtime) {
-            window.chrome.runtime = {};
+            window.chrome.runtime = {
+                OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+                connect: function() { return { disconnect: function() {}, onDisconnect: { addListener: function() {} }, onMessage: { addListener: function() {} }, postMessage: function() {} }; },
+                sendMessage: function() {},
+                id: undefined,
+            };
+        }
+        if (!window.chrome.csi) {
+            window.chrome.csi = function() { return { startE: Date.now(), onloadT: Date.now() + 100, pageT: 100, tran: 15 }; };
+        }
+        if (!window.chrome.loadTimes) {
+            window.chrome.loadTimes = function() {
+                return {
+                    requestTime: Date.now() / 1000,
+                    startLoadTime: Date.now() / 1000,
+                    commitLoadTime: Date.now() / 1000 + 0.1,
+                    finishDocumentLoadTime: Date.now() / 1000 + 0.2,
+                    finishLoadTime: Date.now() / 1000 + 0.3,
+                    firstPaintTime: Date.now() / 1000 + 0.15,
+                    firstPaintAfterLoadTime: 0,
+                    navigationType: 'Other',
+                    wasFetchedViaSpdy: true,
+                    wasNpnNegotiated: true,
+                    npnNegotiatedProtocol: 'h2',
+                    wasAlternateProtocolAvailable: false,
+                    connectionInfo: 'h2',
+                };
+            };
         }
     } catch (e) {}
 
-    // 4. Standardize navigator.plugins
+    // 4. Standardize navigator.plugins with realistic PluginArray
     try {
         if (!navigator.plugins || navigator.plugins.length === 0) {
+            const pluginDefs = [
+                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mimeTypes: [{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }] },
+                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mimeTypes: [{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }] },
+                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mimeTypes: [{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }] },
+                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mimeTypes: [{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }] },
+                { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mimeTypes: [{ type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format' }] },
+            ];
+            const plugins = Object.create(PluginArray.prototype);
+            pluginDefs.forEach((p, idx) => {
+                const plugin = Object.create(Plugin.prototype);
+                Object.defineProperties(plugin, {
+                    name: { value: p.name, enumerable: true },
+                    filename: { value: p.filename, enumerable: true },
+                    description: { value: p.description, enumerable: true },
+                    length: { value: p.mimeTypes.length, enumerable: true },
+                });
+                p.mimeTypes.forEach((m, mIdx) => {
+                    const mime = Object.create(MimeType.prototype);
+                    Object.defineProperties(mime, {
+                        type: { value: m.type, enumerable: true },
+                        suffixes: { value: m.suffixes, enumerable: true },
+                        description: { value: m.description, enumerable: true },
+                        enabledPlugin: { value: plugin, enumerable: false },
+                    });
+                    plugin[mIdx] = mime;
+                });
+                plugins[idx] = plugin;
+                plugins[p.name] = plugin;
+            });
+            Object.defineProperty(plugins, 'length', { value: pluginDefs.length, enumerable: true });
+            plugins.item = function(index) { return this[index] || null; };
+            plugins.namedItem = function(name) { return this[name] || null; };
+            plugins.refresh = function() {};
             Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5],
+                get: () => plugins,
                 configurable: true,
+                enumerable: true,
             });
         }
     } catch (e) {}
@@ -240,7 +325,59 @@ _STEALTH_INIT_SCRIPT = """
         Object.defineProperty(navigator, 'languages', {
             get: () => ['en-US', 'en'],
             configurable: true,
+            enumerable: true,
         });
+    } catch (e) {}
+
+    // 6. Fix permissions query (Notification status alignment)
+    try {
+        if (navigator.permissions && navigator.permissions.query) {
+            const origQuery = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = (parameters) => {
+                if (parameters && parameters.name === 'notifications') {
+                    return Promise.resolve({
+                        state: Notification.permission === 'granted' ? 'granted' : (Notification.permission === 'denied' ? 'denied' : 'prompt'),
+                        onchange: null,
+                    });
+                }
+                return origQuery(parameters);
+            };
+        }
+    } catch (e) {}
+
+    // 7. WebGL vendor/renderer spoofing (unmask SwiftShader/software rendering)
+    try {
+        const getParam = (orig) => function(parameter) {
+            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return orig.apply(this, [parameter]);
+        };
+        if (typeof WebGLRenderingContext !== 'undefined') {
+            WebGLRenderingContext.prototype.getParameter = getParam(WebGLRenderingContext.prototype.getParameter);
+        }
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+            WebGL2RenderingContext.prototype.getParameter = getParam(WebGL2RenderingContext.prototype.getParameter);
+        }
+    } catch (e) {}
+
+    // 8. Screen and window dimensions (avoid 0x0 outer dimensions in headless)
+    try {
+        if (window.outerWidth === 0) {
+            Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
+        }
+        if (window.outerHeight === 0) {
+            Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 });
+        }
+        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+        Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+        Object.defineProperty(screen, 'width', { get: () => 1920 });
+        Object.defineProperty(screen, 'height', { get: () => 1080 });
+    } catch (e) {}
+
+    // 9. Device memory & hardware concurrency
+    try {
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
     } catch (e) {}
 })();
 """
@@ -374,10 +511,11 @@ class BrowserlessActuator(Actuator):
         # driver WS), so we attach via ``connect_over_cdp`` and reuse its
         # default context — no ``new_context`` over CDP.
         self._playwright = await async_playwright().start()
+        ws_target = self._cdp_url or _ws_url()
+        if "?stealth=" not in ws_target and "&stealth=" not in ws_target:
+            ws_target += ("&stealth=true" if "?" in ws_target else "?stealth=true")
         try:
-            browser = await self._playwright.chromium.connect_over_cdp(
-                self._cdp_url or _ws_url()
-            )
+            browser = await self._playwright.chromium.connect_over_cdp(ws_target)
         except Exception:
             # A completed VNC session can outlive its Docker container (host
             # reboot, manual cleanup, or an expired test session). Never roll
@@ -387,7 +525,10 @@ class BrowserlessActuator(Actuator):
                 raise
             self._cdp_url = None
             self._shared_browser = False
-            browser = await self._playwright.chromium.connect_over_cdp(_ws_url())
+            fallback_ws = _ws_url()
+            if "?stealth=" not in fallback_ws and "&stealth=" not in fallback_ws:
+                fallback_ws += ("&stealth=true" if "?" in fallback_ws else "?stealth=true")
+            browser = await self._playwright.chromium.connect_over_cdp(fallback_ws)
         self._browser = browser
         self._context = browser.contexts[0]
         # Navigate only when requested; restore_storage_state needs cookies and
@@ -473,9 +614,43 @@ class BrowserlessActuator(Actuator):
         self._target_frame = None
         await self._page.set_viewport_size({"width": 1400, "height": 900})
 
-        # Inject anti-bot stealth scripts into page and context
+        # Inject anti-bot stealth scripts into context and page
+        try:
+            await self._context.add_init_script(_STEALTH_INIT_SCRIPT)
+        except Exception:
+            pass
         try:
             await self._page.add_init_script(_STEALTH_INIT_SCRIPT)
+        except Exception:
+            pass
+
+        # Apply realistic User-Agent and Client Hints via CDP session to override wire headers
+        try:
+            cdp = await self._context.new_cdp_session(self._page)
+            real_ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+            )
+            await cdp.send("Network.setUserAgentOverride", {
+                "userAgent": real_ua,
+                "acceptLanguage": "en-US,en;q=0.9",
+                "platform": "Win32",
+                "userAgentMetadata": {
+                    "brands": [
+                        {"brand": "Chromium", "version": "133"},
+                        {"brand": "Google Chrome", "version": "133"},
+                        {"brand": "Not?A_Brand", "version": "99"},
+                    ],
+                    "fullVersion": "133.0.6943.126",
+                    "platform": "Windows",
+                    "platformVersion": "10.0.0",
+                    "architecture": "x86",
+                    "model": "",
+                    "mobile": False,
+                    "bitness": "64",
+                    "wow64": False,
+                },
+            })
         except Exception:
             pass
 

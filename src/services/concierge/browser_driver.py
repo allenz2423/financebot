@@ -50,6 +50,50 @@ def _ws_url() -> str:
     return ws.rstrip("/") + path
 
 
+async def _apply_stealth(context, page) -> None:
+    try:
+        from src.bot.approval_views import _STEALTH_INIT_SCRIPT
+        await context.add_init_script(_STEALTH_INIT_SCRIPT)
+        await page.add_init_script(_STEALTH_INIT_SCRIPT)
+    except Exception:
+        pass
+    try:
+        cdp = await context.new_cdp_session(page)
+        real_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        )
+        await cdp.send("Network.setUserAgentOverride", {
+            "userAgent": real_ua,
+            "acceptLanguage": "en-US,en;q=0.9",
+            "platform": "Win32",
+            "userAgentMetadata": {
+                "brands": [
+                    {"brand": "Chromium", "version": "133"},
+                    {"brand": "Google Chrome", "version": "133"},
+                    {"brand": "Not?A_Brand", "version": "99"},
+                ],
+                "fullVersion": "133.0.6943.126",
+                "platform": "Windows",
+                "platformVersion": "10.0.0",
+                "architecture": "x86",
+                "model": "",
+                "mobile": False,
+                "bitness": "64",
+                "wow64": False,
+            },
+        })
+    except Exception:
+        pass
+
+
+def _stealth_ws_url() -> str:
+    ws = _ws_url()
+    if "?stealth=" not in ws and "&stealth=" not in ws:
+        ws += ("&stealth=true" if "?" in ws else "?stealth=true")
+    return ws
+
+
 async def act_on_page(
     url: str,
     steps: List[Dict[str, Any]],
@@ -71,10 +115,11 @@ async def act_on_page(
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(_ws_url())
+        browser = await p.chromium.connect_over_cdp(_stealth_ws_url())
         context = browser.contexts[0]
         page = await context.new_page()
         await page.set_viewport_size({"width": 1400, "height": 900})
+        await _apply_stealth(context, page)
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
         pre_text = await _text(page)
@@ -119,10 +164,11 @@ async def screenshot_page(url: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> byt
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(_ws_url())
+        browser = await p.chromium.connect_over_cdp(_stealth_ws_url())
         context = browser.contexts[0]
         page = await context.new_page()
         await page.set_viewport_size({"width": 1400, "height": 900})
+        await _apply_stealth(context, page)
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         shot = await page.screenshot(full_page=True)
         await context.close()

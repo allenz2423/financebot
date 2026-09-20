@@ -446,6 +446,29 @@ def test_e2e_anti_bot_stealth():
         assert len(languages) >= 1
         assert "en-US" in languages or "en" in languages
 
+        # 7. navigator.webdriver must not leak as an own-property
+        has_own_wd = act._loop.run_until_complete(
+            page.evaluate("() => navigator.hasOwnProperty('webdriver')")
+        )
+        assert has_own_wd is False
+
+        # 8. window dimensions must not be 0x0
+        outer_w = act._loop.run_until_complete(page.evaluate("() => window.outerWidth"))
+        outer_h = act._loop.run_until_complete(page.evaluate("() => window.outerHeight"))
+        assert outer_w > 0
+        assert outer_h > 0
+
+        # 9. WebGL renderer must mask SwiftShader / software emulator
+        webgl_renderer = act._loop.run_until_complete(
+            page.evaluate("""() => {
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl');
+                const debugInfo = gl ? gl.getExtension('WEBGL_debug_renderer_info') : null;
+                return debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : '';
+            }""")
+        )
+        assert "SwiftShader" not in webgl_renderer
+
     finally:
         act.close()
 

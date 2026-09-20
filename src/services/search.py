@@ -68,6 +68,155 @@ _scrape_semaphore = asyncio.Semaphore(SEARCH_CONCURRENCY)
 WEB_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
 WEB_PAGE_CACHE: dict[str, tuple[float, str, bool]] = {}
 
+_GOOGLE_DOC_ID_RE = re.compile(r"/document/d/([A-Za-z0-9_-]+)")
+_GOOGLE_SHEET_ID_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
+
+
+def _text_artifact_filename(requested: str, default_name: str) -> str:
+    """Return a truthful filename for a text export.
+
+    ``fetch_webpage(save_only=True)`` stores the response bytes, not an Excel
+    workbook.  In particular, the all-tabs Google Sheets export is a text
+    container with tab markers and CSV sections.  Never let a caller's
+    ``.xlsx`` name make those bytes look like a workbook (or collide with a
+    workbook generated later in the same turn).
+    """
+    name = Path(str(requested or default_name)).name
+    suffix = Path(name).suffix.lower()
+    if suffix in {".xlsx", ".xls", ".xlsm", ".ods"}:
+        name = f"{Path(name).stem}_raw.txt"
+    if not Path(name).suffix:
+        name = f"{name}.txt"
+    return name
+
+
+def _omniroute_search_config() -> tuple[bool, str, str]:
+    """Return the optional OmniRoute native-search configuration.
+
+    OmniRoute is on the same Docker network as Delilah.  The native search
+    endpoint is intentionally treated as an optimization/provider, not as a
+    replacement for the existing SearXNG implementation: if it is absent,
+    unauthorized, rate-limited, or malformed, callers transparently fall back
+    to the established SearXNG path.
+    """
+    enabled = os.getenv("OMNIROUTE_SEARCH_ENABLED", "1").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    url = os.getenv(
+        "OMNIROUTE_SEARCH_URL",
+        "http://omniroute:20128/v1/search",
+    ).strip()
+    provider = os.getenv("OMNIROUTE_SEARCH_PROVIDER", "duckduckgo-free").strip()
+    return enabled and bool(url) and bool(provider), url, provider
+
+
+def _google_public_export_url(url: str) -> tuple[str, str] | None:
+    """Return a public machine-readable export for supported Google URLs."""
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host != "docs.google.com":
+        return None
+    doc = _GOOGLE_DOC_ID_RE.search(parsed.path)
+    if doc:
+        return (
+            f"https://docs.google.com/document/d/{doc.group(1)}/export?format=txt",
+            "Google Docs text export",
+        )
+    sheet = _GOOGLE_SHEET_ID_RE.search(parsed.path)
+    if sheet:
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        gid = query.get("gid")
+        if not gid:
+            gid = dict(parse_qsl((parsed.fragment or "").lstrip("#"), keep_blank_values=True)).get("gid")
+        export = f"https://docs.google.com/spreadsheets/d/{sheet.group(1)}/export?format=csv"
+        if gid and str(gid).isdigit():
+            export += f"&gid={gid}"
+        return export, "Google Sheets CSV export"
+    return None
+
+
+async def _fetch_google_sheet_all_tabs(
+    url: str,
+    max_chars: int,
+    user_id: str | None = None,
+    save_only: bool = False,
+    workspace_filename: str = "",
+) -> str | None:
+    """Fetch every visible public tab from a Google Sheet via GViz."""
+    parsed = urlparse(url)
+    match = _GOOGLE_SHEET_ID_RE.search(parsed.path)
+    if not match:
+        return None
+    spreadsheet_id = match.group(1)
+    try:
+        async with httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True, headers=_random_browser_headers()
+        ) as client:
+            page = await client.get(url)
+            if page.status_code != 200 or "<html" not in page.text[:1000].lower():
+                return None
+            raw_names = re.findall(
+                r'class="[^"]*docs-sheet-tab-caption[^"]*">(.*?)</div>',
+                page.text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            names = []
+            for raw_name in raw_names:
+                name = re.sub(r"<[^>]+>", "", unescape(raw_name)).strip()
+                if name and name not in names:
+                    names.append(name)
+            if not names:
+                return None
+            names = names[:100]
+            async def fetch_tab(name: str) -> tuple[str, str]:
+                endpoint = (
+                    f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq"
+                    f"?tqx=out:csv&{urlencode({'sheet': name})}"
+                )
+                response = await client.get(endpoint)
+                if response.status_code != 200:
+                    return name, f"[tab fetch failed: HTTP {response.status_code}]"
+                body = response.content.decode("utf-8-sig", errors="replace")
+                return name, body
+            tabs = await asyncio.gather(*(fetch_tab(name) for name in names))
+    except Exception as exc:
+        print(f" [Google Sheets tabs] fetch failed for {url}: {type(exc).__name__}: {exc}")
+        return None
+    combined = [
+        "[google export: Google Sheets all-tab CSV]",
+        f"[source: {url}]",
+        f"[tabs discovered: {len(tabs)}]",
+    ]
+    for name, body in tabs:
+        combined.append(f"\n===== TAB: {name} =====\n{body}")
+    text = "\n".join(combined)
+    saved_path = None
+    if user_id:
+        try:
+            spreadsheet_file = _text_artifact_filename(
+                workspace_filename,
+                f"google_sheet_{spreadsheet_id}_all_tabs.txt",
+            )
+            saved_path = await sandbox_client.save_workspace_file(
+                str(user_id), spreadsheet_file, text.encode("utf-8")
+            )
+        except Exception as exc:
+            print(f" [Google Sheets tabs] workspace save failed: {type(exc).__name__}: {exc}")
+    truncated = len(text) > max_chars
+    status = "INCOMPLETE_TRUNCATED" if truncated else "COMPLETE"
+    if save_only and saved_path:
+        return (
+            f"[export status: {status}]\n"
+            f"[full export saved to workspace: {saved_path}]\n"
+            f"[tabs discovered: {len(tabs)}; bytes: {len(text.encode('utf-8'))}]"
+        )
+    return (
+        f"[export status: {status}]\n"
+        + (f"[full export saved to workspace: {saved_path}]\n" if saved_path else "")
+        + text[:max_chars]
+        + ("\n[Output truncated; increase max_chars or process the saved artifact.]" if truncated else "")
+    )
+
 _USER_AGENT_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -711,6 +860,68 @@ async def _searxng_engine_query(
         })
     return out
 
+
+async def _omniroute_search_query(
+    client: httpx.AsyncClient,
+    query: str,
+    provider: str,
+    time_range: str | None,
+) -> list[dict]:
+    """Query OmniRoute's native search API and normalize its result envelope."""
+    enabled, endpoint, _configured_provider = _omniroute_search_config()
+    if not enabled:
+        return []
+
+    payload = {
+        "query": query,
+        "provider": provider,
+        "max_results": MAX_SEARCH_RESULTS_PER_ENGINE,
+        "search_type": "web",
+        "language": "en",
+    }
+    if time_range:
+        payload["time_range"] = time_range
+
+    try:
+        response = await client.post(
+            endpoint,
+            json=payload,
+            headers={"Accept": "application/json"},
+            timeout=min(SEARCH_HTTP_TIMEOUT, 20.0),
+        )
+        if response.status_code != 200:
+            print(
+                f" [OmniRoute search] HTTP {response.status_code} for {query!r}; "
+                "falling back to SearXNG"
+            )
+            return []
+        data = response.json()
+    except Exception as exc:
+        print(
+            f" [OmniRoute search] failed for {query!r}: "
+            f"{type(exc).__name__}: {exc}; falling back to SearXNG"
+        )
+        return []
+
+    out = []
+    for rank, raw in enumerate(data.get("results") or []):
+        if rank >= MAX_SEARCH_RESULTS_PER_ENGINE or not isinstance(raw, dict):
+            break
+        url = str(raw.get("url") or "").strip()
+        if not url:
+            continue
+        out.append({
+            "title": str(raw.get("title") or "").strip(),
+            "url": url,
+            "snippet": re.sub(r"\s+", " ", str(raw.get("snippet") or "")).strip(),
+            "engine_score": float(raw.get("score") or 0.0),
+            "engine": f"omniroute:{provider}",
+            "engine_rank": rank + 1,
+            "source_query": query,
+            "publishedDate": raw.get("published_at"),
+        })
+    return out
+
 # ────────────────────────────────────────────────────────────
 # Reciprocal Rank Fusion (RRF) — merges rankings from multiple engines
 # ────────────────────────────────────────────────────────────
@@ -1102,33 +1313,52 @@ async def search_searxng(
 
     candidates: list[dict] = []
 
+    # Prefer OmniRoute's native search abstraction when enabled.  It can use
+    # free providers such as DuckDuckGo and gives us one stable gateway for
+    # future provider failover.  A failed/empty response deliberately falls
+    # through to the existing multi-engine SearXNG implementation below.
+    omni_enabled, _omni_url, omni_provider = _omniroute_search_config()
+    if omni_enabled:
+        async with _search_semaphore:
+            async with httpx.AsyncClient(timeout=min(SEARCH_HTTP_TIMEOUT, 20.0)) as client:
+                omni_candidates = await _omniroute_search_query(
+                    client, clean_q or q, omni_provider, effective_time_range
+                )
+        if omni_candidates:
+            candidates.extend(omni_candidates)
+            print(
+                f" [OmniRoute SEARCH] {q!r} → "
+                f"{len(omni_candidates)} results via {omni_provider}"
+            )
+
     # Try clean unquoted query first, but if clean_q != q and returns 0 candidates, fallback
     search_queries = [clean_q] if clean_q else [q]
     if clean_q and clean_q != q:
         search_queries.append(q)
 
-    for query_variant in search_queries:
-        async with _search_semaphore:
-            async with httpx.AsyncClient(timeout=SEARCH_HTTP_TIMEOUT) as client:
-                responses = await asyncio.gather(
-                    *[
-                        _searxng_engine_query(
-                            client,
-                            query_variant,
-                            engine,
-                            effective_time_range,
-                        )
-                        for engine in engines
-                    ],
-                    return_exceptions=True,
-                )
+    if not candidates:
+        for query_variant in search_queries:
+            async with _search_semaphore:
+                async with httpx.AsyncClient(timeout=SEARCH_HTTP_TIMEOUT) as client:
+                    responses = await asyncio.gather(
+                        *[
+                            _searxng_engine_query(
+                                client,
+                                query_variant,
+                                engine,
+                                effective_time_range,
+                            )
+                            for engine in engines
+                        ],
+                        return_exceptions=True,
+                    )
 
-        for response in responses:
-            if isinstance(response, list):
-                candidates.extend(response)
+            for response in responses:
+                if isinstance(response, list):
+                    candidates.extend(response)
 
-        if candidates:
-            break
+            if candidates:
+                break
 
     excluded = {
         _canonical_url(str(u))
@@ -1361,7 +1591,7 @@ async def _get_playwright_browser():
         browserless_url = os.getenv("BROWSERLESS_URL")
         if browserless_url:
             try:
-                ws_url = browserless_url.rstrip("/").replace("http://", "ws://").replace("https://", "wss://") + "/chrome"
+                ws_url = browserless_url.rstrip("/").replace("http://", "ws://").replace("https://", "wss://") + "/chromium?stealth=true"
                 _PLAYWRIGHT_INSTANCE = await async_playwright().start()
                 _PLAYWRIGHT_BROWSER = await _PLAYWRIGHT_INSTANCE.chromium.connect_over_cdp(ws_url)
                 print(f" [Playwright] Connected to Browserless CDP at {ws_url}")
@@ -1530,6 +1760,7 @@ async def fetch_webpage_rendered(
     allowed_urls: set[str] | None = None,
     max_chars: int = 14000,
     direct_user_url: bool = False,
+    complete: bool = False,
 ) -> str:
     if not url.lower().startswith(("http://", "https://")):
         return " Invalid URL."
@@ -1543,11 +1774,18 @@ async def fetch_webpage_rendered(
     if browser is None:
         return " Playwright renderer unavailable."
     async with _PLAYWRIGHT_SEMAPHORE:
+        real_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+            user_agent=real_ua,
             locale="en-US",
             java_script_enabled=True,
+            viewport={"width": 1400, "height": 900},
         )
+        try:
+            from src.bot.approval_views import _STEALTH_INIT_SCRIPT
+            await context.add_init_script(_STEALTH_INIT_SCRIPT)
+        except Exception:
+            pass
         try:
             async def route_handler(route):
                 if route.request.resource_type in {"image", "media", "font"}:
@@ -1557,6 +1795,15 @@ async def fetch_webpage_rendered(
 
             await context.route("**/*", route_handler)
             page = await context.new_page()
+            try:
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Network.setUserAgentOverride", {
+                    "userAgent": real_ua,
+                    "acceptLanguage": "en-US,en;q=0.9",
+                    "platform": "Win32",
+                })
+            except Exception:
+                pass
             page.set_default_timeout(PLAYWRIGHT_TIMEOUT_MS)
             # Do not require the navigation to reach DOMContentLoaded.
             # Bot-protected / heavily client-rendered sites may keep navigation
@@ -1592,10 +1839,83 @@ async def fetch_webpage_rendered(
             if initial_host != final_host and not direct_user_url:
                 return " Refused redirect target: cross-site redirect."
 
-            try:
-                body = await page.locator("body").inner_text(timeout=5000)
-            except Exception:
-                body = ""
+            completeness_note = ""
+            snapshots: list[str] = []
+            if complete:
+                # Dynamic sites frequently virtualize rows: only the viewport is
+                # present in the DOM at once. Collect snapshots while advancing
+                # every plausible scroll container, then de-duplicate lines.
+                stable_rounds = 0
+                previous_snapshot = ""
+                for _ in range(40):
+                    try:
+                        current_snapshot = await page.locator("body").inner_text(timeout=5000)
+                        snapshots.append(current_snapshot)
+                        state = await page.evaluate(
+                            """() => {
+                              const els = [document.scrollingElement, ...document.querySelectorAll(
+                                '[role=grid], [role=treegrid], table, [style*="overflow"], [class*="scroll"]'
+                              )].filter(Boolean);
+                              let moved = false;
+                              for (const el of els) {
+                                const before = el.scrollTop || 0;
+                                const step = Math.max(500, Math.floor((el.clientHeight || innerHeight) * .85));
+                                if ((el.scrollHeight || 0) > (el.clientHeight || 0) + 8) {
+                                  el.scrollTop = Math.min(el.scrollHeight, before + step);
+                                  if (el.scrollTop > before) moved = true;
+                                }
+                              }
+                              return {moved};
+                            }"""
+                        )
+                        if not state.get("moved"):
+                            # Canvas-style applications (including many
+                            # spreadsheet/data-grid UIs) may not expose their
+                            # scroll state as a normal DOM element. PageDown
+                            # is the generic fallback; only count a round as
+                            # stable if the visible text also stops changing.
+                            try:
+                                await page.keyboard.press("PageDown")
+                                await page.wait_for_timeout(250)
+                                after_key = await page.locator("body").inner_text(timeout=5000)
+                            except Exception:
+                                after_key = current_snapshot
+                            if after_key == current_snapshot == previous_snapshot:
+                                stable_rounds += 1
+                                if stable_rounds >= 2:
+                                    break
+                            else:
+                                stable_rounds = 0
+                            snapshots.append(after_key)
+                        else:
+                            stable_rounds = 0
+                        await page.wait_for_timeout(250)
+                        previous_snapshot = current_snapshot
+                    except Exception:
+                        break
+                try:
+                    snapshots.append(await page.locator("body").inner_text(timeout=5000))
+                except Exception:
+                    pass
+                lines = []
+                seen_lines = set()
+                for snapshot in snapshots:
+                    for line in snapshot.splitlines():
+                        normalized = re.sub(r"\s+", " ", line).strip()
+                        if normalized and normalized not in seen_lines:
+                            seen_lines.add(normalized)
+                            lines.append(normalized)
+                body = "\n".join(lines)
+                completeness_note = (
+                    f"[complete-scroll snapshots: {len(snapshots)}; "
+                    f"stabilized: {stable_rounds >= 2}; "
+                    f"status: {'COMPLETE' if stable_rounds >= 2 else 'INCOMPLETE'}]"
+                )
+            else:
+                try:
+                    body = await page.locator("body").inner_text(timeout=5000)
+                except Exception:
+                    body = ""
             html = await page.content()
             structured = _extract_jsonld_prices(html)
             links = []
@@ -1620,6 +1940,8 @@ async def fetch_webpage_rendered(
                 f"[rendered page: {page.url}]",
                 f"[page title: {await page.title()}]",
             ]
+            if completeness_note:
+                parts.append(completeness_note)
             if structured:
                 parts.append("[structured product data]\n" + "\n".join(f"- {x}" for x in structured))
             if links:
@@ -1643,6 +1965,9 @@ async def fetch_webpage(
     prefer_rendered: bool = False,
     direct_user_url: bool = False,
     user_id: str | None = None,
+    complete: bool = False,
+    save_only: bool = False,
+    workspace_filename: str = "",
 ) -> str:
     # The advisor explicitly chose this URL — that is the "used" signal that
     # earns a page a place in the vector store (domain web_search_result).
@@ -1681,16 +2006,90 @@ async def fetch_webpage(
             index_web_search_result(embed_user, final_url, title, str(text)[:12000])
         )
 
+    async def _save_only_result(text: str, default_name: str) -> str | None:
+        if not save_only or not user_id or not text:
+            return None
+        return await sandbox_client.save_workspace_file(
+            str(user_id),
+            _text_artifact_filename(workspace_filename, default_name),
+            text.encode("utf-8"),
+        )
+
     if not url or not url.lower().startswith(("http://", "https://")):
         return f" Not a valid http(s) URL: {url!r}"
     parsed = urlparse(url)
     if not await _host_is_public(parsed.hostname or ""):
         return " Refused URL: only publicly routable hosts may be fetched."
 
+    # Google editors are application shells: the visible DOM may contain only
+    # the toolbar/accessibility layer. Public Docs/Sheets expose a text/CSV
+    # representation that is both more complete and cheaper than scraping the
+    # editor. This is a fetch-layer optimization, not a separate tool.
+    google_export = _google_public_export_url(url)
+    if google_export:
+        export_url, export_kind = google_export
+        # A directly supplied Sheet should never silently degrade to one
+        # truncated/default tab just because the model omitted complete=true.
+        # Enumerate/save all tabs automatically for direct user URLs; search
+        # result URLs retain the cheaper single-tab behavior unless complete
+        # was explicitly requested.
+        if export_kind == "Google Sheets CSV export" and (complete or direct_user_url):
+            all_tabs = await _fetch_google_sheet_all_tabs(
+                url,
+                max_chars,
+                user_id=user_id,
+                save_only=save_only,
+                workspace_filename=workspace_filename,
+            )
+            if all_tabs:
+                return all_tabs
+        try:
+            async with httpx.AsyncClient(
+                timeout=30.0, follow_redirects=True, headers=_random_browser_headers()
+            ) as client:
+                export_response = await client.get(export_url)
+            export_host = (urlparse(str(export_response.url)).hostname or "").lower().removeprefix("www.")
+            if (
+                export_response.status_code == 200
+                and await _host_is_public(export_host)
+                and "<html" not in export_response.text[:500].lower()
+            ):
+                export_text = export_response.content.decode("utf-8-sig", errors="replace")
+                if save_only and user_id:
+                    doc_match = _GOOGLE_DOC_ID_RE.search(parsed.path)
+                    default_name = (
+                        f"google_doc_{doc_match.group(1)}.txt"
+                        if doc_match
+                        else "google_export.txt"
+                    )
+                    saved_path = await sandbox_client.save_workspace_file(
+                        str(user_id),
+                        _text_artifact_filename(workspace_filename, default_name),
+                        export_text.encode("utf-8"),
+                    )
+                    if saved_path:
+                        return (
+                            f"[export status: COMPLETE]\n"
+                            f"[full export saved to workspace: {saved_path}]\n"
+                            f"[bytes: {len(export_text.encode('utf-8'))}]"
+                        )
+                truncated = len(export_text) > max_chars
+                result = (
+                    f"[google export: {export_kind}]\n"
+                    f"[source: {url}]\n"
+                    f"[export status: {'INCOMPLETE_TRUNCATED' if truncated else 'COMPLETE'}]\n"
+                    + export_text[:max_chars]
+                )
+                if truncated:
+                    result += "\n[Output truncated; request a larger max_chars value or save/process the source artifact.]"
+                return result
+        except Exception as exc:
+            print(f" [Google export] fallback failed for {url}: {type(exc).__name__}: {exc}")
+
     key = _canonical_url(url)
     now = time.time()
     cached = WEB_PAGE_CACHE.get(key)
-    if cached and now - cached[0] < RESEARCH_PAGE_CACHE_TTL_SECONDS and not prefer_rendered:
+    if cached and now - cached[0] < RESEARCH_PAGE_CACHE_TTL_SECONDS and not prefer_rendered and not complete:
         return cached[1]
 
     static_result = None
@@ -1754,14 +2153,21 @@ async def fetch_webpage(
                     parts.append(page_text[:max_chars] + (" …[truncated]" if len(page_text) > max_chars else ""))
                 static_result = "\n".join(parts)
                 WEB_PAGE_CACHE[key] = (now, static_result, False)
-                if not prefer_rendered:
+                if save_only:
+                    saved_path = await _save_only_result(
+                        static_result,
+                        f"webpage_{(parsed.hostname or 'artifact').replace('.', '_')}.txt",
+                    )
+                    if saved_path:
+                        return f"[saved to workspace: {saved_path}]\n[bytes: {len(static_result.encode('utf-8'))}]"
+                if not prefer_rendered and not complete:
                     title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
                     title = (
                         re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", title_m.group(1))).strip()[:300]
                         if title_m else ""
                     )
                     _fire_web_embed(str(r.url), title, static_result, html=html)
-                if not prefer_rendered:
+                if not prefer_rendered and not complete:
                     return static_result
 
     if static_result is None:
@@ -1769,16 +2175,24 @@ async def fetch_webpage(
     else:
         static_error = f" {url} returned HTTP {r.status_code if r else 'N/A'}."
 
-    if prefer_rendered or static_error.startswith(" Fetched"):
+    if prefer_rendered or complete or static_error.startswith(" Fetched"):
         rendered = await fetch_webpage_rendered(
             url,
             allowed_urls=allowed_urls,
             max_chars=max(12000, max_chars * 2),
             direct_user_url=direct_user_url,
+            complete=complete,
         )
         if rendered and not rendered.startswith((" ", " Refused", " Playwright renderer unavailable", " Playwright render failed")):
             WEB_PAGE_CACHE[key] = (now, rendered, True)
             _fire_web_embed(str(r.url), "", rendered)
+            if save_only:
+                saved_path = await _save_only_result(
+                    rendered,
+                    f"webpage_{(parsed.hostname or 'artifact').replace('.', '_')}.txt",
+                )
+                if saved_path:
+                    return f"[saved to workspace: {saved_path}]\n[bytes: {len(rendered.encode('utf-8'))}]"
             return rendered
 
     if static_result is not None:
