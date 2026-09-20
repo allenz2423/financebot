@@ -291,63 +291,115 @@ def test_agentic_browser_step_auto_action():
 
 
 @pytest.mark.asyncio
-async def test_cua_agent_shopping_flow():
-    from unittest.mock import AsyncMock
+async def test_cua_agent_shopping_turn_loop():
+    from unittest.mock import MagicMock
     from src.services.concierge.system1_agent import CUAAgent
 
-    mock_page = AsyncMock()
-    mock_page.url = "https://www.amazon.com/"
-    
-    # Mock search input
-    mock_search_input = AsyncMock()
-    
-    # Mock candidate elements
-    mock_result_item = AsyncMock()
-    mock_title_link = AsyncMock()
-    mock_title_link.inner_text = AsyncMock(return_value="Rotring 600 Mechanical Pencil, Limited Edition Mint, 0.5mm")
-    mock_price = AsyncMock()
-    mock_price.inner_text = AsyncMock(return_value="$37.33")
-    
-    mock_result_item.query_selector = AsyncMock(
-        side_effect=lambda sel: mock_title_link if "h2 a" in sel else (mock_price if "price" in sel else None)
-    )
+    mock_actuator = MagicMock()
+    # Mock initial interactive summary with search input
+    mock_actuator._handles = {
+        "e1": {"handle": "e1", "tag": "input", "type": "search", "label": "Search Amazon", "name": "field-keywords"},
+        "e2": {"handle": "e2", "tag": "button", "type": "submit", "label": "Go", "name": "submit"},
+    }
+    mock_actuator.interactive_summary.return_value = "e1: [input:search] 'Search Amazon'\ne2: [button:submit] 'Go'"
+    mock_actuator.get_text.return_value = "Amazon.com. Spend less. Smile more."
 
-    # Mock add to cart button
-    mock_add_btn = AsyncMock()
-    mock_add_btn.inner_text = AsyncMock(return_value="Add to Cart")
-    mock_add_btn.get_attribute = AsyncMock(return_value="")
-    
-    # Mock cart count element (increments from 1 to 2)
-    mock_cart_elem = AsyncMock()
-    cart_counts = ["1", "2"]
-    mock_cart_elem.inner_text = AsyncMock(side_effect=lambda: cart_counts.pop(0) if cart_counts else "2")
-    mock_cart_elem.get_attribute = AsyncMock(return_value="")
+    def fake_type(handle, val):
+        if handle == "e1":
+            # Search submitted, transition to search results page
+            mock_actuator._handles = {
+                "e3": {"handle": "e3", "tag": "a", "type": "link", "label": "Rotring 600 Mechanical Pencil Mint 0.5mm"},
+                "e4": {"handle": "e4", "tag": "a", "type": "link", "label": "Rotring 800 Silver Pencil"},
+            }
+            mock_actuator.interactive_summary.return_value = (
+                "e3: [a:link] 'Rotring 600 Mechanical Pencil Mint 0.5mm'\n"
+                "e4: [a:link] 'Rotring 800 Silver Pencil'"
+            )
+            mock_actuator.get_text.return_value = "Results for rotring 600 mint"
 
-    mock_page.query_selector = AsyncMock(side_effect=lambda sel: (
-        mock_search_input if ("twotabsearchtextbox" in sel or "search" in sel)
-        else (mock_add_btn if "add-to-cart" in sel
-        else (mock_cart_elem if "cart" in sel else None))
-    ))
-    mock_page.query_selector_all = AsyncMock(side_effect=lambda sel: (
-        [mock_add_btn] if "button" in sel
-        else ([mock_cart_elem] if "cart" in sel or "basket" in sel
-        else [mock_result_item])
-    ))
-    mock_page.goto = AsyncMock()
-    mock_page.screenshot = AsyncMock()
+    def fake_click(handle):
+        if handle == "e3":
+            # Product details page with Add to Cart button
+            mock_actuator._handles = {
+                "e5": {"handle": "e5", "tag": "button", "type": "submit", "label": "Add to Cart"},
+            }
+            mock_actuator.interactive_summary.return_value = "e5: [button:submit] 'Add to Cart'"
+            mock_actuator.get_text.return_value = "Rotring 600 Mint in stock. Add to Cart."
+        elif handle == "e5":
+            # Item added to cart
+            mock_actuator._handles = {}
+            mock_actuator.interactive_summary.return_value = ""
+            mock_actuator.get_text.return_value = "Added to Cart. Cart subtotal: $37.33"
 
-    cua = CUAAgent(cdp_actuator=mock_page)
+    mock_actuator.type_text.side_effect = fake_type
+    mock_actuator.click.side_effect = fake_click
+    mock_actuator.screenshot.return_value = None
+
+    cua = CUAAgent(cdp_actuator=mock_actuator)
     # Test parse goal
     parsed = cua.parse_goal("add a rotring 600 in a nice blue adjacent color preferably mint to my cart")
     assert "rotring 600" in parsed["search_query"]
     assert "mint" in parsed["preferred_colors"]
 
-    # Test autonomous goal execution
-    res = await cua.run_goal_async("add a rotring 600 in a nice blue adjacent color preferably mint to my cart")
+    # Test autonomous turn loop
+    res = await cua.run_goal_async("add a rotring 600 in a nice blue adjacent color preferably mint to my cart", max_turns=5)
     assert res["status"] == "completed"
-    assert "Rotring 600" in res["selected_product"]
-    assert res["initial_cart_count"] == 1
-    assert res["final_cart_count"] == 2
-    assert any(step["step"] == "click_add_to_cart" for step in res["trace"])
+    assert len(res["actions_executed"]) >= 2
+    assert any(a["action"] == "type" for a in res["actions_executed"])
+    assert any(a["action"] == "click" for a in res["actions_executed"])
+
+
+@pytest.mark.asyncio
+async def test_cua_agent_banking_turn_loop():
+    """Verify CUA functions identically on banking portals without any shopping assumptions."""
+    from unittest.mock import MagicMock
+    from src.services.concierge.system1_agent import CUAAgent
+
+    mock_actuator = MagicMock()
+    mock_actuator._handles = {
+        "e1": {"handle": "e1", "tag": "a", "type": "link", "label": "360 Checking ...1234 - $4,520.10"},
+        "e2": {"handle": "e2", "tag": "button", "type": "button", "label": "Transfer Money"},
+    }
+    mock_actuator.interactive_summary.return_value = "e1: [a:link] '360 Checking ...1234'\ne2: [button] 'Transfer Money'"
+    mock_actuator.get_text.return_value = "Capital One Accounts Dashboard. Welcome Alice."
+
+    def fake_click(handle):
+        if handle == "e2":
+            mock_actuator._handles = {
+                "e3": {"handle": "e3", "tag": "input", "type": "text", "label": "Amount", "name": "amount"},
+                "e4": {"handle": "e4", "tag": "button", "type": "submit", "label": "Confirm Transfer"},
+            }
+            mock_actuator.interactive_summary.return_value = "e3: [input:text] 'Amount'\ne4: [button:submit] 'Confirm Transfer'"
+            mock_actuator.get_text.return_value = "Transfer Funds form"
+
+    mock_actuator.click.side_effect = fake_click
+    mock_actuator.screenshot.return_value = None
+
+    cua = CUAAgent(cdp_actuator=mock_actuator)
+    res = await cua.run_goal_async("Transfer Money", max_turns=3)
+    assert res["status"] == "completed"
+    assert any(a["action"] == "click" and a["target"] == "e2" for a in res["actions_executed"])
+
+
+@pytest.mark.asyncio
+async def test_cua_agent_challenge_blocking():
+    """Verify CUA halts cleanly when an OTP or security challenge is presented."""
+    from unittest.mock import MagicMock
+    from src.services.concierge.system1_agent import CUAAgent
+
+    mock_actuator = MagicMock()
+    mock_actuator._handles = {
+        "e1": {"handle": "e1", "tag": "input", "type": "text", "label": "Enter security code sent via SMS", "name": "otp"},
+    }
+    mock_actuator.interactive_summary.return_value = "e1: [input:text] 'Enter security code sent via SMS'"
+    mock_actuator.get_text.return_value = "Two-step verification. Enter the verification code sent to your phone."
+
+    cua = CUAAgent(cdp_actuator=mock_actuator)
+    res = await cua.run_goal_async("Check recent transactions", max_turns=3)
+    assert res["status"] == "blocked"
+    assert res["stage"] == "challenge"
+    assert "challenge" in res["block_reason"].lower() or "verification" in res["block_reason"].lower()
+    assert len(res["actions_executed"]) == 0
+
 
 

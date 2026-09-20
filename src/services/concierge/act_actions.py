@@ -134,6 +134,7 @@ class Actuator:
     def get_text(self) -> str: ...  # pragma: no cover
     def element_visible(self, selector: str) -> bool: ...  # pragma: no cover
     def scroll(self, value: str = "down", selector: str = "") -> None: ...  # pragma: no cover
+    def press_key(self, key: str = "Enter") -> None: ...  # pragma: no cover
 
     def heal(self) -> bool:
         """Clear a known interstitial (bot-check/captcha) blocking the flow.

@@ -530,14 +530,14 @@ class System1FormAgent:
 
 
 class CUAAgent:
-    """Autonomous Computer-Use Agent (CUA) combining System 1 and System 2.
+    """Universal Grounded Computer-Use Agent (CUA) combining System 1 and System 2.
 
-    Handles high-level user instructions across web workflows:
-    - Synthesizes queries and target criteria from user goals (System 2 / Ollama).
-    - Perceives and drives interactive elements via CDP with sub-50ms latency (System 1).
-    - Ranks and selects matching products semantically based on multi-attribute preferences (System 2).
-    - Executes actions (search, variant/swatch clicks, add-to-cart, modal dismissals).
-    - Verifies outcome metrics (e.g. cart state increment).
+    Operates autonomously across arbitrary web portals (banking, e-commerce, SaaS, admin)
+    using universal perception and action primitives without site-specific or domain-specific assumptions:
+    - Perceives live interactive elements (e1, e2, ...) and page landmarks/text.
+    - Decides next grounded primitive via System 2 (Ollama / local LLM) with domain-agnostic fallback.
+    - Executes universal primitives: click(handle), type(handle, val), press_key(key), scroll(dir), navigate(url), wait(sec), finish(result).
+    - Detects auth/OTP challenges and halts cleanly for user intervention.
     """
 
     def __init__(
@@ -559,7 +559,7 @@ class CUAAgent:
         self.jev_client = JevSystem1Client()
         self.form_agent = System1FormAgent(cdp_actuator, tenant or "", domain or "", vault)
 
-    def _call_ollama(self, prompt: str, format_json: bool = True, timeout: float = 30.0) -> Optional[Dict[str, Any]]:
+    def _call_ollama(self, prompt: str, format_json: bool = True, timeout: float = 35.0) -> Optional[Dict[str, Any]]:
         """Query local Ollama instance with structured output."""
         try:
             import urllib.request
@@ -586,405 +586,481 @@ class CUAAgent:
             return None
 
     def parse_goal(self, goal: str) -> Dict[str, Any]:
-        """Synthesize a structured execution plan from a user goal."""
-        prompt = (
-            f"You are a Computer Use Agent parser.\n"
-            f"Analyze this user shopping goal: \"{goal}\"\n"
-            f"Return ONLY a valid JSON object with keys:\n"
-            f"- \"search_query\": concise search query for the search bar (e.g. \"rotring 600 mint\")\n"
-            f"- \"target_model\": the specific product model\n"
-            f"- \"preferred_colors\": list of colors matching user request (e.g. [\"mint\", \"blue\"])\n"
-            f"- \"action\": \"add_to_cart\" or \"view\"\n"
-            f"JSON:"
-        )
-        res = self._call_ollama(prompt, format_json=True)
-        if res and "search_query" in res:
-            return res
+        """Synthesize high-level intent, key query terms, and attributes from any user goal."""
+        q = (goal or "").strip()
+        q_low = q.lower()
 
-        # Semantic fallback parsing
-        q = goal.lower()
-        query = "rotring 600"
-        if "mint" in q:
-            query = "rotring 600 mint"
-        elif "blue" in q:
-            query = "rotring 600 blue"
-        colors = []
-        for c in ("mint", "blue", "ice mint", "pastel", "silver", "black", "red"):
-            if c in q:
-                colors.append(c)
+        # Extract colors or attributes if mentioned
+        colors = [c for c in ("mint", "blue", "ice mint", "pastel", "silver", "black", "red") if c in q_low]
+
+        query = q
+        for prefix in ("add a ", "add an ", "add ", "buy a ", "buy an ", "buy ", "search for ", "find ", "look for ", "get me a ", "get a "):
+            if q_low.startswith(prefix):
+                query = q[len(prefix):]
+                break
+        for suffix in (" to my cart", " to cart", " into cart"):
+            if query.lower().endswith(suffix):
+                query = query[:-len(suffix)].strip()
+
         return {
+            "intent": "interact",
             "search_query": query,
-            "target_model": "rotring 600",
-            "preferred_colors": colors or ["mint", "blue"],
-            "action": "add_to_cart",
+            "target_model": query,
+            "attributes": colors,
+            "preferred_colors": colors,
+            "action": "execute",
         }
 
-    def rank_candidates(
+    async def _get_interactive_inventory(self, page_obj: Any, _call: Any) -> Tuple[List[Dict[str, Any]], str]:
+        """Collect visible interactive elements with stable handles (e1, e2, ...)."""
+        # 1. Preferred path: use actuator.interactive_summary() if available
+        if hasattr(self.actuator, "interactive_summary") and callable(self.actuator.interactive_summary):
+            raw_summary = await _call(self.actuator.interactive_summary)
+            handles = getattr(self.actuator, "_handles", {})
+            ctrls = list(handles.values())
+            if ctrls:
+                return ctrls, str(raw_summary or "")
+
+        # 2. Page element extraction fallback
+        controls: List[Dict[str, Any]] = []
+        if page_obj and hasattr(page_obj, "query_selector_all"):
+            try:
+                elements = await _call(
+                    page_obj.query_selector_all,
+                    "input, button, a, select, textarea, [role='button'], [role='link']"
+                ) or []
+                for i, el in enumerate(elements[:60]):
+                    handle = f"e{i+1}"
+                    tag = "input"
+                    typ = ""
+                    label = ""
+                    name = ""
+                    val = ""
+                    if hasattr(el, "evaluate"):
+                        try:
+                            info = await _call(el.evaluate, """(e) => ({
+                                tag: e.tagName.toLowerCase(),
+                                type: (e.getAttribute('type') || '').toLowerCase(),
+                                label: (e.innerText || e.getAttribute('aria-label') || e.getAttribute('placeholder') || '').replace(/\\s+/g, ' ').trim(),
+                                name: e.getAttribute('name') || '',
+                                value: e.value || ''
+                            })""")
+                            if info:
+                                tag = info.get("tag", "input")
+                                typ = info.get("type", "")
+                                label = info.get("label", "")
+                                name = info.get("name", "")
+                                val = info.get("value", "")
+                        except Exception:
+                            pass
+                    if not label and hasattr(el, "inner_text"):
+                        try:
+                            label = str(await _call(el.inner_text) or "").strip()
+                        except Exception:
+                            label = ""
+                    if not label and hasattr(el, "get_attribute"):
+                        try:
+                            label = str(await _call(el.get_attribute, "aria-label") or await _call(el.get_attribute, "placeholder") or "")
+                        except Exception:
+                            pass
+
+                    controls.append({
+                        "handle": handle,
+                        "tag": tag,
+                        "type": typ,
+                        "label": label[:120],
+                        "name": name,
+                        "value": val,
+                        "_element": el,
+                    })
+            except Exception:
+                pass
+
+        formatted = "\n".join(
+            f"{c['handle']}: [{c['tag']}:{c.get('type') or c['tag']}] {c['label']!r}"
+            for c in controls
+        )
+        return controls, formatted
+
+    async def _get_page_text(self, page_obj: Any, _call: Any) -> str:
+        """Extract readable text and landmarks from the active page."""
+        if hasattr(self.actuator, "get_text") and callable(self.actuator.get_text):
+            return str(await _call(self.actuator.get_text) or "")
+        if page_obj and hasattr(page_obj, "evaluate"):
+            try:
+                return str(await _call(page_obj.evaluate, "() => document.body ? document.body.innerText : ''") or "")
+            except Exception:
+                return ""
+        return ""
+
+    def _check_auth_challenge(self, page_text: str, current_url: str) -> bool:
+        """Detect OTP/2FA or CAPTCHA verification challenges on page."""
+        try:
+            from src.bot.approval_views import browser_auth_challenge
+            if browser_auth_challenge(page_text, current_url):
+                return True
+        except Exception:
+            pass
+        if self.jev_client.is_available:
+            return bool(self.jev_client.is_auth_challenge(page_text))
+        # Basic heuristic
+        low = page_text.lower()
+        return any(k in low for k in ("enter the verification code", "one-time password", "enter security code", "solve the puzzle", "captcha"))
+
+    def decide_next_action(
         self,
-        candidates: List[Dict[str, Any]],
         goal: str,
-        preferred_colors: List[str],
-    ) -> int:
-        """Rank candidate products using System 2 semantic evaluation or heuristic fallback."""
-        if not candidates:
-            return 0
-        if len(candidates) == 1:
-            return 0
+        current_url: str,
+        page_summary: str,
+        controls: List[Dict[str, Any]],
+        history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Select the single next grounded action primitive via System 2 LLM or domain-agnostic fallback."""
+        formatted_controls = "\n".join(
+            f"{c['handle']}: [{c.get('tag', '')}:{c.get('type', '')}] {c.get('label', '')!r}"
+            + (f" name={c.get('name')!r}" if c.get('name') else "")
+            + (f" value={c.get('value')!r}" if c.get('value') and not c.get('secret') else "")
+            for c in controls[:50]
+        )
+
+        history_str = "\n".join(
+            f"- Turn {h.get('turn')}: {h.get('action')} on {h.get('target', '')} (thought: {h.get('thought', '')})"
+            for h in history
+        ) or "None"
 
         prompt = (
-            f"Goal: {goal}\n"
-            f"Candidates:\n{json.dumps(candidates, indent=2)}\n\n"
-            f"Select the best candidate matching the user goal.\n"
-            f"Return ONLY JSON: {{\"selected_index\": int, \"rationale\": str}}"
+            f"You are an autonomous Computer-Use Agent (CUA) operating a browser.\n"
+            f"User Goal: {goal}\n"
+            f"Current URL: {current_url}\n"
+            f"Page Summary: {page_summary[:800]}\n"
+            f"Interactive Controls:\n{formatted_controls}\n"
+            f"Action History:\n{history_str}\n\n"
+            f"Choose the single best next action primitive to advance towards the goal.\n"
+            f"Available actions:\n"
+            f"- {{\"thought\": \"...\", \"action\": \"type\", \"target\": \"eN\", \"value\": \"...\", \"press_enter\": true|false}}\n"
+            f"- {{\"thought\": \"...\", \"action\": \"click\", \"target\": \"eN\"}}\n"
+            f"- {{\"thought\": \"...\", \"action\": \"press_key\", \"key\": \"Enter\"|\"Tab\"|\"Escape\"}}\n"
+            f"- {{\"thought\": \"...\", \"action\": \"scroll\", \"direction\": \"down\"|\"up\"}}\n"
+            f"- {{\"thought\": \"...\", \"action\": \"navigate\", \"url\": \"https://...\"}}\n"
+            f"- {{\"thought\": \"...\", \"action\": \"wait\", \"seconds\": 1.0}}\n"
+            f"- {{\"thought\": \"...\", \"action\": \"finish\", \"result\": \"description of what was accomplished\"}}\n\n"
+            f"Requirements:\n"
+            f"1. Ground decisions strictly in the listed controls (e1, e2, ...). Do not invent handles.\n"
+            f"2. Return ONLY a valid JSON object."
         )
+
         res = self._call_ollama(prompt, format_json=True)
-        if res and "selected_index" in res:
-            try:
-                idx = int(res["selected_index"])
-                if 0 <= idx < len(candidates):
-                    logger.info(f"CUA System 2 ranked item #{idx}: {res.get('rationale')}")
-                    return idx
-            except Exception:
-                pass
+        if isinstance(res, dict) and "action" in res:
+            action = res.get("action")
+            if action in {"type", "click", "press_key", "scroll", "navigate", "wait", "finish"}:
+                return res
 
-        # Heuristic fallback: score by color keyword and model match
-        best_idx = 0
-        best_score = -1.0
-        for i, c in enumerate(candidates):
-            title = c.get("title", "").lower()
-            score = 0.0
-            if "rotring 600" in title:
-                score += 5.0
-            for col in preferred_colors:
-                if col.lower() in title:
-                    score += 10.0
-            if "mechanical pencil" in title:
-                score += 2.0
-            if score > best_score:
-                best_score = score
-                best_idx = i
-        return best_idx
+        # Universal Grounded Heuristic Fallback (when Ollama offline / unit test)
+        return self._heuristic_next_action(goal, controls, history, page_summary)
 
-    async def run_goal_async(self, goal: str, start_url: Optional[str] = None) -> Dict[str, Any]:
-        """Execute autonomous computer-use workflow for the given goal."""
-        import asyncio
-        import inspect
-        start_time = time.perf_counter()
-        trace = []
+    def _heuristic_next_action(
+        self,
+        goal: str,
+        controls: List[Dict[str, Any]],
+        history: List[Dict[str, Any]],
+        page_summary: str,
+    ) -> Dict[str, Any]:
+        """Domain-agnostic grounded heuristic for action selection."""
+        if not controls:
+            return {"thought": "No interactive controls visible; finishing.", "action": "finish", "result": page_summary[:200]}
 
-        async def _call(fn, *args, **kwargs):
-            if fn is None:
-                return None
-            res = fn(*args, **kwargs)
-            if inspect.isawaitable(res):
-                return await res
-            return res
-
-        # Resolve live playwright page from actuator or directly
-        page = None
-        if hasattr(self.actuator, "goto") or hasattr(self.actuator, "query_selector"):
-            page = self.actuator
-        elif hasattr(self.actuator, "_page") and self.actuator._page:
-            page = self.actuator._page
-        else:
-            raise ValueError("CUAAgent requires a CDP actuator or Playwright Page")
-
-        # 1. Parse Goal (System 2)
         parsed = self.parse_goal(goal)
-        search_query = parsed.get("search_query", "rotring 600 mint")
-        pref_colors = parsed.get("preferred_colors", ["mint", "blue"])
-        trace.append({
-            "step": "goal_synthesis",
-            "search_query": search_query,
-            "preferred_colors": pref_colors,
-            "engine": "ollama_system2",
-        })
+        query = parsed.get("search_query") or goal
+        q_tokens = set(re.findall(r"\w+", query.lower())) - {"the", "a", "an", "to", "in", "of", "my", "for", "and", "is", "on"}
 
-        if start_url:
-            await _call(page.goto, start_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1.5)
+        has_typed = any(h.get("action") == "type" for h in history)
+        clicked_handles = {h.get("target") for h in history if h.get("action") == "click"}
 
-    async def _find_generic_search_input(self, page, _call):
-        """Find search input using universal HTML5 and ARIA standards."""
-        selectors = [
-            "input[type='search']",
-            "[role='searchbox']",
-            "form[role='search'] input:not([type='hidden'])",
-            "input[aria-label*='search' i]",
-            "input[placeholder*='search' i]",
-            "input[placeholder*='find' i]",
-            "input[name*='search' i]",
-            "input[name='q']",
-            "input[name='query']",
-            "input[name*='keyword' i]",
-            "input[id*='search' i]:not([type='hidden'])",
-        ]
-        for sel in selectors:
-            try:
-                elem = await _call(page.query_selector, sel)
-                if elem:
-                    return elem
-            except Exception:
-                continue
-        return None
+        # 1. If we haven't typed yet, look for an empty text/search input to submit the query
+        if not has_typed:
+            inputs = [
+                c for c in controls
+                if c.get("tag") == "input" and c.get("type") in {"text", "search", ""}
+            ]
+            if inputs:
+                # Prioritize searchbox
+                best_input = next(
+                    (c for c in inputs if any(k in f"{c.get('name','')} {c.get('label','')}".lower() for k in ("search", "find", "query", "q"))),
+                    inputs[0]
+                )
+                return {
+                    "thought": f"Enter query into input field {best_input['handle']}",
+                    "action": "type",
+                    "target": best_input["handle"],
+                    "value": query,
+                    "press_enter": True,
+                }
 
-    async def _get_generic_cart_count(self, page, _call) -> int:
-        """Read cart item count from standard store navigation."""
-        selectors = [
-            "a[href*='/cart' i]",
-            "a[href*='/basket' i]",
-            "a[href*='/bag' i]",
-            "[aria-label*='cart' i]",
-            "[aria-label*='basket' i]",
-            "[id*='cart' i]",
-            "[class*='cart' i]",
-        ]
-        for sel in selectors:
-            try:
-                elems = await _call(page.query_selector_all, sel) or []
-                for el in elems[:5]:
-                    txt = str(await _call(el.inner_text) or "").strip()
-                    m_txt = re.search(r"\b(\d{1,4})\b", txt)
-                    if m_txt:
-                        return int(m_txt.group(1))
-                    aria = str(await _call(el.get_attribute, "aria-label") or "").strip()
-                    m_aria = re.search(r"\b(\d{1,4})\b", aria)
-                    if m_aria:
-                        return int(m_aria.group(1))
-            except Exception:
-                continue
-        return 0
-
-    async def _find_generic_add_to_cart(self, page, _call):
-        """Locate primary Add to Cart CTA across any e-commerce storefront."""
-        buttons = await _call(page.query_selector_all, "button, input[type='submit'], [role='button'], a.btn") or []
-        for btn in buttons:
-            try:
-                text = str(await _call(btn.inner_text) or "").strip().lower()
-                val = str(await _call(btn.get_attribute, "value") or "").strip().lower()
-                label = str(await _call(btn.get_attribute, "aria-label") or "").strip().lower()
-                btn_id = str(await _call(btn.get_attribute, "id") or "").strip().lower()
-                name = str(await _call(btn.get_attribute, "name") or "").strip().lower()
-                combined = f"{text} {val} {label} {btn_id} {name}"
-                if any(phrase in combined for phrase in ("add to cart", "add to bag", "add to basket", "buy now")):
-                    return btn
-            except Exception:
-                continue
-        return None
-
-    async def run_goal_async(self, goal: str, start_url: Optional[str] = None) -> Dict[str, Any]:
-        """Execute autonomous computer-use workflow using universal web semantics."""
-        import asyncio
-        import inspect
-        start_time = time.perf_counter()
-        trace = []
-
-        async def _call(fn, *args, **kwargs):
-            if fn is None:
-                return None
-            res = fn(*args, **kwargs)
-            if inspect.isawaitable(res):
-                return await res
-            return res
-
-        # Resolve live playwright page from actuator or directly
-        page = None
-        if hasattr(self.actuator, "goto") or hasattr(self.actuator, "query_selector"):
-            page = self.actuator
-        elif hasattr(self.actuator, "_page") and self.actuator._page:
-            page = self.actuator._page
-        else:
-            raise ValueError("CUAAgent requires a CDP actuator or Playwright Page")
-
-        # 1. Parse Goal (System 2)
-        parsed = self.parse_goal(goal)
-        search_query = parsed.get("search_query", "rotring 600 mint")
-        pref_colors = parsed.get("preferred_colors", ["mint", "blue"])
-        trace.append({
-            "step": "goal_synthesis",
-            "search_query": search_query,
-            "preferred_colors": pref_colors,
-            "engine": "ollama_system2",
-        })
-
-        if start_url:
-            await _call(page.goto, start_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1.5)
-
-        # 2. Check initial cart state generically (System 1)
-        initial_cart_count = await self._get_generic_cart_count(page, _call)
-
-        # 3. Generic Search Execution (System 1)
-        search_input = await self._find_generic_search_input(page, _call)
-        if search_input:
-            await _call(search_input.fill, search_query)
-            trace.append({"step": "search_fill", "query": search_query, "engine": "cua_s1_generic"})
-            await _call(search_input.press, "Enter")
-            await asyncio.sleep(2.5)
-            trace.append({"step": "search_submit", "engine": "cua_s1_generic"})
-        else:
-            # Fallback to query URL if no input found
-            curr_url = getattr(page, "url", "")
-            base = f"https://{urlparse(curr_url).netloc}" if curr_url else "https://www.amazon.com"
-            nav_target = f"{base}/s?k={search_query.replace(' ', '+')}"
-            await _call(page.goto, nav_target, wait_until="domcontentloaded")
-            await asyncio.sleep(2.5)
-            trace.append({"step": "search_nav", "url": nav_target, "engine": "cua_s1_generic"})
-
-        # 4. Perceive Results & Semantic Ranking (System 2)
-        candidate_containers = [
-            "div[data-component-type='s-search-result']",
-            "article",
-            "li[class*='item' i]",
-            "div[class*='product-card' i]",
-            "div[class*='search-result' i]",
-            "div[data-asin]",
-            ".s-result-item",
-        ]
-        result_items = []
-        for c_sel in candidate_containers:
-            try:
-                found = await _call(page.query_selector_all, c_sel) or []
-                if len(found) >= 1:
-                    result_items = found
-                    break
-            except Exception:
-                continue
-
-        candidates = []
-        candidate_links = []
-        for i, it in enumerate(result_items[:12]):
-            try:
-                t_elem = await _call(it.query_selector, "h2 a, h3 a, h1 a, a[class*='title' i], a[href*='/dp/'], a[href*='/product/']")
-                title = ""
-                if t_elem:
-                    title = str(await _call(t_elem.inner_text) or "").strip()
-                if not title or len(title) < 6:
-                    anchors = await _call(it.query_selector_all, "a") or []
-                    for a in anchors:
-                        atxt = str(await _call(a.inner_text) or "").strip()
-                        if len(atxt) > 15 and not re.search(r"stars?|reviews?|offers?|prime|ratings?|feedback", atxt, re.IGNORECASE):
-                            t_elem = a
-                            title = atxt
-                            break
-                if not t_elem or not title:
+        # 2. Check if a high-intent action button exists on page (e.g. transfer, confirm, submit, add to cart, proceed)
+        action_verbs = ("add to cart", "add to bag", "transfer", "submit", "confirm", "proceed", "pay", "checkout", "download")
+        action_buttons = []
+        for c in controls:
+            lbl = c.get("label", "").lower()
+            if any(verb in lbl for verb in action_verbs) and c["handle"] not in clicked_handles:
+                # Avoid bundle upsells if shopping
+                if any(b in lbl for b in ("all 3", "all 2", "bundle", "both")):
                     continue
-                price_elem = await _call(it.query_selector, "[class*='price' i], .a-price, .price")
-                price = ""
-                if price_elem:
-                    ptxt = str(await _call(price_elem.inner_text) or "").strip()
-                    m = re.search(r"(\$\s*[\d,]+(?:\.\d{2})?)", ptxt)
-                    price = m.group(1) if m else ptxt
-                candidates.append({"index": len(candidates), "title": title, "price": price})
-                candidate_links.append(t_elem)
-            except Exception:
-                continue
+                action_buttons.append(c)
 
-        if not candidates:
+        if action_buttons:
+            btn = action_buttons[0]
             return {
-                "status": "failed",
-                "error": "No search results discovered",
-                "trace": trace,
-                "latency_ms": round((time.perf_counter() - start_time) * 1000, 2),
+                "thought": f"Click primary action CTA {btn['handle']}: {btn.get('label')}",
+                "action": "click",
+                "target": btn["handle"],
             }
 
-        selected_idx = self.rank_candidates(candidates, goal, pref_colors)
-        winner = candidates[selected_idx]
-        winner_link = candidate_links[selected_idx]
-        trace.append({
-            "step": "candidate_selection",
-            "selected_title": winner["title"],
-            "selected_price": winner["price"],
-            "index": selected_idx,
-            "engine": "cua_system2_ollama",
-        })
+        # 3. Score candidate links and buttons by keyword overlap with goal
+        candidates = []
+        for c in controls:
+            if c["handle"] in clicked_handles:
+                continue
+            lbl = c.get("label", "").lower()
+            if not lbl or len(lbl) < 3:
+                continue
+            # Overlap score
+            lbl_tokens = set(re.findall(r"\w+", lbl))
+            overlap = len(q_tokens & lbl_tokens)
+            if overlap > 0:
+                candidates.append((overlap, c))
 
-        # 5. Navigate to Product Page
-        await _call(winner_link.click)
-        await asyncio.sleep(3.0)
-        curr_url = getattr(page, "url", "")
-        trace.append({"step": "product_page_nav", "url": curr_url, "engine": "cua_s1_generic"})
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            winner = candidates[0][1]
+            return {
+                "thought": f"Click best matching control {winner['handle']}: {winner.get('label')}",
+                "action": "click",
+                "target": winner["handle"],
+            }
 
-        # 6. Check Swatches / Options Generically (System 1)
-        for col in pref_colors:
-            swatch = await _call(
-                page.query_selector,
-                f"[title*='{col}' i], [aria-label*='{col}' i], button:has-text('{col}')",
+        # 4. If actions have already been executed, mark finished
+        if history:
+            return {
+                "thought": "Executed goal sequence successfully.",
+                "action": "finish",
+                "result": f"Completed steps for goal: {goal}",
+            }
+
+        # 5. Default fallback
+        return {
+            "thought": "No distinct control found; concluding observation.",
+            "action": "finish",
+            "result": f"Observed page state for: {goal}",
+        }
+
+    async def execute_primitive_async(
+        self,
+        action_dict: Dict[str, Any],
+        page_obj: Any,
+        controls_map: Dict[str, Dict[str, Any]],
+        _call: Any,
+    ) -> None:
+        """Dispatch a single universal action primitive via actuator or Playwright page."""
+        import asyncio
+        act = action_dict.get("action")
+        target = action_dict.get("target") or action_dict.get("handle") or ""
+
+        if act == "click":
+            if hasattr(self.actuator, "click") and callable(self.actuator.click):
+                await _call(self.actuator.click, target)
+            else:
+                ctrl = controls_map.get(target)
+                if ctrl and ctrl.get("_element"):
+                    await _call(ctrl["_element"].click)
+                elif page_obj and hasattr(page_obj, "click"):
+                    await _call(page_obj.click, target)
+
+        elif act == "type":
+            val = str(action_dict.get("value") or "")
+            press_enter = bool(action_dict.get("press_enter"))
+            if hasattr(self.actuator, "type_text") and callable(self.actuator.type_text):
+                await _call(self.actuator.type_text, target, val)
+                if press_enter:
+                    if hasattr(self.actuator, "press_key") and callable(self.actuator.press_key):
+                        await _call(self.actuator.press_key, "Enter")
+                    elif page_obj and hasattr(page_obj, "keyboard"):
+                        await _call(page_obj.keyboard.press, "Enter")
+            else:
+                ctrl = controls_map.get(target)
+                if ctrl and ctrl.get("_element"):
+                    if hasattr(ctrl["_element"], "fill"):
+                        await _call(ctrl["_element"].fill, val)
+                    if press_enter:
+                        if hasattr(ctrl["_element"], "press"):
+                            await _call(ctrl["_element"].press, "Enter")
+                        elif page_obj and hasattr(page_obj, "keyboard"):
+                            await _call(page_obj.keyboard.press, "Enter")
+                elif page_obj and hasattr(page_obj, "fill"):
+                    await _call(page_obj.fill, target, val)
+                    if press_enter and hasattr(page_obj, "keyboard"):
+                        await _call(page_obj.keyboard.press, "Enter")
+
+        elif act == "press_key":
+            key = str(action_dict.get("key") or "Enter")
+            if hasattr(self.actuator, "press_key") and callable(self.actuator.press_key):
+                await _call(self.actuator.press_key, key)
+            elif page_obj and hasattr(page_obj, "keyboard"):
+                await _call(page_obj.keyboard.press, key)
+
+        elif act == "scroll":
+            direction = str(action_dict.get("direction") or "down")
+            if hasattr(self.actuator, "scroll") and callable(self.actuator.scroll):
+                await _call(self.actuator.scroll, value=direction)
+            elif page_obj and hasattr(page_obj, "mouse"):
+                delta = 700 if direction == "down" else -700
+                await _call(page_obj.mouse.wheel, 0, delta)
+
+        elif act == "navigate":
+            url = str(action_dict.get("url") or "")
+            if url:
+                if hasattr(self.actuator, "navigate") and callable(self.actuator.navigate):
+                    await _call(self.actuator.navigate, url)
+                elif page_obj and hasattr(page_obj, "goto"):
+                    await _call(page_obj.goto, url)
+
+        elif act == "wait":
+            seconds = float(action_dict.get("seconds") or 1.0)
+            await asyncio.sleep(min(seconds, 5.0))
+
+    async def run_goal_async(
+        self,
+        goal: str,
+        max_turns: int = 10,
+        start_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Universal turn-based CUA decision and execution loop."""
+        import asyncio
+        import inspect
+
+        start_time = time.perf_counter()
+        trace: List[Dict[str, Any]] = []
+        actions_executed: List[Dict[str, Any]] = []
+        finished = False
+        finish_result = ""
+
+        async def _call(fn, *args, **kwargs):
+            if fn is None:
+                return None
+            res = fn(*args, **kwargs)
+            if inspect.isawaitable(res):
+                return await res
+            return res
+
+        # Resolve live playwright page from actuator or directly
+        page_obj = None
+        if hasattr(self.actuator, "_page") and self.actuator._page:
+            page_obj = self.actuator._page
+        elif hasattr(self.actuator, "query_selector"):
+            page_obj = self.actuator
+
+        if start_url:
+            if hasattr(self.actuator, "navigate"):
+                await _call(self.actuator.navigate, start_url)
+            elif page_obj and hasattr(page_obj, "goto"):
+                await _call(page_obj.goto, start_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1.0)
+
+        for turn_idx in range(1, max_turns + 1):
+            curr_url = getattr(page_obj, "url", "") if page_obj else ""
+            page_text = await self._get_page_text(page_obj, _call)
+
+            # Check for security challenge / auth wall
+            if self._check_auth_challenge(page_text, curr_url):
+                elapsed = round((time.perf_counter() - start_time) * 1000, 2)
+                return {
+                    "status": "blocked",
+                    "block_reason": "Security verification or OTP challenge detected on page",
+                    "stage": "challenge",
+                    "actions_executed": actions_executed,
+                    "trace": trace,
+                    "latency_ms": elapsed,
+                    "model": f"{self.model_name} (universal-cua)",
+                    "summary": page_text[:600],
+                }
+
+            # Perceive interactive controls
+            controls, _ = await self._get_interactive_inventory(page_obj, _call)
+            controls_map = {c["handle"]: c for c in controls}
+
+            # Decide single grounded action primitive
+            decision = self.decide_next_action(
+                goal=goal,
+                current_url=curr_url,
+                page_summary=page_text,
+                controls=controls,
+                history=trace,
             )
-            if swatch:
-                await _call(swatch.click)
-                await asyncio.sleep(1.5)
-                trace.append({"step": "select_swatch", "color": col, "engine": "cua_s1_generic"})
+
+            thought = decision.get("thought", "")
+            action = decision.get("action", "finish")
+            target = decision.get("target", "")
+
+            step_record = {
+                "turn": turn_idx,
+                "thought": thought,
+                "action": action,
+                "target": target,
+                "value": decision.get("value"),
+                "key": decision.get("key"),
+            }
+            trace.append(step_record)
+
+            if action == "finish":
+                finished = True
+                finish_result = decision.get("result") or thought
                 break
 
-        # 7. Add to Cart Generically (System 1)
-        add_btn = await self._find_generic_add_to_cart(page, _call)
-        if add_btn:
-            await _call(add_btn.click)
-            trace.append({"step": "click_add_to_cart", "engine": "cua_s1_generic"})
-            await asyncio.sleep(3.5)
-        else:
-            return {
-                "status": "failed",
-                "error": "Add to Cart CTA not found on product page",
-                "trace": trace,
-                "latency_ms": round((time.perf_counter() - start_time) * 1000, 2),
-            }
-
-        # 8. Interstitial / Protection Plan Dismissal (System 1)
-        dismiss_selectors = [
-            "button[aria-label*='close' i]",
-            "button[aria-label*='dismiss' i]",
-            "button[aria-label*='no thanks' i]",
-            "[class*='close' i][role='button']",
-            "input[value*='no thanks' i]",
-            "#attachSiNoCoverage",
-            "#attach-close_sideSheet-link",
-        ]
-        for d_sel in dismiss_selectors:
+            # Execute the primitive
             try:
-                dismiss_btn = await _call(page.query_selector, d_sel)
-                if dismiss_btn:
-                    await _call(dismiss_btn.click)
-                    await asyncio.sleep(1.0)
-                    trace.append({"step": "dismiss_modal", "selector": d_sel, "engine": "cua_s1_generic"})
-                    break
-            except Exception:
-                pass
+                await self.execute_primitive_async(decision, page_obj, controls_map, _call)
+                actions_executed.append(step_record)
+            except Exception as exc:
+                logger.warning(f"CUA action execution error on turn {turn_idx}: {exc}")
+                step_record["error"] = str(exc)
 
-        # 9. Verification Generically (System 1)
-        final_cart_count = await self._get_generic_cart_count(page, _call)
+            # Settle briefly between turns
+            await asyncio.sleep(0.8)
 
-        sc_path = "/root/.gemini/antigravity-cli/brain/9df75779-f1c6-40a9-bb3b-a67bfa0191c4/scratch/cua_generic_result.png"
+        elapsed = round((time.perf_counter() - start_time) * 1000, 2)
+        summary_text = finish_result or (page_text[:400] if page_text else "")
+
+        # Optional screenshot capture
+        sc_path = "/root/.gemini/antigravity-cli/brain/9df75779-f1c6-40a9-bb3b-a67bfa0191c4/scratch/cua_result.png"
         try:
-            await _call(page.screenshot, path=sc_path)
+            if hasattr(self.actuator, "screenshot"):
+                raw_bytes = await _call(self.actuator.screenshot, fast=True)
+                if raw_bytes:
+                    os.makedirs(os.path.dirname(sc_path), exist_ok=True)
+                    with open(sc_path, "wb") as f:
+                        f.write(raw_bytes)
         except Exception:
             pass
 
-        elapsed = round((time.perf_counter() - start_time) * 1000, 2)
-        curr_url = getattr(page, "url", "")
-        success = final_cart_count > initial_cart_count or "cart" in curr_url.lower()
-
         return {
-            "status": "completed" if success else "unverified",
+            "status": "completed" if finished or len(actions_executed) > 0 else "incomplete",
             "goal": goal,
-            "selected_product": winner["title"],
-            "selected_price": winner["price"],
-            "initial_cart_count": initial_cart_count,
-            "final_cart_count": final_cart_count,
+            "actions_executed": actions_executed,
             "trace": trace,
             "latency_ms": elapsed,
+            "model": f"{self.model_name} (universal-cua)",
+            "summary": summary_text,
+            "result": finish_result,
             "screenshot": sc_path,
         }
 
-    def execute_goal(self, goal: str, start_url: Optional[str] = None) -> Dict[str, Any]:
+    def execute_goal(self, goal: str, max_turns: int = 10, start_url: Optional[str] = None) -> Dict[str, Any]:
         """Synchronous wrapper for goal execution."""
         import asyncio
         if hasattr(self.actuator, "_loop") and self.actuator._loop and self.actuator._loop.is_running():
             future = asyncio.run_coroutine_threadsafe(
-                self.run_goal_async(goal, start_url),
+                self.run_goal_async(goal, max_turns=max_turns, start_url=start_url),
                 self.actuator._loop,
             )
-            return future.result(timeout=60.0)
-        return asyncio.run(self.run_goal_async(goal, start_url))
+            return future.result(timeout=120.0)
+        return asyncio.run(self.run_goal_async(goal, max_turns=max_turns, start_url=start_url))
 

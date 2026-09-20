@@ -1363,6 +1363,19 @@ class BrowserlessActuator(Actuator):
 
         self._loop.run_until_complete(_type())
 
+    def press_key(self, key: str = "Enter") -> None:
+        """Send keyboard key press event to the active page."""
+        self._ensure()
+        self._assert_on_scope()
+
+        async def _press():
+            if self._page is None or self._page.is_closed():
+                return
+            await self._page.keyboard.press(key)
+            await self._wait_for_settle()
+
+        self._loop.run_until_complete(_press())
+
     def screenshot(self, fast: bool = False) -> bytes:
         self._ensure()
         self._assert_on_scope()
@@ -2514,8 +2527,10 @@ def agentic_browser_step(
             actuator.type_text(selector, value)
         elif action == "scroll":
             actuator.scroll(value=value, selector=selector)
+        elif action in {"press_key", "key"}:
+            actuator.press_key(key=str(value or selector or "Enter"))
         else:
-            raise ValueError("action must be observe, screenshot, navigate, click, type, scroll, or auto")
+            raise ValueError("action must be observe, screenshot, navigate, click, type, press_key, scroll, or auto")
         debug_shots = os.getenv("CONCIERGE_DEBUG_SCREENSHOTS", "0").lower() in {
             "1", "true", "yes", "on"
         }
