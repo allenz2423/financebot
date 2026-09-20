@@ -704,44 +704,181 @@ class CUAAgent:
             await _call(page.goto, start_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(1.5)
 
-        # 2. Check initial cart state (System 1)
-        initial_cart_count = 0
-        try:
-            cart_elem = await _call(page.query_selector, "#nav-cart-count, .nav-cart-count")
-            if cart_elem:
-                cnt_txt = await _call(cart_elem.inner_text)
-                initial_cart_count = int(str(cnt_txt or "").strip() or "0")
-        except Exception:
-            initial_cart_count = 0
+    async def _find_generic_search_input(self, page, _call):
+        """Find search input using universal HTML5 and ARIA standards."""
+        selectors = [
+            "input[type='search']",
+            "[role='searchbox']",
+            "form[role='search'] input:not([type='hidden'])",
+            "input[aria-label*='search' i]",
+            "input[placeholder*='search' i]",
+            "input[placeholder*='find' i]",
+            "input[name*='search' i]",
+            "input[name='q']",
+            "input[name='query']",
+            "input[name*='keyword' i]",
+            "input[id*='search' i]:not([type='hidden'])",
+        ]
+        for sel in selectors:
+            try:
+                elem = await _call(page.query_selector, sel)
+                if elem:
+                    return elem
+            except Exception:
+                continue
+        return None
 
-        # 3. Search Execution (System 1)
-        search_sel = "#twotabsearchtextbox, input[name='field-keywords'], input[type='search']"
-        search_input = await _call(page.query_selector, search_sel)
+    async def _get_generic_cart_count(self, page, _call) -> int:
+        """Read cart item count from standard store navigation."""
+        selectors = [
+            "a[href*='/cart' i]",
+            "a[href*='/basket' i]",
+            "a[href*='/bag' i]",
+            "[aria-label*='cart' i]",
+            "[aria-label*='basket' i]",
+            "[id*='cart' i]",
+            "[class*='cart' i]",
+        ]
+        for sel in selectors:
+            try:
+                elems = await _call(page.query_selector_all, sel) or []
+                for el in elems[:5]:
+                    txt = str(await _call(el.inner_text) or "").strip()
+                    m_txt = re.search(r"\b(\d{1,4})\b", txt)
+                    if m_txt:
+                        return int(m_txt.group(1))
+                    aria = str(await _call(el.get_attribute, "aria-label") or "").strip()
+                    m_aria = re.search(r"\b(\d{1,4})\b", aria)
+                    if m_aria:
+                        return int(m_aria.group(1))
+            except Exception:
+                continue
+        return 0
+
+    async def _find_generic_add_to_cart(self, page, _call):
+        """Locate primary Add to Cart CTA across any e-commerce storefront."""
+        buttons = await _call(page.query_selector_all, "button, input[type='submit'], [role='button'], a.btn") or []
+        for btn in buttons:
+            try:
+                text = str(await _call(btn.inner_text) or "").strip().lower()
+                val = str(await _call(btn.get_attribute, "value") or "").strip().lower()
+                label = str(await _call(btn.get_attribute, "aria-label") or "").strip().lower()
+                btn_id = str(await _call(btn.get_attribute, "id") or "").strip().lower()
+                name = str(await _call(btn.get_attribute, "name") or "").strip().lower()
+                combined = f"{text} {val} {label} {btn_id} {name}"
+                if any(phrase in combined for phrase in ("add to cart", "add to bag", "add to basket", "buy now")):
+                    return btn
+            except Exception:
+                continue
+        return None
+
+    async def run_goal_async(self, goal: str, start_url: Optional[str] = None) -> Dict[str, Any]:
+        """Execute autonomous computer-use workflow using universal web semantics."""
+        import asyncio
+        import inspect
+        start_time = time.perf_counter()
+        trace = []
+
+        async def _call(fn, *args, **kwargs):
+            if fn is None:
+                return None
+            res = fn(*args, **kwargs)
+            if inspect.isawaitable(res):
+                return await res
+            return res
+
+        # Resolve live playwright page from actuator or directly
+        page = None
+        if hasattr(self.actuator, "goto") or hasattr(self.actuator, "query_selector"):
+            page = self.actuator
+        elif hasattr(self.actuator, "_page") and self.actuator._page:
+            page = self.actuator._page
+        else:
+            raise ValueError("CUAAgent requires a CDP actuator or Playwright Page")
+
+        # 1. Parse Goal (System 2)
+        parsed = self.parse_goal(goal)
+        search_query = parsed.get("search_query", "rotring 600 mint")
+        pref_colors = parsed.get("preferred_colors", ["mint", "blue"])
+        trace.append({
+            "step": "goal_synthesis",
+            "search_query": search_query,
+            "preferred_colors": pref_colors,
+            "engine": "ollama_system2",
+        })
+
+        if start_url:
+            await _call(page.goto, start_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(1.5)
+
+        # 2. Check initial cart state generically (System 1)
+        initial_cart_count = await self._get_generic_cart_count(page, _call)
+
+        # 3. Generic Search Execution (System 1)
+        search_input = await self._find_generic_search_input(page, _call)
         if search_input:
             await _call(search_input.fill, search_query)
-            trace.append({"step": "search_fill", "query": search_query, "engine": "cua_s1"})
+            trace.append({"step": "search_fill", "query": search_query, "engine": "cua_s1_generic"})
             await _call(search_input.press, "Enter")
             await asyncio.sleep(2.5)
-            trace.append({"step": "search_submit", "engine": "cua_s1"})
+            trace.append({"step": "search_submit", "engine": "cua_s1_generic"})
         else:
-            nav_target = f"https://www.amazon.com/s?k={search_query.replace(' ', '+')}"
+            # Fallback to query URL if no input found
+            curr_url = getattr(page, "url", "")
+            base = f"https://{urlparse(curr_url).netloc}" if curr_url else "https://www.amazon.com"
+            nav_target = f"{base}/s?k={search_query.replace(' ', '+')}"
             await _call(page.goto, nav_target, wait_until="domcontentloaded")
             await asyncio.sleep(2.5)
-            trace.append({"step": "search_nav", "url": nav_target, "engine": "cua_s1"})
+            trace.append({"step": "search_nav", "url": nav_target, "engine": "cua_s1_generic"})
 
         # 4. Perceive Results & Semantic Ranking (System 2)
-        result_items = await _call(page.query_selector_all, "div[data-component-type='s-search-result']") or []
+        candidate_containers = [
+            "div[data-component-type='s-search-result']",
+            "article",
+            "li[class*='item' i]",
+            "div[class*='product-card' i]",
+            "div[class*='search-result' i]",
+            "div[data-asin]",
+            ".s-result-item",
+        ]
+        result_items = []
+        for c_sel in candidate_containers:
+            try:
+                found = await _call(page.query_selector_all, c_sel) or []
+                if len(found) >= 1:
+                    result_items = found
+                    break
+            except Exception:
+                continue
+
         candidates = []
         candidate_links = []
-        for i, it in enumerate(result_items[:8]):
-            t_elem = await _call(it.query_selector, "h2 a, .a-link-normal")
-            if not t_elem:
+        for i, it in enumerate(result_items[:12]):
+            try:
+                t_elem = await _call(it.query_selector, "h2 a, h3 a, h1 a, a[class*='title' i], a[href*='/dp/'], a[href*='/product/']")
+                title = ""
+                if t_elem:
+                    title = str(await _call(t_elem.inner_text) or "").strip()
+                if not title or len(title) < 6:
+                    anchors = await _call(it.query_selector_all, "a") or []
+                    for a in anchors:
+                        atxt = str(await _call(a.inner_text) or "").strip()
+                        if len(atxt) > 15 and not re.search(r"stars?|reviews?|offers?|prime|ratings?|feedback", atxt, re.IGNORECASE):
+                            t_elem = a
+                            title = atxt
+                            break
+                if not t_elem or not title:
+                    continue
+                price_elem = await _call(it.query_selector, "[class*='price' i], .a-price, .price")
+                price = ""
+                if price_elem:
+                    ptxt = str(await _call(price_elem.inner_text) or "").strip()
+                    m = re.search(r"(\$\s*[\d,]+(?:\.\d{2})?)", ptxt)
+                    price = m.group(1) if m else ptxt
+                candidates.append({"index": len(candidates), "title": title, "price": price})
+                candidate_links.append(t_elem)
+            except Exception:
                 continue
-            title = str(await _call(t_elem.inner_text) or "").strip()
-            price_elem = await _call(it.query_selector, ".a-price .a-offscreen, .a-price-whole")
-            price = str(await _call(price_elem.inner_text) or "").strip() if price_elem else ""
-            candidates.append({"index": len(candidates), "title": title, "price": price})
-            candidate_links.append(t_elem)
 
         if not candidates:
             return {
@@ -766,61 +903,59 @@ class CUAAgent:
         await _call(winner_link.click)
         await asyncio.sleep(3.0)
         curr_url = getattr(page, "url", "")
-        trace.append({"step": "product_page_nav", "url": curr_url, "engine": "cua_s1"})
+        trace.append({"step": "product_page_nav", "url": curr_url, "engine": "cua_s1_generic"})
 
-        # 6. Check Swatches / Options (System 1)
+        # 6. Check Swatches / Options Generically (System 1)
         for col in pref_colors:
             swatch = await _call(
                 page.query_selector,
-                f"li[title*='{col}' i] button, button[aria-label*='{col}' i], li[data-defaultasin][title*='{col}' i]",
+                f"[title*='{col}' i], [aria-label*='{col}' i], button:has-text('{col}')",
             )
             if swatch:
                 await _call(swatch.click)
                 await asyncio.sleep(1.5)
-                trace.append({"step": "select_swatch", "color": col, "engine": "cua_s1"})
+                trace.append({"step": "select_swatch", "color": col, "engine": "cua_s1_generic"})
                 break
 
-        # 7. Add to Cart (System 1)
-        add_btn = await _call(
-            page.query_selector,
-            "#add-to-cart-button, input[name='submit.add-to-cart'], input#add-to-cart-button",
-        )
+        # 7. Add to Cart Generically (System 1)
+        add_btn = await self._find_generic_add_to_cart(page, _call)
         if add_btn:
             await _call(add_btn.click)
-            trace.append({"step": "click_add_to_cart", "engine": "cua_s1"})
+            trace.append({"step": "click_add_to_cart", "engine": "cua_s1_generic"})
             await asyncio.sleep(3.5)
         else:
             return {
                 "status": "failed",
-                "error": "Add to Cart button not found on product page",
+                "error": "Add to Cart CTA not found on product page",
                 "trace": trace,
                 "latency_ms": round((time.perf_counter() - start_time) * 1000, 2),
             }
 
         # 8. Interstitial / Protection Plan Dismissal (System 1)
-        try:
-            dismiss_btn = await _call(
-                page.query_selector,
-                "input[aria-labelledby*='attachSiNoCoverage'], #attachSiNoCoverage, #attach-close_sideSheet-link, button[data-action='a-popover-close']",
-            )
-            if dismiss_btn:
-                await _call(dismiss_btn.click)
-                await asyncio.sleep(1.5)
-                trace.append({"step": "dismiss_protection_modal", "engine": "cua_s1"})
-        except Exception:
-            pass
+        dismiss_selectors = [
+            "button[aria-label*='close' i]",
+            "button[aria-label*='dismiss' i]",
+            "button[aria-label*='no thanks' i]",
+            "[class*='close' i][role='button']",
+            "input[value*='no thanks' i]",
+            "#attachSiNoCoverage",
+            "#attach-close_sideSheet-link",
+        ]
+        for d_sel in dismiss_selectors:
+            try:
+                dismiss_btn = await _call(page.query_selector, d_sel)
+                if dismiss_btn:
+                    await _call(dismiss_btn.click)
+                    await asyncio.sleep(1.0)
+                    trace.append({"step": "dismiss_modal", "selector": d_sel, "engine": "cua_s1_generic"})
+                    break
+            except Exception:
+                pass
 
-        # 9. Verification (System 1)
-        final_cart_count = initial_cart_count
-        try:
-            cart_elem = await _call(page.query_selector, "#nav-cart-count, .nav-cart-count")
-            if cart_elem:
-                cnt_txt = await _call(cart_elem.inner_text)
-                final_cart_count = int(str(cnt_txt or "").strip() or "0")
-        except Exception:
-            pass
+        # 9. Verification Generically (System 1)
+        final_cart_count = await self._get_generic_cart_count(page, _call)
 
-        sc_path = "/root/.gemini/antigravity-cli/brain/9df75779-f1c6-40a9-bb3b-a67bfa0191c4/scratch/cua_cart_result.png"
+        sc_path = "/root/.gemini/antigravity-cli/brain/9df75779-f1c6-40a9-bb3b-a67bfa0191c4/scratch/cua_generic_result.png"
         try:
             await _call(page.screenshot, path=sc_path)
         except Exception:

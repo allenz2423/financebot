@@ -314,18 +314,25 @@ async def test_cua_agent_shopping_flow():
 
     # Mock add to cart button
     mock_add_btn = AsyncMock()
+    mock_add_btn.inner_text = AsyncMock(return_value="Add to Cart")
+    mock_add_btn.get_attribute = AsyncMock(return_value="")
     
     # Mock cart count element (increments from 1 to 2)
     mock_cart_elem = AsyncMock()
     cart_counts = ["1", "2"]
     mock_cart_elem.inner_text = AsyncMock(side_effect=lambda: cart_counts.pop(0) if cart_counts else "2")
+    mock_cart_elem.get_attribute = AsyncMock(return_value="")
 
     mock_page.query_selector = AsyncMock(side_effect=lambda sel: (
         mock_search_input if ("twotabsearchtextbox" in sel or "search" in sel)
-        else (mock_add_btn if "add-to-cart-button" in sel
-        else (mock_cart_elem if "nav-cart-count" in sel else None))
+        else (mock_add_btn if "add-to-cart" in sel
+        else (mock_cart_elem if "cart" in sel else None))
     ))
-    mock_page.query_selector_all = AsyncMock(return_value=[mock_result_item])
+    mock_page.query_selector_all = AsyncMock(side_effect=lambda sel: (
+        [mock_add_btn] if "button" in sel
+        else ([mock_cart_elem] if "cart" in sel or "basket" in sel
+        else [mock_result_item])
+    ))
     mock_page.goto = AsyncMock()
     mock_page.screenshot = AsyncMock()
 
