@@ -1056,11 +1056,23 @@ class CUAAgent:
     def execute_goal(self, goal: str, max_turns: int = 10, start_url: Optional[str] = None) -> Dict[str, Any]:
         """Synchronous wrapper for goal execution."""
         import asyncio
-        if hasattr(self.actuator, "_loop") and self.actuator._loop and self.actuator._loop.is_running():
+        loop = getattr(self.actuator, "_loop", None)
+        if loop is not None and isinstance(loop, asyncio.AbstractEventLoop) and loop.is_running():
             future = asyncio.run_coroutine_threadsafe(
                 self.run_goal_async(goal, max_turns=max_turns, start_url=start_url),
-                self.actuator._loop,
+                loop,
             )
             return future.result(timeout=120.0)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop and running_loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(
+                    asyncio.run,
+                    self.run_goal_async(goal, max_turns=max_turns, start_url=start_url),
+                ).result(timeout=120.0)
         return asyncio.run(self.run_goal_async(goal, max_turns=max_turns, start_url=start_url))
 

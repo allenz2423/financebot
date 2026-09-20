@@ -1982,16 +1982,35 @@ class ActionApprovalView(discord.ui.View):
             if proposal.get("kind") == "fill_form" and mission:
                 try:
                     from src.services.llm import chat_with_delilah
+                    cua_status = res.get("cua_result", {}).get("status") if isinstance(res, dict) else None
+                    if cua_status == "completed":
+                        prompt_text = (
+                            f"The approved browser mission ('{proposal.get('summary') or 'browser task'}') "
+                            f"was executed and COMPLETED by the autonomous Computer-Use Agent (CUA). "
+                            f"Outcome: {res.get('cua_result', {}).get('result') or res.get('summary')}. "
+                            "Briefly report the successful completion to the user. No further browser actions are needed."
+                        )
+                    elif cua_status == "blocked" or (isinstance(res, dict) and res.get("blocked")):
+                        prompt_text = (
+                            f"The approved browser mission ('{proposal.get('summary') or 'browser task'}') "
+                            f"is currently BLOCKED by an authentication or verification challenge: "
+                            f"{res.get('cua_result', {}).get('block_reason') or res.get('block_reason') or 'Security verification required'}. "
+                            "Step in now to ask the user for their verification/OTP code or advise them to complete the prompt in their browser."
+                        )
+                    else:
+                        prompt_text = (
+                            f"Permission was granted for the approved browser mission: '{proposal.get('summary') or 'browser task'}'. "
+                            "The autonomous Computer-Use Agent (CUA) takes the lead on navigating and executing the mission. "
+                            "Call concierge_browser_step with the active mission_id and action='auto' so CUA drives "
+                            "the page autonomously. The model only steps in when CUA reports a 2FA/OTP challenge, "
+                            "requires user input, or reports completion so you can summarize the result."
+                        )
+
                     continuation = await interaction.channel.send(
-                        "🔎 Permission granted. Inspecting the live page and continuing the approved browser mission…"
+                        "🔎 Permission granted. CUA is taking the lead on navigating and continuing the approved browser mission…"
                     )
                     continuation_task = asyncio.create_task(chat_with_delilah(
-                        "Permission was granted for the approved browser mission. "
-                        "Use concierge_browser_step with the active mission_id to observe the current page, "
-                        "then take exactly one appropriate next action at a time. Do not guess selectors; "
-                        "inspect after every action. If the page has no sign-in or credential field, do NOT "
-                        "click unrelated controls: navigate to the site's sign-in page (e.g. /signin or "
-                        "/login) first. Stop and report if the page shows a challenge or failure.",
+                        prompt_text,
                         self.owner_uid,
                         continuation,
                         required_tools={"concierge_browser_step"},
@@ -2292,7 +2311,7 @@ def execute_approved_act(
             audit.append(
                 actor=tenant, action="login_entry", tenant=tenant,
                 subject=login_domain,
-                detail={"proposal_id": proposal_id, "result": res["login_entry"]},
+                detail={"proposal_id": proposal_id, "result": str(res["login_entry"])},
             )
             # Opportunistic System 1 autonomous form filling pass (CUA-S1 + Jev)
             if os.getenv("CONCIERGE_ENABLE_SYSTEM1", "1").lower() in {"1", "true", "yes", "on"}:
@@ -2310,6 +2329,41 @@ def execute_approved_act(
                             )
                 except Exception as exc:  # noqa: BLE001
                     print(f" [CONCIERGE SYSTEM1] auto-pilot execution note: {exc}", flush=True)
+            # CUA takes the lead on navigating and executing the approved mission goal
+            if os.getenv("CONCIERGE_ENABLE_CUA", "1").lower() in {"1", "true", "yes", "on"}:
+                goal = proposal.get("summary") or (proposal.get("args") or {}).get("summary") or ""
+                if goal and not any(k in goal.lower() for k in ("login only", "just sign in", "auth only")):
+                    try:
+                        from src.services.concierge.system1_agent import CUAAgent
+                        cua = CUAAgent(
+                            cdp_actuator=actuator,
+                            tenant=tenant,
+                            domain=str(login_domain),
+                            vault=vault,
+                        )
+                        cua_res = cua.execute_goal(goal, max_turns=8)
+                        res["cua_result"] = cua_res
+                        if cua_res.get("actions_executed"):
+                            audit.append(
+                                actor=tenant, action="act_cua_auto", tenant=tenant,
+                                subject=proposal["kind"],
+                                detail={"actions": cua_res["actions_executed"], "latency_ms": cua_res.get("latency_ms")},
+                            )
+                        if cua_res.get("status") == "completed":
+                            res["status"] = "ok"
+                            res["summary"] = cua_res.get("summary") or cua_res.get("result") or res.get("summary")
+                        elif cua_res.get("status") == "blocked":
+                            res["blocked"] = True
+                            res["block_reason"] = cua_res.get("block_reason")
+                        if cua_res.get("screenshot") and os.path.exists(cua_res["screenshot"]):
+                            try:
+                                with open(cua_res["screenshot"], "rb") as sf:
+                                    res["screenshot_png"] = sf.read()
+                            except Exception:
+                                pass
+                    except Exception as exc:  # noqa: BLE001
+                        print(f" [CONCIERGE CUA] execution error: {exc}", flush=True)
+
         verification = asyncio.run(verify(
             proposal["url"], proposal["steps"],
             page_text=res.get("summary", "") or "",
@@ -2320,6 +2374,8 @@ def execute_approved_act(
             len(execution_args.get("steps") or []) == 1
             and execution_args["steps"][0].get("action") == "screenshot"
         )
+        if res.get("cua_result", {}).get("status") == "completed":
+            marker_only = False
         execution_phase = "started" if marker_only else "completed"
         audit.append(
             actor=tenant, action="act_" + outcome, tenant=tenant,
@@ -2464,7 +2520,13 @@ def agentic_browser_step(
         elif action == "auto":
             from src.services.concierge.system1_agent import CUAAgent, System1FormAgent
             goal = str(value or "").strip()
-            if goal and not any(k in goal.lower() for k in ("login", "sign in", "auth")):
+            if not goal:
+                orig_id = missions[0].get("origin_proposal_id")
+                if orig_id:
+                    orig_prop = store.get(orig_id)
+                    if orig_prop:
+                        goal = orig_prop.get("summary") or (orig_prop.get("args") or {}).get("summary") or ""
+            if goal and not any(k in goal.lower() for k in ("login only", "sign in only", "auth only")):
                 cua = CUAAgent(
                     cdp_actuator=actuator,
                     tenant=tenant,
@@ -2560,11 +2622,10 @@ def agentic_browser_step(
             if controls:
                 summary = (
                     f"{controls}\n\n[PAGE TEXT]\n{text}\n\n"
-                    "[BROWSER PROGRESS] The page has already been observed. Choose one "
-                    "control by its id (eN) and call click or type with "
-                    "selector=\"eN\"; observing the same page again without an action is "
-                    "not progress. For a credential field, use type with an empty value so "
-                    "the executor can resolve the stored credential for this allowed domain."
+                    "[CUA NAVIGATION] Computer-Use Agent (CUA) takes the lead on navigating and executing the goal. "
+                    "Call concierge_browser_step with action=\"auto\" to let CUA autonomously navigate and achieve the goal. "
+                    "The model steps in when CUA reports a 2FA/OTP challenge, requires user input, or finishes. "
+                    "If manual interaction is required (e.g. entering an SMS verification code), call click or type with selector=\"eN\"."
                 )[:6000]
             else:
                 summary = text
@@ -2582,12 +2643,15 @@ def agentic_browser_step(
         summary, challenge_urls = _sample_observation()
         if s1_result:
             s1_report = (
+                f"[CUA AUTONOMOUS EXECUTION RESULT]\n"
                 f"[SYSTEM 1 AUTONOMOUS FORM RESULT]\n"
                 f"Status: {s1_result.get('status')}\n"
                 f"Model: {s1_result.get('model')}\n"
                 f"Latency: {s1_result.get('latency_ms')}ms\n"
                 f"Actions Executed: {json.dumps(s1_result.get('actions_executed', []))}\n"
             )
+            if s1_result.get("result"):
+                s1_report += f"Result: {s1_result.get('result')}\n"
             if s1_result.get("block_reason"):
                 s1_report += f"Block Reason: {s1_result.get('block_reason')}\n"
             summary = s1_report + "\n" + summary

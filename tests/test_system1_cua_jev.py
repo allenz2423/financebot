@@ -341,8 +341,9 @@ async def test_cua_agent_shopping_turn_loop():
     assert "rotring 600" in parsed["search_query"]
     assert "mint" in parsed["preferred_colors"]
 
-    # Test autonomous turn loop
-    res = await cua.run_goal_async("add a rotring 600 in a nice blue adjacent color preferably mint to my cart", max_turns=5)
+    # Test autonomous turn loop with deterministic fallback
+    with patch.object(CUAAgent, "_call_ollama", return_value=None):
+        res = await cua.run_goal_async("add a rotring 600 in a nice blue adjacent color preferably mint to my cart", max_turns=5)
     assert res["status"] == "completed"
     assert len(res["actions_executed"]) >= 2
     assert any(a["action"] == "type" for a in res["actions_executed"])
@@ -376,7 +377,8 @@ async def test_cua_agent_banking_turn_loop():
     mock_actuator.screenshot.return_value = None
 
     cua = CUAAgent(cdp_actuator=mock_actuator)
-    res = await cua.run_goal_async("Transfer Money", max_turns=3)
+    with patch.object(CUAAgent, "_call_ollama", return_value=None):
+        res = await cua.run_goal_async("Transfer Money", max_turns=3)
     assert res["status"] == "completed"
     assert any(a["action"] == "click" and a["target"] == "e2" for a in res["actions_executed"])
 
@@ -400,6 +402,125 @@ async def test_cua_agent_challenge_blocking():
     assert res["stage"] == "challenge"
     assert "challenge" in res["block_reason"].lower() or "verification" in res["block_reason"].lower()
     assert len(res["actions_executed"]) == 0
+
+
+def test_agentic_browser_step_auto_resolves_origin_goal():
+    """Verify action=auto automatically retrieves the mission's goal from the origin proposal."""
+    from src.bot.approval_views import AGENTIC_BROWSER_SESSIONS, agentic_browser_step
+
+    mock_actuator = MagicMock()
+    mock_actuator.interactive_summary.return_value = "e1: [button] 'Transfer Money'"
+    mock_actuator.get_text.return_value = "Capital One Dashboard"
+    mock_actuator.page_stage.return_value = "page"
+    mock_actuator._handles = {
+        "e1": {"handle": "e1", "tag": "button", "type": "button", "label": "Transfer Money"},
+    }
+    mock_actuator.screenshot.return_value = None
+    mock_actuator.storage_state.return_value = b'{"cookies": []}'
+    mock_actuator.operation_lock = MagicMock()
+    mock_actuator.operation_lock.__enter__ = MagicMock()
+    mock_actuator.operation_lock.__exit__ = MagicMock()
+
+    mission_id = "test-mission-cua-auto"
+    AGENTIC_BROWSER_SESSIONS[mission_id] = mock_actuator
+
+    mock_mission = {
+        "mission_id": mission_id,
+        "tenant": "user:202",
+        "domain": "capitalone.com",
+        "url": "https://capitalone.com/dashboard",
+        "kind": "fill_form",
+        "origin_proposal_id": "prop_xyz789",
+        "state_vault_ref": None,
+    }
+    mock_proposal = {
+        "proposal_id": "prop_xyz789",
+        "summary": "Transfer Money",
+        "domain": "capitalone.com",
+    }
+
+    with patch("src.bot.approval_views.ApprovalStore") as MockStore, \
+         patch("src.bot.approval_views.Vault") as MockVault, \
+         patch("src.services.concierge.system1_agent.CUAAgent._call_ollama", return_value=None):
+        store_inst = MockStore.return_value
+        store_inst.active_missions_for_tenant.return_value = [mock_mission]
+        store_inst.get.return_value = mock_proposal
+
+        vault_inst = MockVault.return_value
+        vault_inst.list_records.return_value = []
+        vault_inst.store_browser_state.return_value = {"vault_ref": "st_888"}
+
+        res = agentic_browser_step(
+            tenant="user:202",
+            mission_id=mission_id,
+            action="auto",
+        )
+
+        assert res["mission_id"] == mission_id
+        assert res["action"] == "auto"
+        assert "s1_result" in res
+        assert res["s1_result"]["status"] == "completed"
+        assert "[CUA AUTONOMOUS EXECUTION RESULT]" in res["summary"]
+
+
+def test_execute_approved_act_cua_takes_lead():
+    """Verify execute_approved_act runs CUA autonomously when proposal is approved."""
+    from src.bot.approval_views import execute_approved_act
+
+    mock_actuator = MagicMock()
+    mock_actuator._handles = {
+        "e1": {"handle": "e1", "tag": "button", "type": "submit", "label": "Add to Cart"},
+    }
+    mock_actuator.interactive_summary.return_value = "e1: [button:submit] 'Add to Cart'"
+    mock_actuator.get_text.return_value = "Rotring 600 in stock"
+    mock_actuator.storage_state.return_value = b'{"cookies": []}'
+    mock_actuator.screenshot.return_value = None
+
+    def fake_factory(url, allowed):
+        return mock_actuator
+
+    mock_proposal = {
+        "proposal_id": "prop_cua_lead",
+        "tenant": "user:303",
+        "uid": "303",
+        "kind": "fill_form",
+        "url": "https://www.amazon.com/dp/B08X",
+        "domain": "amazon.com",
+        "allowed_domains": ["amazon.com"],
+        "summary": "Add to Cart",
+        "args": {"steps": [{"action": "screenshot"}], "domain": "amazon.com"},
+        "steps": [{"action": "screenshot"}],
+    }
+
+    with patch("src.bot.approval_views.ApprovalStore") as MockStore, \
+         patch("src.bot.approval_views.Vault") as MockVault, \
+         patch("src.bot.approval_views.verify_act") as MockVerify, \
+         patch("src.services.concierge.system1_agent.CUAAgent._call_ollama", return_value=None):
+        store_inst = MockStore.return_value
+        store_inst.claim.return_value = True
+        store_inst.get.return_value = mock_proposal
+        store_inst.grant_mission.return_value = {
+            "mission_id": "miss_cua_lead",
+            "domain": "amazon.com",
+            "url": "https://www.amazon.com/dp/B08X",
+            "state_vault_ref": None,
+        }
+
+        MockVerify.return_value = {"verdict": "success", "confidence": 0.99}
+
+        res = execute_approved_act(
+            proposal_id="prop_cua_lead",
+            tenant="user:303",
+            store=store_inst,
+            vault=MockVault.return_value,
+            actuator_factory=fake_factory,
+        )
+
+        assert res.get("ok") is True, f"execute_approved_act failed: {res}"
+        assert "cua_result" in res["res"]
+        assert res["res"]["cua_result"]["status"] == "completed"
+        assert res["execution_phase"] == "completed"
+
 
 
 

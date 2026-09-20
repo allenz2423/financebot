@@ -1251,12 +1251,12 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "concierge_browser_step",
-            "description": "Continue an already-approved concierge browser mission one observed step at a time or autonomously. Call with action=auto to execute autonomous System 1 form completion (CUA-S1-FORMS + Jev) which maps credentials to fields, fills forms, and submits in a single sub-second pass without token round trips. Alternatively, call with action=observe, then choose exactly one next click/type/navigate/scroll from the returned page summary; do not observe the same page repeatedly without acting. An observe result has two parts: [INTERACTIVE ELEMENTS] lists every button, link, input, textarea, select, and form the bot can act on, each with a stable id (e1, e2, …) and its owning [FORM]; and [PAGE TEXT] is the readable page text. Act by that id — pass the id (e.g. 'e3') as selector for click/type — instead of inventing a CSS selector; do not guess the order of a form's fields. Use scroll with value='up', 'down', 'top', 'bottom', or a pixel distance; optionally provide selector (an id) to bring a known element into view. For a visible credential field, call type with an empty value so the executor resolves the stored credential for the already-visited allowed domain; never request or echo raw secrets. Do not request or send screenshots during normal work. Use action=screenshot only when the user explicitly asks to see the current page; that screenshot is posted to the user in Discord. This is the preferred tool for login and web tasks after the user approves. Never guess a multi-step selector plan. If a page exposes no sign-in or credential field (a marketing homepage, or a page with only a cookie banner and navigation links), do NOT click unrelated controls — navigate to the site's sign-in page first (commonly https://<host>/signin or /login). Only the current user's active approved mission may be used; a denied or expired permission stops the mission. A past mission's recorded outcome is never proof the user is signed in now: when the user asks to log in, or asks whether they are already logged in, call observe and act on the live page instead of answering from concierge_act_status.",
+            "description": "Drive an approved concierge browser mission. CUA TAKES THE LEAD: call with action='auto' (optionally passing the user goal in 'value') to let the Computer-Use Agent autonomously navigate, search, select, and advance the mission across multiple steps without single-click round trips. The model steps in when CUA is blocked by 2FA/OTP/CAPTCHA, requires specific user input (such as entering an SMS verification code), or finishes. Manual actions (click, type, navigate, scroll, press_key) are used when the model steps in to provide user values. action='observe' inspects the live page. action='screenshot' is only used when the user explicitly asks to see the current page in Discord.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "mission_id": {"type": "string", "description": "The ACTIVE mission id (from the ACTIVE AUTO-PILOT MISSIONS context or the active_missions list returned by concierge_act_status). It is NOT a proposal_id: a proposal_id from concierge_act_status will not resolve to a mission."},
-                    "action": {"type": "string", "enum": ["observe", "screenshot", "click", "type", "navigate", "scroll", "auto"]},
+                    "action": {"type": "string", "enum": ["observe", "screenshot", "click", "type", "navigate", "scroll", "press_key", "auto"]},
                     "selector": {"type": "string", "description": "The observed element id (e.g. 'e3') for click/type/scroll, taken from [INTERACTIVE ELEMENTS] of the latest observe. A raw CSS selector also works but is unnecessary; prefer the id."},
                     "value": {"type": "string"},
                     "vault_ref": {"type": "string"},
@@ -3870,11 +3870,12 @@ _BROWSER_ACTION_NUDGE = (
     "narrated steps you did not take. Do not describe actions you did not "
     "perform. Emit the real tool call now: if an active mission already covers "
     "the site, call `concierge_browser_step` with that `mission_id` and "
-    "action=\"observe\"; otherwise call `request_concierge_action` with "
-    "kind=\"fill_form\" and args={\"domain\": \"<the site>\"} — that creates the "
+    "action=\"auto\" so CUA takes the lead on navigating and executing the goal; "
+    "otherwise call `request_concierge_action` with kind=\"fill_form\" and "
+    "args={\"domain\": \"<the site>\", \"summary\": \"<user goal>\"} — that creates the "
     "approval the user clicks ✅ on, and approval grants the mission. A session "
     "already open on another site does NOT block a new one: each domain simply "
-    "needs its own approval. Then act one observed step at a time."
+    "needs its own approval."
 )
 
 # Saved-file work is also an action, even though it is not a browser action.
@@ -7748,7 +7749,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             # can be expected to change the page. Remember it so
                             # a read-only turn is never mistaken for a stalled one.
                             if str(args.get("action") or "observe").lower() in {
-                                "navigate", "click", "type", "scroll"
+                                "navigate", "click", "type", "scroll", "press_key", "auto"
                             }:
                                 browser_mutation_this_turn = True
                             # Only a repeated *observation* of an unchanged page
