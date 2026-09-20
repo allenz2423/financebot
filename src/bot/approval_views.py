@@ -2449,14 +2449,24 @@ def agentic_browser_step(
         if action in {"observe", "screenshot"}:
             pass
         elif action == "auto":
-            from src.services.concierge.system1_agent import System1FormAgent
-            s1_agent = System1FormAgent(
-                cdp_actuator=actuator,
-                tenant=tenant,
-                domain=missions[0]["domain"],
-                vault=Vault(_DB),
-            )
-            s1_result = s1_agent.run_autonomous_step()
+            from src.services.concierge.system1_agent import CUAAgent, System1FormAgent
+            goal = str(value or "").strip()
+            if goal and not any(k in goal.lower() for k in ("login", "sign in", "auth")):
+                cua = CUAAgent(
+                    cdp_actuator=actuator,
+                    tenant=tenant,
+                    domain=missions[0]["domain"],
+                    vault=Vault(_DB),
+                )
+                s1_result = cua.execute_goal(goal)
+            else:
+                s1_agent = System1FormAgent(
+                    cdp_actuator=actuator,
+                    tenant=tenant,
+                    domain=missions[0]["domain"],
+                    vault=Vault(_DB),
+                )
+                s1_result = s1_agent.run_autonomous_step()
         elif action == "navigate":
             # `url` is the navigation target. A bare observation id (eN) or a
             # CSS selector accidentally passed here is NOT a path — treating it

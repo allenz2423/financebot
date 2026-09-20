@@ -289,3 +289,58 @@ def test_agentic_browser_step_auto_action():
         assert res["s1_result"]["status"] == "ok"
         assert "[SYSTEM 1 AUTONOMOUS FORM RESULT]" in res["summary"]
 
+
+@pytest.mark.asyncio
+async def test_cua_agent_shopping_flow():
+    from unittest.mock import AsyncMock
+    from src.services.concierge.system1_agent import CUAAgent
+
+    mock_page = AsyncMock()
+    mock_page.url = "https://www.amazon.com/"
+    
+    # Mock search input
+    mock_search_input = AsyncMock()
+    
+    # Mock candidate elements
+    mock_result_item = AsyncMock()
+    mock_title_link = AsyncMock()
+    mock_title_link.inner_text = AsyncMock(return_value="Rotring 600 Mechanical Pencil, Limited Edition Mint, 0.5mm")
+    mock_price = AsyncMock()
+    mock_price.inner_text = AsyncMock(return_value="$37.33")
+    
+    mock_result_item.query_selector = AsyncMock(
+        side_effect=lambda sel: mock_title_link if "h2 a" in sel else (mock_price if "price" in sel else None)
+    )
+
+    # Mock add to cart button
+    mock_add_btn = AsyncMock()
+    
+    # Mock cart count element (increments from 1 to 2)
+    mock_cart_elem = AsyncMock()
+    cart_counts = ["1", "2"]
+    mock_cart_elem.inner_text = AsyncMock(side_effect=lambda: cart_counts.pop(0) if cart_counts else "2")
+
+    mock_page.query_selector = AsyncMock(side_effect=lambda sel: (
+        mock_search_input if ("twotabsearchtextbox" in sel or "search" in sel)
+        else (mock_add_btn if "add-to-cart-button" in sel
+        else (mock_cart_elem if "nav-cart-count" in sel else None))
+    ))
+    mock_page.query_selector_all = AsyncMock(return_value=[mock_result_item])
+    mock_page.goto = AsyncMock()
+    mock_page.screenshot = AsyncMock()
+
+    cua = CUAAgent(cdp_actuator=mock_page)
+    # Test parse goal
+    parsed = cua.parse_goal("add a rotring 600 in a nice blue adjacent color preferably mint to my cart")
+    assert "rotring 600" in parsed["search_query"]
+    assert "mint" in parsed["preferred_colors"]
+
+    # Test autonomous goal execution
+    res = await cua.run_goal_async("add a rotring 600 in a nice blue adjacent color preferably mint to my cart")
+    assert res["status"] == "completed"
+    assert "Rotring 600" in res["selected_product"]
+    assert res["initial_cart_count"] == 1
+    assert res["final_cart_count"] == 2
+    assert any(step["step"] == "click_add_to_cart" for step in res["trace"])
+
+
