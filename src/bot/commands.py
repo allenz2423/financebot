@@ -1,5 +1,5 @@
 import src.core.state
-import src.bot.concierge_commands  # noqa: F401  (registers !concierge admin plane)
+
 import html
 import json
 import os
@@ -96,10 +96,6 @@ from src.db.queries import *
 from src.services.llm import *
 from src.db.prefs import set_user_timezone, get_user_timezone
 from src.services.analyst import run_autonomous_analyst
-
-# Mount the concierge credential-capture router on the shared app.
-from src.services.concierge.routes import register_capture_routes
-register_capture_routes(app)
 
 
 
@@ -5152,30 +5148,6 @@ async def on_ready():
     except Exception as exc:
         print(f" [MONITOR] Monitor watchdog failed to start: {type(exc).__name__}: {exc}")
 
-    # Concierge risk monitor: per-tenant anomaly alerts over the concierge
-    # audit chain (capture storms, refusals, repeated secrets). LLM-free.
-    try:
-        from src.services.concierge.monitor import concierge_risk_watchdog_loop
-        t_concierge_mon = bot.loop.create_task(concierge_risk_watchdog_loop())
-        _PERSISTENT_TASKS.add(t_concierge_mon)
-        t_concierge_mon.add_done_callback(_PERSISTENT_TASKS.discard)
-        print(" [CONCIERGE MONITOR] Persistent concierge risk monitor started.")
-    except Exception as exc:
-        print(f" [CONCIERGE MONITOR] Concierge monitor watchdog failed to start: {type(exc).__name__}: {exc}")
-
-    # Concierge browser reaper: reclaim per-session headed Chromium containers
-    # once their login session is terminal or superseded. Without this an
-    # abandoned session leaked a container + noVNC port forever (the login view
-    # removed a container only on an explicit ✕ Cancel).
-    try:
-        from src.bot.concierge_login import concierge_browser_reaper_loop
-        t_reaper = bot.loop.create_task(concierge_browser_reaper_loop())
-        _PERSISTENT_TASKS.add(t_reaper)
-        t_reaper.add_done_callback(_PERSISTENT_TASKS.discard)
-        print(" [CONCIERGE REAPER] started.")
-    except Exception as exc:
-        print(f" [CONCIERGE REAPER] failed to start: {type(exc).__name__}: {exc}")
-
     # Gmail watcher: history-API polling for new mail. Deterministic digest
     # to Discord; LLM triage only for users who opted in via !gmail autoparse.
     try:
@@ -5474,15 +5446,22 @@ async def on_message(message: discord.Message):
     if prompt:
         try:
             import sandbox_client
-            raw_path = await sandbox_client.save_workspace_file(
-                str(user_id), "message.txt", prompt.encode("utf-8")
-            )
-            if raw_path:
-                prompt = (
-                    f"[RAW MESSAGE SAVED TO WORKSPACE: {raw_path}]\n"
-                    f"Original user request: {prompt[:2000]}\n"
-                    "Work from this saved artifact when the user asks you to inspect, filter, "
-                    "transform, or summarize the pasted content."
+            # Only save and append artifact notice if the message is large (e.g. pasted code/data/document)
+            if len(prompt) > 2500:
+                raw_path = await sandbox_client.save_workspace_file(
+                    str(user_id), "message.txt", prompt.encode("utf-8")
+                )
+                if raw_path:
+                    prompt = (
+                        f"[RAW MESSAGE SAVED TO WORKSPACE: {raw_path}]\n"
+                        f"Original user request: {prompt[:2000]}\n"
+                        "Work from this saved artifact when the user asks you to inspect, filter, "
+                        "transform, or summarize the pasted content."
+                    )
+            else:
+                # Silently save to workspace in background without modifying prompt
+                await sandbox_client.save_workspace_file(
+                    str(user_id), "message.txt", prompt.encode("utf-8")
                 )
         except Exception as exc:
             print(f" [MESSAGE] raw message preservation failed: {type(exc).__name__}: {exc}")

@@ -76,38 +76,7 @@ def _redact_inline_credentials(text: str) -> str:
     )
 
 
-def _coerce_concierge_object(value):
-    """Coerce provider tool arguments into a real object, safely.
 
-    Some OpenAI-compatible providers incorrectly serialize a nested object as
-    a string and occasionally emit Python-style escaping. Try strict JSON
-    first, then a literal-only compatibility parse; never evaluate code or
-    repair arbitrary text into an action.
-    """
-    if isinstance(value, dict):
-        return value
-    if not isinstance(value, str):
-        raise ValueError("args must be a JSON object")
-    raw = value.strip()
-    if raw.startswith("```") and raw.endswith("```"):
-        raw = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", raw, flags=re.IGNORECASE)
-    candidates = (raw, raw.replace("\\\\'", "'"))
-    errors = []
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except (TypeError, json.JSONDecodeError) as exc:
-            errors.append(exc)
-        try:
-            parsed = ast.literal_eval(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except (ValueError, SyntaxError) as exc:
-            errors.append(exc)
-    detail = errors[0] if errors else "invalid object"
-    raise ValueError(f"args must be a JSON object: {detail}")
 from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI
@@ -1247,96 +1216,6 @@ BOT_TOOLS_SCHEMA = [
         }
     },
 
-    {
-        "type": "function",
-        "function": {
-            "name": "concierge_browser_step",
-            "description": "Drive an approved concierge browser mission. CUA TAKES THE LEAD: call with action='auto' (optionally passing the user goal in 'value') to let the Computer-Use Agent autonomously navigate, search, select, and advance the mission across multiple steps without single-click round trips. The model steps in when CUA is blocked by 2FA/OTP/CAPTCHA, requires specific user input (such as entering an SMS verification code), or finishes. Manual actions (click, type, navigate, scroll, press_key) are used when the model steps in to provide user values. action='observe' inspects the live page. action='screenshot' is only used when the user explicitly asks to see the current page in Discord.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mission_id": {"type": "string", "description": "The ACTIVE mission id (from the ACTIVE AUTO-PILOT MISSIONS context or the active_missions list returned by concierge_act_status). It is NOT a proposal_id: a proposal_id from concierge_act_status will not resolve to a mission."},
-                    "action": {"type": "string", "enum": ["observe", "screenshot", "click", "type", "navigate", "scroll", "press_key", "auto"]},
-                    "selector": {"type": "string", "description": "The observed element id (e.g. 'e3') for click/type/scroll, taken from [INTERACTIVE ELEMENTS] of the latest observe. A raw CSS selector also works but is unnecessary; prefer the id."},
-                    "value": {"type": "string"},
-                    "vault_ref": {"type": "string"},
-                    "url": {"type": "string"}
-                },
-                "required": ["mission_id", "action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "request_concierge_action",
-            "description": "Concierge action gateway. Read-tier kinds (order_status / tracking / price_watch) run ONE supervised read against a domain in the user's concierge allowlist — read-only, audited, sandboxed, mask-only output. Write-tier kinds (send_email / schedule_event / fill_form) NEVER self-execute: they validate the plan against the tenant allowlist and create a pending approval proposal that the user must ✅/✕ in Discord (via the ActionApprovalView) before any browser act occurs; the model only sees 'submitted for approval'. Use kind='fill_form' for all browser writes, including finding products and adding items to a cart; there is no add_to_cart or shopping kind. fill_form also covers sign-in / login flows: password/secret steps must use a vault_ref from the user's stored credential records (resolved at execution) — never ask for or echo raw passwords. If the user has no stored credential for the domain, call `request_credential_capture` to hand them a secure capture link (they enter values on a secure page, out of this conversation); do not attempt the act without one. Refuses cleanly if concierge is not enabled, the tier is too low (writes need write/spend tier), or the target domain is not allowed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "kind": {"type": "string", "enum": ["order_status", "tracking", "price_watch", "send_email", "schedule_event", "fill_form"]},
-                    "args": {
-                        "type": "object",
-                        "description": "For fill_form browser writes, provide domain and a concise summary only; do not generate steps because the approved mission inspects the live page agentically. Reads use domain plus the read-specific fields. For non-browser writes, steps may use navigate|click|type|scroll|screenshot|assert_text. The observe action is only for concierge_browser_step, never this approval tool.",
-                        "properties": {
-                            "domain": {"type": "string"},
-                            "summary": {"type": "string"},
-                            "order_id": {"type": "string"},
-                            "tracking_id": {"type": "string"},
-                            "path": {"type": "string"},
-                            "product": {"type": "string"},
-                            "steps": {
-                                "type": "array",
-                                "description": "Write-plan actions only. Do not include observe.",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "action": {"type": "string", "enum": ["navigate", "click", "type", "scroll", "screenshot", "assert_text"]},
-                                        "sel": {"type": "string"},
-                                        "selector": {"type": "string"},
-                                        "url": {"type": "string"},
-                                        "value": {"type": "string"},
-                                        "vault_ref": {"type": "string"}
-                                    },
-                                    "required": ["action"]
-                                }
-                            }
-                        },
-                        "required": ["domain"]
-                    }
-                },
-                "required": ["kind", "args"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "request_credential_capture",
-            "description": "Issue a secure one-time credential-capture link so the USER can store login credentials for a domain that the concierge fill_form flow later injects from the vault at execution. Use this when a login flow needs a stored credential the user does not have, OR when the user explicitly asks to update/replace/re-enter an existing stored credential (e.g. the stored password is wrong or outdated) — NEVER ask the user for passwords in chat. The domain must be in the user's concierge allowlist; the tenant is the current user, derived from the interaction and never model-supplied. The user opens the returned URL and enters values on a secure page; raw values never appear in this conversation. Returns the capture URL (single-use, 10-minute expiry) plus the domain.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "domain": {"type": "string", "description": "Site the user needs credentials for"},
-                    "fields": {"type": "array", "description": "Optional form fields to collect. Each item: {label, type (text|password|otp|token|url), required}. Defaults to Email (text) + Password (password). Payment/card/identity fields are refused.", "items": {"type": "object", "properties": {"label": {"type": "string"}, "type": {"type": "string"}, "required": {"type": "boolean"}}}}
-                },
-                "required": ["domain"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "concierge_act_status",
-            "description": "Check the status and outcome of pending or past concierge proposals (write-tier acts: fill_form / login, send_email, schedule_event) for the current user. Use this whenever the user asks 'is it done', 'did the login work', 'what happened after I approved' — never guess from the approval prompt alone. Returns the most recent proposals with their status (pending / executed / rolled_back / rejected / expired) and a short outcome note (error text or the page text captured while that act ran). That outcome is only a snapshot from the moment the act ran: an executed fill_form is NOT proof the user is signed in now, and a merchant's logged-out landing page looks like success. When the user asks to log in, or asks whether they are currently signed in, observe the LIVE page with concierge_browser_step before answering. Read-only; never executes or mutates anything.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "description": "How many of the most recent proposals to return (1-25, default 10)."}
-                }
-            }
-        }
-    },
     {
         "type": "function",
         "function": {
@@ -3390,10 +3269,6 @@ BOT_TOOLS_SCHEMA = [
 
 SCHEMA_TOOL_NAMES = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
 EXPECTED_TOOL_NAMES = {
-    "request_concierge_action",
-    "concierge_browser_step",
-    "request_credential_capture",
-    "concierge_act_status",
     "scrape_rendered_page",
     "find_government_forms",
     "fill_pdf_form",
@@ -3835,14 +3710,8 @@ _LIVE_STATE_CLAIM_RE = re.compile(
 
 _LIVE_STATE_NUDGE = (
     "SYSTEM ENFORCEMENT: your reply states the user's CURRENT browser or account "
-    "state, but nothing on the live page was read this turn. A stored note, a "
-    "previous turn's page, and a name that merely appears somewhere on the page "
-    "(for example in a recipient or contact list) are NOT evidence of who is "
-    "signed in. Do not answer from memory. Call `concierge_browser_step` with "
-    "action `observe` now — or, to confirm whose account is open, read the "
-    "merchant's own profile/account page — and answer only from what you "
-    "actually read. If the live page cannot be read, say so plainly instead of "
-    "guessing."
+    "state, but no live page was read this turn. Do not answer from memory or guess. "
+    "If the live account state cannot be verified, say so plainly."
 )
 
 _LIVE_STATE_FALLBACK = (
@@ -3851,32 +3720,7 @@ _LIVE_STATE_FALLBACK = (
     "again and I'll look at the live session."
 )
 
-# A browser action (sign in, check out, buy, …) is never satisfied by a
-# narrated plan. Free-tier models routinely write the whole flow as prose
-# ("Let me observe the page … Great, you're logged in") while emitting zero
-# tool calls; the state guard above then refuses the fabricated result and the
-# user is left with nothing done. Force the real call instead.
-_BROWSER_ACTION_RE = re.compile(
-    r"\b(?:log\s?in|log\s?into|log\s+me\s+in|sign\s?in|sign\s?into|sign\s+me\s+in|"
-    r"check\s?out|checkout|"
-    r"add\s+to\s+(?:my\s+|the\s+)?cart|my\s+cart|shopping\s+cart|"
-    r"buy|purchase|place\s+(?:an\s+|the\s+)?order)\b",
-    re.IGNORECASE,
-)
 
-_BROWSER_ACTION_NUDGE = (
-    "SYSTEM ENFORCEMENT: the user asked for a browser action (sign in, check "
-    "out, buy, …) but your reply emitted no native browser tool call — you only "
-    "narrated steps you did not take. Do not describe actions you did not "
-    "perform. Emit the real tool call now: if an active mission already covers "
-    "the site, call `concierge_browser_step` with that `mission_id` and "
-    "action=\"auto\" so CUA takes the lead on navigating and executing the goal; "
-    "otherwise call `request_concierge_action` with kind=\"fill_form\" and "
-    "args={\"domain\": \"<the site>\", \"summary\": \"<user goal>\"} — that creates the "
-    "approval the user clicks ✅ on, and approval grants the mission. A session "
-    "already open on another site does NOT block a new one: each domain simply "
-    "needs its own approval."
-)
 
 # Saved-file work is also an action, even though it is not a browser action.
 # Without this guard, a model can say "let me examine the file" and the normal
@@ -4009,19 +3853,13 @@ async def _prefetch_gmail_batch(
 # and carries no financial intent, so financial context is withheld). Reading
 # a message is the whole point of the flow — omitting read_gmail_message left
 # the model able to list matches but never open one, so it could not retrieve
-# a verification code. The concierge tools stay offered because typing that
-# code into an already-approved browser mission is the same task; their own
-# tenant/tier gates still govern access.
+# a verification code.
 _GMAIL_ONLY_TOOLS = frozenset({
     "search_gmail",
     "read_gmail_message",
     "read_gmail_thread",
     "enable_reasoning",
     "end_turn",
-    "concierge_browser_step",
-    "concierge_act_status",
-    "request_concierge_action",
-    "request_credential_capture",
 })
 
 
@@ -4058,34 +3896,10 @@ def _claims_live_browser_state(text: str) -> bool:
 
 
 def _observed_live_browser(trace) -> bool:
-    """True when a ``concierge_browser_step`` actually read the page.
-
-    Requires ``ok``: a step that errored (expired mission, unreachable page)
-    returned no page, so it is not evidence and must not license a verdict.
-    """
-    for entry in trace or []:
-        if (
-            isinstance(entry, dict)
-            and entry.get("name") == "concierge_browser_step"
-            and entry.get("ok")
-        ):
-            return True
     return False
 
 
 def _browser_tool_ran(trace) -> bool:
-    """True when this turn actually started or advanced a browser task.
-
-    Used to force a real call when the model only *narrates* a browser action;
-    either tool counts, so an already-created approval is not re-demanded.
-    """
-    for entry in trace or []:
-        if (
-            isinstance(entry, dict)
-            and entry.get("ok")
-            and entry.get("name") in {"concierge_browser_step", "request_concierge_action"}
-        ):
-            return True
     return False
 
 
@@ -4237,9 +4051,8 @@ DECISION PROTOCOLS:
   figure; do not automatically run pacing, projections, debt strategies, fee
   leakage, or bill-anomaly analysis unless the user asks for a full affordability
   review or those facts are necessary to resolve ambiguity.
-  Give the verdict only after the purchase amount is known. If the cart has not
-  been inspected, say that the amount is unknown and inspect it through concierge
-  when permission/session state allows.
+  Give the verdict only after the purchase amount is known. If the purchase amount
+  is unknown, ask the user for the amount or inspect the relevant receipt/order.
 - DEBT & LEAKAGE: Quantify Avalanche vs Snowball savings (calculate_debt_snowball_vs_avalanche), extra payment impacts (calculate_extra_payment_impact), score tier gains (simulate_credit_paydown_impact), checking cash drag (get_cash_drag_analysis), bank fees (detect_bank_fee_leakage), and bill increases (detect_unusual_bill_increases).
 
 CORE REASONING CYCLE:
@@ -4417,94 +4230,8 @@ RUNTIME CONTRACT:
             except Exception:
                 awm_context = ""
 
-    concierge_context = ""
-    try:
-        from src.security.vault import Vault, DEFAULT_DB_PATH as _concierge_db
-        from src.services.concierge.tenants import TenantStore
-        c_store = TenantStore(_concierge_db)
-        c_status = c_store.status(f"user:{uid}")
-        if c_status.get("enabled"):
-            v = Vault(_concierge_db)
-            manifest = v.build_manifest(f"user:{uid}")
-            # Credential records are executor-only. The model receives no
-            # secret/payment refs or displays; a secret is resolved only
-            # when the browser executor is already on the matching live
-            # domain. Session-profile metadata is safe to expose because
-            # it contains no credential value.
-            manifest = {
-                "session_profiles": manifest.get("session_profiles", [])
-            }
-            allowed = c_status.get("allow_domains") or []
-            missions_line = ""
-            try:
-                from src.services.concierge.approval_store import ApprovalStore
-                missions = ApprovalStore(_concierge_db).active_missions_for_tenant(
-                    f"user:{uid}"
-                )
-                if missions:
-                    missions_line = (
-                        f"\nACTIVE AUTO-PILOT MISSIONS (user approved once; follow-up acts "
-                        f"on these domains execute WITHOUT a new approval prompt):\n"
-                        f"{json.dumps(missions, indent=2)}\n"
-                        f"While a mission is active: if the last act on a mission domain "
-                        f"failed, check concierge_act_status first, then propose corrected "
-                        f"fill_form steps for the SAME domain — they run immediately, no "
-                        f"approval needed. Never propose acts for a domain OUTSIDE the "
-                        f"mission list without a fresh approval prompt. For shopping "
-                        f"research, stay on the requested retailer/merchant; do not "
-                        f"substitute another marketplace or retailer.\n"
-                        f"Each mission's `mission_id` is the id you pass to "
-                        f"concierge_browser_step. It is NOT a proposal_id and NOT a "
-                        f"`profile_…` vault_ref.\n"
-                    )
-                else:
-                    # No mission is live. Say so explicitly: otherwise the model
-                    # has no id to use, grabs a proposal_id or a `profile_…`
-                    # vault_ref from the session records below, and every
-                    # concierge_browser_step fails with "mission is not active".
-                    missions_line = (
-                        f"\nNO ACTIVE BROWSER MISSION. concierge_browser_step cannot run "
-                        f"until one exists. When the user asks you to log in or do "
-                        f"anything on a site, call request_concierge_action with "
-                        f"kind='fill_form' and args={{'domain': '<site>'}} — that creates "
-                        f"the approval the user clicks ✅ on, and approval grants the "
-                        f"mission. Do not ask 'would you like me to?' first; propose it. "
-                        f"Do not pass a proposal_id or a `profile_…` vault_ref as a "
-                        f"mission_id.\n"
-                    )
-            except Exception:
-                pass
-            concierge_context = (
-                f"\nCONCIERGE STATUS & STORED VAULT CREDENTIALS\n"
-                f"===========================================\n"
-                f"Tenant: user:{uid} (Tier: {c_status.get('tier')}, Allowed Domains: {allowed})\n"
-                f"Available browser session records:\n{json.dumps(manifest, indent=2)}\n"
-                f"{missions_line}"
-                f"Credential values and credential references are executor-only. When the live browser is on the "
-                f"requested domain, use a secret-field type action without inventing or displaying a password; "
-                f"the executor resolves one matching stored credential locally. If none exists, use "
-                f"request_credential_capture. Never ask for or echo raw passwords.\n"
-                f"After an act is approved, the browser continues on its own where possible: "
-                f"known checkpoints (Amazon bot-check 'Continue shopping' pages) are clicked through "
-                f"automatically and interrupted steps are retried — an act only rolls back on a hard wall. "
-                f"Use concierge_act_status to see what actually happened.\n"
-                f"A recorded act outcome is the page text captured while that act ran, NOT proof of an "
-                f"authenticated session — a merchant's logged-out landing page reads like a success. "
-                f"Never answer 'you are logged in' from concierge_act_status. When the user asks to log in "
-                f"(or asks if they are signed in), drive the live page with concierge_browser_step and "
-                f"confirm the authenticated page (e.g. an /myaccount or dashboard URL) before claiming it.\n"
-                f"To identify WHOSE account is signed in, read the merchant's own profile/account page. "
-                f"Never infer the account holder from a name that merely appears elsewhere on a page — a "
-                f"recipient, contact, or 'send again' entry, an activity payee, or a recommendation: those "
-                f"names belong to other people and merchants, and naming the signed-in user from one of "
-                f"them is a wrong answer that the user cannot see the source of.\n"
-            )
-    except Exception as c_exc:
-        concierge_context = ""
-
     volatile_context = f"""
 {awm_context}
-{concierge_context}
 
 CURERENT SYSTEM DATE & TIME: {current_time}
 
@@ -4616,10 +4343,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # large budget mainly becomes hidden reasoning latency before dispatch.
     web_fast_turn = (
         any(term in prompt_lower for term in (
-            "search", "web", "website", "browser", "amazon", "cart",
-            "login", "log in", "sign in", "product", "price", "buy",
-            "add to cart", "open the site", "active mission", "concierge",
-            "permission was granted",
+            "search", "web", "website", "browser", "amazon", "product", "price",
         ))
         and not (merchant_research_intent or merchant_plus_action_intent)
     )
@@ -4924,18 +4648,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
             # model needs to read the emailed code the moment it hits the wall
             # rather than spending a round loading schemas first.
             "search_gmail", "read_gmail_message", "read_gmail_thread",
-            # Concierge read-tier: offered every round so concierge-enabled
-            # users can supervise order/tracking/price reads without needing
-            # dynamic discovery; the tenant gate refuses for other users.
-            "request_concierge_action",
-            "concierge_browser_step",
-            # Credential-capture issuance is user-triggered on demand: offered
-            # every round so the model can hand the user a secure capture
-            # link when a fill_form login needs stored credentials.
-            "request_credential_capture",
-            # Post-approval status reads: offered every round so the model can
-            # answer "is it done / what happened" from real proposal state.
-            "concierge_act_status",
         }
         if not _audit_is_active():
             if context_policy["gmail_only"]:
@@ -5831,26 +5543,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     consecutive_no_tool_rounds = 0
     final_content = ""
     end_turn_rejections = 0
-    concierge_turn = False
-    # Start with concise tool planning; the model can opt into the larger
-    # budget for subsequent rounds when a task is genuinely complex.
     reasoning_enabled_this_turn = False
-    browser_observation_counts: dict[str, int] = {}
-    # Count an action only while the observed page state is unchanged. This is
-    # site-agnostic and still permits the same selector to be used for several
-    # distinct rows/items as the page changes after each successful action.
-    browser_action_observation_counts: dict[str, int] = {}
-    browser_failed_action_counts: dict[str, int] = {}
-    # Turn-scoped, unlike the per-round side-effect flags below: a page is only
-    # expected to change after a mutating action, and acting once must keep
-    # licensing the stall check for the rest of the turn.
-    browser_mutation_this_turn = False
-    browser_readonly_reobserve_nudges = 0
-    # A verification/security wall is satisfied by a code only the user owns.
-    # Nudge once to ask for it (or to let the user finish in the VNC session)
-    # instead of hard-stopping on first sight, then hard-stop if the model
-    # keeps re-reading the wall instead of supplying a code.
-    browser_challenge_nudges = 0
 
     total_search_calls = 0
     search_cache: dict[str, str] = {}
@@ -6398,17 +6091,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
             or audit_batch_mode
         )
         tools = _tool_schema_for_mode()
-        # An approved browser continuation has one job: inspect/act in the
-        # already-authorized mission. Keeping unrelated financial and web
-        # tools out of this narrow continuation materially improves free-model
-        # tool selection and reduces prompt tokens, without encoding any site
-        # semantics or choosing browser actions on the model's behalf.
-        if required_tools == {"concierge_browser_step"}:
-            tools = [
-                tool for tool in tools
-                if (tool.get("function") or {}).get("name")
-                in {"concierge_browser_step", "end_turn", "request_credential_capture"}
-            ]
 
         # Optional total tool-call guard. 0 = unlimited.
         total_calls_so_far = sum(tool_call_counts.values()) if isinstance(tool_call_counts, dict) else 0
@@ -6554,11 +6236,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     _shadow_mode = "audit"
                 elif context_policy["gmail_only"]:
                     _shadow_mode = "gmail_only"
-                elif required_tools == {"concierge_browser_step"}:
-                    # Required-only browser continuation: offering is narrowed to
-                    # a fixed 3-tool set, so the router must not touch it — in
-                    # offering or telemetry (contract "Restricted modes").
-                    _shadow_mode = "concierge_continuation"
                 else:
                     _shadow_mode = "ordinary"
                 _shadow_restricted = _shadow_mode != "ordinary"
@@ -6839,13 +6516,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
         else:
             tool_batches = []
 
-        # Per-round side-effect flags must exist even when the model emits no
-        # tool calls. Plain-text completion guards inspect these flags too.
-        approval_pending_this_round = False
-        concierge_refused_this_round = False
-        browser_auth_blocked_this_round = False
-        browser_block_reason_this_round = ""
-        browser_block_stage_this_round = ""
+
 
         # If end_turn was the ONLY call, there is nothing left to execute.
         if end_turn_this_round and not tool_calls:
@@ -6959,28 +6630,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 )
             )
 
-            # ── Browser-action enforcement ──
-            # "Log into X / check out my cart" is an action, not a question.
-            # When the model answers such a turn with prose that claims a live
-            # state or promises tool calls — but ran no browser tool at all —
-            # it has not done anything; force the real call instead of letting
-            # the state guard below end the turn on a non-answer.
-            if (
-                not audit_active_now
-                and not pause_active
-                and browser_action_nudges < 2
-                and not _browser_tool_ran(turn_tool_trace)
-                and _BROWSER_ACTION_RE.search(prompt_lower)
-                and (_claims_live_browser_state(text_final) or promised_tools)
-            ):
-                browser_action_nudges += 1
-                print(
-                    " [BROWSER ACTION ENFORCEMENT] browser action narrated with "
-                    "no tool call; forcing the real call"
-                )
-                messages.append({"role": "user", "content": _BROWSER_ACTION_NUDGE})
-                attempts += 1
-                continue
+
 
             # ── Saved-artifact enforcement ──
             # A spreadsheet/document task must reach the workspace or sandbox
@@ -7222,19 +6872,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 continue
 
             if len(text_final) > 40 and not promised_tools and not audit_active_now and not require_fresh_verification and not pause_active:
-                # Never trust a model's claim that an approval was sent. The
-                # Discord prompt is an external side effect and is only real
-                # when request_concierge_action created it in this turn.
-                if (
-                    not approval_pending_this_round
-                    and re.search(r"\b(?:sent|created|submitted)\b.{0,40}\bapproval\b", text_final, re.IGNORECASE | re.DOTALL)
-                ):
-                    print(" [CONCIERGE APPROVAL GUARD] model claimed approval without creating one")
-                    final_content = (
-                        "I could not create the approval request because the concierge action "
-                        "was not submitted. Nothing was added or changed. Please try again."
-                    )
-                    break
                 executed_tools_so_far = {
                     str(entry.get("name"))
                     for entry in turn_tool_trace
@@ -7365,14 +7002,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 func_name = None
                 args = {}
                 db_result = None
-                screenshot_png = None
-                screenshot_user_requested = False
                 tool_succeeded = False
-                # Set by the concierge_browser_step dispatch branch only on the
-                # success path. Initialised here so the browser-progress check
-                # in the message builder cannot raise UnboundLocalError (and mask
-                # the real error) when a step fails.
-                observation_key = None
                 try:
                     await _set_advisor_status(
                         uid,
@@ -7407,14 +7037,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             f"arguments for '{func_name}' must be an object, got {type(args).__name__}"
                         )
                     func_name = func_name.strip()
-
-                    if func_name in {
-                        "concierge_browser_step",
-                        "request_concierge_action",
-                        "concierge_act_status",
-                        "request_credential_capture",
-                    }:
-                        concierge_turn = True
 
                     if func_name not in KNOWN_TOOLS:
                         resolved = _resolve_tool_alias(func_name)
@@ -7666,499 +7288,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         # Replace user_id = ? with actual user_id, allowing flexible spacing
                         q = re.sub(r"user_id\s*=\s*\?", f"user_id = '{uid}'", q)
                         db_result = verify_claim(args.get("claim", ""), q, uid)
-                    elif func_name == "concierge_browser_step":
-                        try:
-                            from src.bot.approval_views import (
-                                AGENTIC_BROWSER_SESSIONS,
-                                agentic_browser_step,
-                            )
-                            step_result = await asyncio.to_thread(
-                                agentic_browser_step,
-                                "user:" + str(uid),
-                                str(args.get("mission_id") or ""),
-                                str(args.get("action") or "observe"),
-                                str(args.get("selector") or ""),
-                                str(args.get("value") or ""),
-                                str(args.get("vault_ref") or "") or None,
-                                str(args.get("url") or ""),
-                            )
-                            screenshot_png = step_result.pop("screenshot_png", None)
-                            screenshot_user_requested = bool(
-                                step_result.pop("screenshot_user_requested", False)
-                            )
-                            observation_key = json.dumps(
-                                {
-                                    "mission_id": args.get("mission_id"),
-                                    "url": step_result.get("url"),
-                                    "summary": step_result.get("summary"),
-                                },
-                                sort_keys=True,
-                                ensure_ascii=False,
-                            )
-                            action_observation_key = json.dumps(
-                                {
-                                    "mission_id": step_result.get("mission_id"),
-                                    "action": args.get("action"),
-                                    "selector": args.get("selector"),
-                                    "url": args.get("url"),
-                                    "observation": observation_key,
-                                },
-                                sort_keys=True,
-                                ensure_ascii=False,
-                            )
-                            browser_action_observation_counts[action_observation_key] = (
-                                browser_action_observation_counts.get(action_observation_key, 0) + 1
-                            )
-                            if (
-                                str(args.get("action") or "").lower() == "click"
-                                and browser_action_observation_counts[action_observation_key] >= 2
-                            ):
-                                step_result["blocked"] = True
-                                step_result["block_reason"] = (
-                                    "the same browser click was repeated twice; "
-                                    "the page did not provide a distinct target"
-                                )
-                                browser_auth_blocked_this_round = True
-                                browser_block_reason_this_round = step_result["block_reason"]
-                                browser_block_stage_this_round = str(
-                                    step_result.get("page_stage") or "unknown"
-                                )
-                            prior_observation_count = browser_observation_counts.get(
-                                observation_key, 0
-                            )
-                            browser_observation_counts[observation_key] = (
-                                prior_observation_count + 1
-                            )
-                            # A page can have plenty of boilerplate text while
-                            # omitting the useful controls (Amazon cart pages
-                            # do this). If the exact observation repeats, attach
-                            # one fast internal frame so the model can recover.
-                            if (
-                                not screenshot_user_requested
-                                and not screenshot_png
-                                and prior_observation_count >= 1
-                            ):
-                                actuator = AGENTIC_BROWSER_SESSIONS.get(
-                                    str(args.get("mission_id") or "")
-                                )
-                                if actuator is not None:
-                                    screenshot_png = await asyncio.to_thread(
-                                        actuator.screenshot, True
-                                    )
-                            # A navigate/click/type/scroll is the only thing that
-                            # can be expected to change the page. Remember it so
-                            # a read-only turn is never mistaken for a stalled one.
-                            if str(args.get("action") or "observe").lower() in {
-                                "navigate", "click", "type", "scroll", "press_key", "auto"
-                            }:
-                                browser_mutation_this_turn = True
-                            # Only a repeated *observation* of an unchanged page
-                            # is a stall. A click/type/scroll legitimately leaves
-                            # the page text unchanged — typed input values are
-                            # never part of innerText — so gating on every action
-                            # aborted an ordinary login right after the first
-                            # field was filled (observe → type → blocked).
-                            if (
-                                str(args.get("action") or "observe").lower() == "observe"
-                                and browser_observation_counts[observation_key] >= 2
-                            ):
-                                if browser_mutation_this_turn:
-                                    step_result["blocked"] = True
-                                    step_result["block_reason"] = (
-                                        "the browser page did not change between two consecutive observations"
-                                    )
-                                elif browser_readonly_reobserve_nudges < 1:
-                                    # Nothing was supposed to change, so this is
-                                    # not a stall: the model is re-reading the
-                                    # same page instead of answering. Say so once
-                                    # and only stop it if it repeats regardless.
-                                    browser_readonly_reobserve_nudges += 1
-                                    step_result["note"] = (
-                                        "You have already read this page and it did not change. "
-                                        "Re-observing it is not progress. If what you have already "
-                                        "read answers the user's question, answer now; otherwise "
-                                        "use navigate to open the page that would answer it — for "
-                                        "a signed-in identity question, the account/profile page. "
-                                        "Do not observe this same page again."
-                                    )
-                                else:
-                                    step_result["blocked"] = True
-                                    step_result["block_reason"] = (
-                                        "the browser page did not change between two consecutive observations"
-                                    )
-                            if step_result.get("blocked"):
-                                # A verification/security wall is satisfied only
-                                # by a code the user owns. Do not hard-stop on the
-                                # first sight of one: ask the model to obtain the
-                                # code (or have the user finish in the open VNC
-                                # session), so the mission can type what the user
-                                # supplies. A repeat still hard-stops.
-                                challenge_block = (
-                                    "authentication/verification" in str(step_result.get("block_reason") or "")
-                                    or "authentication is required" in str(step_result.get("block_reason") or "")
-                                )
-                                if (
-                                    challenge_block
-                                    and str(args.get("action") or "observe").lower() != "type"
-                                    and browser_challenge_nudges < 1
-                                ):
-                                    browser_challenge_nudges += 1
-                                    step_result["blocked"] = False
-                                    step_result["note"] = (
-                                        "This page is a verification/security step that only the user "
-                                        "can satisfy. First check whether the code was emailed to the "
-                                        "user: call search_gmail (e.g. query 'from:paypal newer_than:1d' "
-                                        "or the site name) and then read_gmail_message(message_id) on "
-                                        "the newest result to extract the code — search_gmail returns "
-                                        "headers only, so you MUST open the message body. Do NOT use "
-                                        "fetch_webpage on a Gmail URL; it is blocked. Once you have the "
-                                        "code, call concierge_browser_step with action=type on the code "
-                                        "field and pass the code as value. If no code is found, ask the "
-                                        "user for the code, or ask them to complete the step in the open "
-                                        "browser session and then tell you it is done so you can observe "
-                                        "again. Do not repeat the same read-only action."
-                                    )
-                                else:
-                                    browser_auth_blocked_this_round = True
-                                    browser_block_reason_this_round = str(
-                                        step_result.get("block_reason") or "authentication is required"
-                                    )
-                                    browser_block_stage_this_round = str(
-                                        step_result.get("page_stage") or "unknown"
-                                    )
-                            if (
-                                screenshot_user_requested
-                                and isinstance(screenshot_png, (bytes, bytearray))
-                                and len(screenshot_png) > 0
-                            ):
-                                try:
-                                    await reply_msg.channel.send(
-                                        f"📸 Browser {step_result.get('action', 'observation')} — "
-                                        f"`{step_result.get('url', '')}`",
-                                        file=discord.File(BytesIO(bytes(screenshot_png)), filename="concierge-browser.png"),
-                                    )
-                                except Exception as shot_err:
-                                    print(f" [CONCIERGE SCREENSHOT] delivery failed: {shot_err}")
-                            db_result = json.dumps(step_result, separators=(",", ":"))
-                        except Exception as exc:  # noqa: BLE001 — fail closed
-                            failed_action_key = json.dumps(
-                                {
-                                    "mission_id": args.get("mission_id"),
-                                    "action": args.get("action"),
-                                    "selector": args.get("selector"),
-                                    "url": args.get("url"),
-                                },
-                                sort_keys=True,
-                                ensure_ascii=False,
-                            )
-                            browser_failed_action_counts[failed_action_key] = (
-                                browser_failed_action_counts.get(failed_action_key, 0) + 1
-                            )
-                            repeated_failure = (
-                                browser_failed_action_counts[failed_action_key] >= 2
-                            )
-                            # Failed clicks/timeouts are precisely when visual
-                            # recovery is most valuable. Capture one compressed
-                            # internal frame, never a Discord attachment.
-                            if (
-                                func_name == "concierge_browser_step"
-                                and os.getenv("CONCIERGE_INTERNAL_SCREENSHOTS", "0").lower()
-                                in {"1", "true", "yes", "on"}
-                            ):
-                                try:
-                                    from src.bot.approval_views import AGENTIC_BROWSER_SESSIONS
-                                    actuator = AGENTIC_BROWSER_SESSIONS.get(
-                                        str(args.get("mission_id") or "")
-                                    )
-                                    if actuator is not None:
-                                        screenshot_png = await asyncio.to_thread(
-                                            actuator.screenshot, True
-                                        )
-                                except Exception as shot_err:
-                                    print(
-                                        f" [CONCIERGE INTERNAL SCREENSHOT] recovery failed: {shot_err}"
-                                    )
-                            if repeated_failure:
-                                browser_auth_blocked_this_round = True
-                                browser_block_reason_this_round = (
-                                    "the same browser action failed twice; "
-                                    "the target was not actionable"
-                                )
-                                browser_block_stage_this_round = "page"
-                                db_result = (
-                                    "Concierge browser stopped: the same browser action failed "
-                                    "twice. Stop this mission; do not repeat the action."
-                                )
-                            else:
-                                db_result = f"Concierge browser stopped: {type(exc).__name__}: {str(exc)[:300]}"
-                    elif func_name == "request_concierge_action":
-                        # B1 read-tier (no approval) + B2 write-tier (human
-                        # approval via ActionApprovalView). Tenant identity is
-                        # derived from the interaction (uid), never model-supplied.
-                        kind_str = str(args.get("kind") or "") if args.get("kind") is not None else ""
-                        try:
-                            from src.services.concierge.llm_tool import (
-                                ConciergeToolError,
-                                request_concierge_action_async,
-                                propose_concierge_act,
-                                tool_result_json,
-                            )
-                            from src.services.concierge.tenants import TenantStore
-                            from src.services.concierge.audit import AuditLog
-                            from src.security.vault import DEFAULT_DB_PATH as _concierge_db
-                            from src.services.browserless import scrape_rendered_page as _scrape_page
-                            from src.services.concierge.act_actions import ACT_KINDS
-                            from src.services.concierge.browser_gate import READ_KINDS
-
-                            if kind_str in ACT_KINDS:
-                                concierge_args = args.get("args") or {}
-                                try:
-                                    concierge_args = _coerce_concierge_object(concierge_args)
-                                except ValueError as exc:
-                                    raise ConciergeToolError(str(exc)) from exc
-                                proposal = propose_concierge_act(
-                                    tenant="user:" + str(uid),
-                                    kind=kind_str,
-                                    args=concierge_args,
-                                    tenants=TenantStore(_concierge_db),
-                                    audit=AuditLog(_concierge_db),
-                                )
-                                from src.services.concierge.approval_store import \
-                                    ApprovalStore as _ActStore
-                                mission = _ActStore(_concierge_db).active_mission_for(proposal)
-                                if mission:
-                                    # Auto-pilot continuation: the user already
-                                    # approved this (tenant, kind, domain) mission,
-                                    # so the follow-up act executes immediately —
-                                    # no new approval prompt. The result flows back
-                                    # to the model so it can keep going/correct.
-                                    from src.bot.approval_views import execute_approved_act
-                                    act_result = await asyncio.to_thread(
-                                        execute_approved_act,
-                                        proposal["proposal_id"],
-                                        "user:" + str(uid),
-                                        _ActStore(_concierge_db),
-                                    )
-                                    if act_result.get("ok"):
-                                        _res = act_result["res"]
-                                        _verify = act_result["verification"]
-                                        _mission = act_result.get("mission") or mission
-                                        _phase = act_result.get("execution_phase", "completed")
-                                        db_result = tool_result_json({
-                                            "proposal_id": proposal["proposal_id"],
-                                            "kind": proposal["kind"],
-                                            "url": proposal["url"],
-                                            "auto_pilot": True,
-                                            "status": _phase,
-                                            "proposal_status": act_result["outcome"],
-                                            "verify_verdict": _verify.get("verdict"),
-                                            "verify_conf": round(float(_verify.get("confidence") or 0), 2),
-                                            "summary": str(_res.get("summary") or "")[:300],
-                                            "receipt": _res.get("receipt") or {},
-                                            "mission_domain": _mission.get("domain"),
-                                            "mission_expires_at": _mission.get("expires_at"),
-                                        })
-                                        try:
-                                            await reply_msg.channel.send(
-                                                f"🚀 **Auto-pilot {proposal['kind']}** "
-                                                f"{('started — not verified' if _phase == 'started' else act_result['outcome'])} on "
-                                                f"{proposal['url']}\n"
-                                                f"Verify: **{_verify.get('verdict')}** "
-                                                f"(conf {float(_verify.get('confidence') or 0):.2f})\n"
-                                                f"Summary: {str(_res.get('summary') or '(no result)')[:200]}"
-                                            )
-                                        except Exception as r_err:
-                                            print(f" [CONCIERGE AUTO-PILOT] result msg failed: {r_err}")
-                                    else:
-                                        db_result = (
-                                            f"Auto-pilot act rolled back (proposal_id="
-                                            f"{proposal['proposal_id']}): "
-                                            f"{str(act_result.get('error') or 'unknown error')[:300]}. "
-                                            f"The auto-pilot mission for {mission['domain']} is still "
-                                            f"active — propose corrected steps for the same domain and "
-                                            f"they will execute without a new approval."
-                                        )
-                                        try:
-                                            await reply_msg.channel.send(
-                                                "⚠️ **Auto-pilot act rolled back** on "
-                                                + proposal["url"] + ": "
-                                                + str(act_result.get("error") or "")[:200]
-                                            )
-                                        except Exception as r_err:
-                                            print(f" [CONCIERGE AUTO-PILOT] result msg failed: {r_err}")
-                                else:
-                                    # Surface an approval prompt in Discord; the LLM
-                                    # only learns that the proposal is pending.
-                                    try:
-                                        from src.bot.approval_views import ActionApprovalView
-                                        view = ActionApprovalView(
-                                            proposal_id=proposal["proposal_id"],
-                                            owner_uid=int(uid),
-                                            tenant="user:" + str(uid),
-                                            timeout=proposal.get("approval_ttl", 600.0),
-                                        )
-                                        if proposal["kind"] == "fill_form":
-                                            preview = (
-                                                "Agentic browser mission: after approval, the live page "
-                                                "will be inspected and actions selected interactively."
-                                            )
-                                        else:
-                                            steps_preview = proposal["steps"] or []
-                                            preview = json.dumps(steps_preview, indent=2, sort_keys=True)[:500]
-                                        prompt_msg = (
-                                            f"⚠️ **Concierge write-tier action pending approval**\n"
-                                            f"Kind: `{proposal['kind']}`\n"
-                                            f"Target: {proposal['url']}\n"
-                                            f"Proposal ID: `{proposal['proposal_id']}`\n"
-                                            f"Plan: {preview}\n"
-                                            f"Only <@{uid}> can approve or reject."
-                                        )
-                                        await reply_msg.channel.send(prompt_msg, view=view)
-                                    except Exception as dm_err:
-                                        print(f" [CONCIERGE APPROVAL] DM send failed: {dm_err}")
-                                    db_result = (
-                                        f"Write-tier act '{kind_str}' submitted for human approval "
-                                        f"(proposal_id={proposal['proposal_id']}). "
-                                        f"The user must click ✅ in Discord before execution proceeds."
-                                    )
-                                    # The approval prompt has already been
-                                    # delivered. Do not send this tool result
-                                    # back through the model: it may emit the
-                                    # same request repeatedly while waiting for
-                                    # the human and create duplicate proposals.
-                                    approval_pending_this_round = True
-                            elif kind_str in READ_KINDS:
-                                async def _concierge_fetch(url: str) -> dict:
-                                    res = await _scrape_page(url, timeout_ms=30000)
-                                    if not isinstance(res, dict):
-                                        return {"text": "", "screenshot": None}
-                                    return {"text": str(res.get("text") or ""), "screenshot": None}
-
-                                try:
-                                    read_args = _coerce_concierge_object(args.get("args") or {})
-                                except ValueError as exc:
-                                    raise ConciergeToolError(str(exc)) from exc
-                                res = await request_concierge_action_async(
-                                    tenant="user:" + str(uid),
-                                    kind=kind_str,
-                                    args=read_args,
-                                    tenants=TenantStore(_concierge_db),
-                                    audit=AuditLog(_concierge_db),
-                                    fetch_async=_concierge_fetch,
-                                    include_screenshot=True,
-                                )
-                                db_result = tool_result_json(res)
-                            else:
-                                raise ConciergeToolError(
-                                    f"unknown concierge kind {kind_str!r}. Use kind='fill_form' "
-                                    "for browser writes such as finding a product or adding it to a cart; "
-                                    "valid read kinds are order_status, tracking, and price_watch."
-                                )
-                        except ConciergeToolError as exc:
-                            # A concierge refusal is a policy/scope decision, not
-                            # an ordinary tool error.  Do not hand it back to the
-                            # model for improvisation: weaker models commonly turn
-                            # this into a false "the site blocked me" narrative or
-                            # immediately propose another merchant.
-                            reason = str(exc)[:500]
-                            db_result = (
-                                "CONCIERGE_ACTION_REJECTED: " + reason +
-                                ". No browser action was executed. Do not claim "
-                                "that the requested action happened, and do not "
-                                "propose a fallback action in this turn."
-                            )
-                            concierge_refused_this_round = True
-                        except Exception as exc:  # noqa: BLE001 — report back to model
-                            db_result = f"Concierge action failed: {type(exc).__name__}: {exc}"
-                    elif func_name == "request_credential_capture":
-                        # Self-service credential-capture issuance: tenant is
-                        # interaction-derived, the URL is handed to the user,
-                        # raw values never enter model context.
-                        try:
-                            from src.services.concierge.llm_tool import (
-                                ConciergeToolError,
-                                request_credential_capture,
-                                tool_result_json,
-                            )
-                            from src.services.concierge.tenants import TenantStore
-                            from src.services.concierge.audit import AuditLog
-                            from src.security.vault import DEFAULT_DB_PATH as _concierge_db
-                            res = request_credential_capture(
-                                tenant="user:" + str(uid),
-                                args=dict(args or {}),
-                                tenants=TenantStore(_concierge_db),
-                                audit=AuditLog(_concierge_db),
-                            )
-                            # Direct message delivery to user in Discord channel
-                            if not res.get("reused"):
-                                try:
-                                    capture_msg = (
-                                        f"🔐 **Credential capture: {res.get('domain')}**\n"
-                                        f"Open this secure link to store your credentials (one-time, expires in {int(res.get('expires_seconds', 600)) // 60} min):\n"
-                                        f"<{res.get('url')}>\n\n"
-                                        "Your credentials will be encrypted at rest and reused for future logins. Raw values are never visible in chat."
-                                    )
-                                    await reply_msg.channel.send(capture_msg)
-                                except Exception as link_send_err:
-                                    print(f" [CONCIERGE CAPTURE] failed to send capture link message: {link_send_err}")
-                            # The link is delivered directly above. Do not put
-                            # the bearer URL back into model context, where it
-                            # would be echoed repeatedly in follow-up replies.
-                            db_result = json.dumps({
-                                "status": "capture_link_already_sent" if res.get("reused") else "capture_link_sent",
-                                "domain": res.get("domain"),
-                                "expires_seconds": res.get("expires_seconds"),
-                            }, separators=(",", ":"))
-                        except ConciergeToolError as exc:
-                            db_result = "Concierge refused: " + str(exc)
-                        except Exception as exc:  # noqa: BLE001 — report back to model
-                            db_result = f"Credential capture failed: {type(exc).__name__}: {exc}"
-                    elif func_name == "concierge_act_status":
-                        # Post-approval proposal status: read-only, tenant is
-                        # interaction-derived, answers "is the login done /
-                        # what happened" from real stored state.
-                        try:
-                            from src.services.concierge.llm_tool import (
-                                concierge_act_status,
-                                tool_result_json,
-                            )
-                            from src.services.concierge.approval_store import (
-                                ApprovalStore as _ActStore,
-                            )
-                            from src.security.vault import (
-                                DEFAULT_DB_PATH as _status_db,
-                            )
-                            active_missions = [
-                                {
-                                    "mission_id": m["mission_id"],
-                                    "domain": m.get("domain"),
-                                    "kind": m.get("kind"),
-                                }
-                                for m in _ActStore(
-                                    _status_db
-                                ).active_missions_for_tenant("user:" + str(uid), limit=50)
-                            ]
-                            db_result = tool_result_json(
-                                {
-                                    "proposals": concierge_act_status(
-                                        tenant="user:" + str(uid),
-                                        limit=int(args.get("limit") or 10),
-                                    ),
-                                    "active_missions": active_missions,
-                                    "note": (
-                                        "Each outcome is the page text captured while that "
-                                        "act ran. It is NOT proof the user is currently signed "
-                                        "in — a logged-out landing page reads like success. To "
-                                        "confirm a login, observe the live page with "
-                                        "concierge_browser_step, passing the active mission's "
-                                        "mission_id (from active_missions or a proposal's "
-                                        "mission_id field) — a proposal_id is never a "
-                                        "mission_id."
-                                    ),
-                                }
-                            )
-                        except Exception as exc:  # noqa: BLE001 — report back to model
-                            db_result = f"Concierge status failed: {type(exc).__name__}: {exc}"
                     elif func_name == "list_world_model_claims":
                         db_result = json.dumps(
                             list_world_model_claims(
@@ -9920,57 +9049,6 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         "content": tagged_content,
                     }
                 )
-                if (
-                    func_name == "concierge_browser_step"
-                    and str(args.get("action") or "observe").lower() == "observe"
-                    and browser_observation_counts.get(observation_key, 0) >= 2
-                ):
-                    # Provider-side intervention for malformed/repeated tool
-                    # calls. This remains site-agnostic: it does not select a
-                    # target or invent a form action, it only requires the
-                    # model to use one of the controls it just observed.
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "SYSTEM BROWSER PROGRESS CHECK: the same page was observed twice. "
-                            "Do not emit another observe call. Emit exactly one click, type, "
-                            "navigate, or scroll call using a visible control from the latest "
-                            "browser result, or call end_turn if the task is blocked."
-                        ),
-                    })
-
-                # Browser observations include a screenshot for debug/vision
-                # turns. Keep the tool result mask-only, but attach the image
-                # as a separate multimodal user message so the next model
-                # request can actually inspect the live page. Previously the
-                # image was only posted to Discord; logs showed images=0 on
-                # every follow-up, causing repeated blind observations.
-                if (
-                    func_name == "concierge_browser_step"
-                    and isinstance(screenshot_png, (bytes, bytearray))
-                    and len(screenshot_png) > 0
-                ):
-                    # Keep only the newest browser frame in the live turn.
-                    # Accumulating every observation made multi-step turns
-                    # grow to multiple images and triggered provider-specific
-                    # invalid-request errors.
-                    messages[:] = [
-                        m for m in messages
-                        if not m.get("_live_browser_screenshot")
-                    ]
-                    messages.append(
-                        {
-                            "role": "user",
-                            "_live_browser_screenshot": True,
-                            "content": (
-                                "[LIVE BROWSER SCREENSHOT] Inspect this image "
-                                "before choosing the next browser action."
-                            ),
-                            "images": [
-                                base64.b64encode(bytes(screenshot_png)).decode("ascii")
-                            ],
-                        }
-                    )
 
                 # Record the ACTUAL tool execution for future-turn context.
                 # This deliberately stores only compact metadata, not the full
@@ -10105,52 +9183,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 end_turn_called = True
                 break
 
-        if approval_pending_this_round:
-            final_content = (
-                "I sent an approval request in Discord. Click ✅ to continue, "
-                "or ✕ to stop it."
-            )
-            end_turn_called = True
-            break
 
-        if concierge_refused_this_round:
-            final_content = (
-                "I stopped because the browser action was rejected before it ran. "
-                "No item was added and no other site was opened. Reason: "
-                + str(db_result or "the requested action was outside the approved site scope.")[:500]
-            )
-            end_turn_called = True
-            break
-
-        if browser_auth_blocked_this_round:
-            if "same browser action failed" in browser_block_reason_this_round:
-                final_content = (
-                    "I stopped the browser mission because the same browser action failed "
-                    "twice. The target was not actionable, so I did not repeat it."
-                )
-            elif "did not change" in browser_block_reason_this_round:
-                stage_text = {
-                    "identifier": "The identifier form was still displayed.",
-                    "password": "The password form was displayed, but the sign-in action did not advance the page.",
-                    "form": "A form was still displayed, but the action did not advance the page.",
-                }.get(browser_block_stage_this_round, "The page did not expose a changed state.")
-                final_content = (
-                    "I stopped the browser mission because the page did not change "
-                    f"between repeated observations. {stage_text}"
-                )
-            elif "click was repeated" in browser_block_reason_this_round:
-                final_content = (
-                    "I stopped the browser mission because the same click was repeated twice "
-                    "without the page changing. I did not repeat it again."
-                )
-            else:
-                final_content = (
-                    "The site requires you to complete an authentication or security verification step manually. "
-                    "I stopped the browser mission and will not handle the code. "
-                    "Complete the verification in the browser session, then ask me to check the status."
-                )
-            end_turn_called = True
-            break
 
                 # ── EMPTY SHELL / PYTHON LOOP BREAKER ──
         def _is_empty_tool_args(tc_item):
@@ -10343,16 +9376,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     final_content = re.sub(r"</?(?:thought|think)>", "", final_content, flags=re.IGNORECASE)
     final_content = re.sub(r"(?im)^\s*end_turn\s*$", "", final_content).strip()
 
-    # Concierge pages can contain account identifiers. Never echo an email
-    # address from a login page back into Discord, even if the model includes
-    # it in its summary.
-    if concierge_turn:
-        final_content = re.sub(
-            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
-            "[account email redacted]",
-            final_content,
-            flags=re.IGNORECASE,
-        )
+
 
     # Inline Memory Extraction (Zero Tool Calls):
     memory_matches = re.findall(r"<memory>(.*?)</memory>", final_content, flags=re.DOTALL | re.IGNORECASE)
@@ -10898,24 +9922,8 @@ async def cancel_advisor(ctx: commands.Context):
         return
     uid = str(ctx.author.id)
     task = ACTIVE_ADVISOR_TASKS.get(uid)
-    tenant = "user:" + uid
-    from src.services.concierge.approval_store import ApprovalStore
-    mission_store = ApprovalStore()
-    active_missions = mission_store.active_missions_for_tenant(tenant, limit=50)
-    revoked = mission_store.cancel_missions_for_tenant(tenant)
-    try:
-        from src.bot.approval_views import AGENTIC_BROWSER_SESSIONS
-        for mission in active_missions:
-            actuator = AGENTIC_BROWSER_SESSIONS.pop(mission["mission_id"], None)
-            if actuator is not None:
-                await asyncio.to_thread(actuator.close)
-    except Exception as exc:
-        print(f" [CANCEL] browser cleanup failed for uid={uid}: {exc}", flush=True)
     if task is None or task.done():
-        if revoked:
-            await ctx.send("🛑 Cancelled the active browser mission.")
-        else:
-            await ctx.send("ℹ No advisor request is currently running for you.")
+        await ctx.send("ℹ No advisor request is currently running for you.")
         return
     # Persistent hard-cancel marker.
     USER_INTERRUPTS.pop(uid, None)
