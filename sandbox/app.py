@@ -438,6 +438,12 @@ class WorkspaceFileRequest(BaseModel):
     path: str
 
 
+class WorkspaceFileWriteRequest(BaseModel):
+    user_id: str
+    filename: str
+    content_base64: str
+
+
 class WorkspaceFileResponse(BaseModel):
     path: str
     filename: str
@@ -1135,6 +1141,48 @@ async def workspace_list(user_id: str):
     return {
         "files": files,
     }
+
+
+@app.post("/workspace/write")
+async def workspace_write(req: WorkspaceFileWriteRequest):
+    """Store an uploaded file in exactly one user's persistent workspace."""
+    filename = Path(str(req.filename or "")).name
+    if not filename or filename in {".", ".."}:
+        raise HTTPException(status_code=400, detail="A valid filename is required.")
+    if len(filename) > 180:
+        filename = filename[:180]
+    try:
+        data = base64.b64decode(req.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 file content.")
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(data) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Uploaded file exceeds the 100 MB limit.")
+    root = _user_workspace(req.user_id)
+    target = (root / filename).resolve()
+    # Preserve repeated uploads/messages instead of silently overwriting the
+    # previous artifact: message.txt, message_1.txt, etc.
+    if target.exists():
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        for index in range(1, 10000):
+            candidate = (root / f"{stem}_{index}{suffix}").resolve()
+            if not candidate.exists():
+                target = candidate
+                filename = candidate.name
+                break
+        else:
+            raise HTTPException(status_code=409, detail="Too many files with this name.")
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid workspace filename.")
+    try:
+        target.write_bytes(data)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to save workspace file: {exc}")
+    return {"path": filename, "filename": filename, "size": len(data)}
 
 
 @app.post(

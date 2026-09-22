@@ -1,4 +1,5 @@
 import src.core.state
+
 import html
 import json
 import os
@@ -26,6 +27,14 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands
 from typing import Optional, List, Dict, Any, Tuple
+
+
+def _safe_message_log_text(content: str) -> str:
+    return re.sub(
+        r"(?i)\b(?:password|passwd|passcode|secret|token)\b\s*(?:is|=|:)\s*[^\s,;]+",
+        "[credential redacted]",
+        str(content or ""),
+    )
 
 
 # --- UNIVERSAL CLOSE BUTTON PATCH ---
@@ -76,10 +85,12 @@ from src.core.state import *
 from src.utils.helpers import *
 from src.services.search import *
 from src.services.gmail import (
+    backfill_gmail_messages,
     begin_gmail_authorization,
     complete_gmail_authorization,
     disconnect_gmail,
     gmail_status,
+    list_gmail_messages,
 )
 from src.db.queries import *
 from src.services.llm import *
@@ -179,6 +190,117 @@ class _HelpPageView(discord.ui.View):
             pass
 
 
+class _GmailHistoryView(discord.ui.View):
+    """Paginated, closable viewer for the stored mail archive."""
+
+    PAGE_SIZE = 8
+
+    def __init__(self, ctx: commands.Context, rows: list[dict]):
+        super().__init__(timeout=300)
+        self.ctx = ctx
+        self.rows = rows or []
+        self.page = 0
+        self._message: discord.Message | None = None
+        REPORT_CONTROL_VIEWS.setdefault(ctx.author.id, set()).add(self)
+        self._refresh_buttons()
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+
+    def _page_rows(self) -> list[dict]:
+        start = self.page * self.PAGE_SIZE
+        return self.rows[start:start + self.PAGE_SIZE]
+
+    def _refresh_buttons(self) -> None:
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.total_pages - 1
+        self.page_indicator.label = f"{self.page + 1} / {self.total_pages}"
+
+    def _embed(self) -> discord.Embed:
+        title = " Gmail archive"
+        if self.total_pages > 1:
+            title = f"{title} · {self.page + 1}/{self.total_pages}"
+        embed = discord.Embed(title=title, color=discord.Color.blurple())
+        if not self.rows:
+            embed.description = (
+                " No stored mail yet. New messages are archived automatically "
+                "when the watcher detects them."
+            )
+        else:
+            lines = []
+            for r in self._page_rows():
+                marker = " ⚠ truncated" if r["body_truncated"] else ""
+                lines.append(
+                    f"**{r['subject'] or '(no subject)'}**{marker}\n"
+                    f"{(r['sender_email'] or '?')} · {r['date'] or '?'} "
+                    f"· seen {r['seen_at']}"
+                )
+                snippet = (r.get("snippet") or "").strip()
+                if snippet:
+                    lines.append(f"*{snippet[:150]}*")
+            embed.description = "\n\n".join(lines) or "No content."
+            embed.set_footer(text=f"{len(self.rows)} stored message(s) · bodies archived")
+        return embed
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(
+                " Only the person who ran this command can use these controls.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _update(self, interaction: discord.Interaction) -> None:
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.primary, disabled=True)
+    async def page_indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        self.page = min(self.total_pages - 1, self.page + 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label=" Close", style=discord.ButtonStyle.danger)
+    async def close_current(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        REPORT_CONTROL_MESSAGES.get(self.ctx.author.id, set()).discard(self._message)
+        REPORT_CONTROL_VIEWS.get(self.ctx.author.id, set()).discard(self)
+        await interaction.response.edit_message(view=None)
+        self.stop()
+
+    @discord.ui.button(label=" Close All", style=discord.ButtonStyle.danger)
+    async def close_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.defer()
+        await _close_all_control_messages(self.ctx.author.id)
+
+    async def on_timeout(self) -> None:
+        REPORT_CONTROL_VIEWS.get(self.ctx.author.id, set()).discard(self)
+        try:
+            if self._message is not None:
+                for child in self.children:
+                    child.disabled = True
+                await self._message.edit(view=self)
+        except Exception:
+            pass
+
+
 @bot.command(name="help")
 async def help_command(ctx: commands.Context, *, section: str = ""):
     user_id = str(ctx.author.id)
@@ -258,7 +380,12 @@ async def help_command(ctx: commands.Context, *, section: str = ""):
          "`!clear` / `!clearchat` — Clear chat history or context.\n"
          "`!testpush [msg]` — Send a test push notification to your phone via ntfy.\n"
          "`!ntfysetup` — DM yourself secret ntfy topic and instructions.\n"
-         "`!gmail connect|status|disconnect` — Connect Gmail account via read-only OAuth."),
+         "`!gmail connect` — Connect Gmail via read-only OAuth; new mail is DM-digested (~60s poll).\n"
+         "`!gmail status` — Show Gmail connection and watch state.\n"
+         "`!gmail disconnect` — Remove the Gmail connection and stop watching.\n"
+         "`!gmail autoparse on|off` — Opt new mail into LLM triage (off = digest only).\n"
+         "`!gmail history [limit]` — Paginated archived mail (bodies are stored per user).\n"
+         "`!gmail backfill [count|all]` — Archive the last N emails, or ALL mail (default 25)."),
 
         ("Memory & Knowledge Graph",
          "`!inspectmemory` (aliases: `!memories`, `!viewmemory`) — Paginated view of active world model claims and saved notes.\n"
@@ -335,9 +462,12 @@ async def gmail_cmd(ctx: commands.Context):
     if ctx.invoked_subcommand is None:
         await ctx.send(
             "**Gmail controls**\n"
-            "`!gmail connect` — Connect your Gmail account.\n"
+            "`!gmail connect` — Connect your Gmail account (read-only OAuth).\n"
             "`!gmail status` — Show Gmail connection status.\n"
-            "`!gmail disconnect` — Remove the Gmail connection."
+            "`!gmail disconnect` — Remove the Gmail connection.\n"
+            "`!gmail autoparse on|off` — Opt new mail into LLM triage (off = digest only).\n"
+            "`!gmail history [limit]` — Paginated archived mail for your account.\n"
+            "`!gmail backfill [count|all]` — Archive the last N emails, or ALL mail (default 25)."
         )
 
 
@@ -401,6 +531,116 @@ async def gmail_disconnect_cmd(ctx: commands.Context):
         await ctx.send(
             f"Gmail disconnect failed: `{type(exc).__name__}: {exc}`"
         )
+
+
+@gmail_cmd.command(name="autoparse")
+async def gmail_autoparse_cmd(ctx: commands.Context, mode: str = ""):
+    """Opt-in LLM triage of newly watched mail: !gmail autoparse on|off"""
+    user_id = str(ctx.author.id)
+    mode = (mode or "").strip().lower()
+    if mode not in ("on", "off"):
+        await ctx.send(
+            "Usage: `!gmail autoparse on` / `!gmail autoparse off`\n"
+            "When on, every new email the watcher detects is handed to the "
+            "advisor for triage (facts persisted to the knowledge graph, "
+            "2-line summary posted)."
+        )
+        return
+    try:
+        from src.services.gmail_watch import set_autoparse
+        await ctx.send(set_autoparse(user_id, mode == "on"))
+    except Exception as exc:
+        await ctx.send(
+            f"Gmail autoparse failed: `{type(exc).__name__}: {exc}`"
+        )
+
+
+@gmail_cmd.command(name="history")
+async def gmail_history_cmd(ctx: commands.Context, limit: str = "20"):
+    """List stored mail for your account: !gmail history [limit]"""
+    user_id = str(ctx.author.id)
+    try:
+        lim = max(1, min(int(limit or 20), 100))
+    except ValueError:
+        lim = 20
+    try:
+        rows = list_gmail_messages(user_id, limit=lim)
+    except Exception as exc:
+        await ctx.send(
+            f"Gmail history failed: `{type(exc).__name__}: {exc}`"
+        )
+        return
+    view = _GmailHistoryView(ctx, rows)
+    msg = await ctx.send(embed=view._embed(), view=view)
+    view._message = msg
+    REPORT_CONTROL_MESSAGES.setdefault(ctx.author.id, set()).add(msg)
+
+
+@gmail_cmd.command(name="backfill")
+async def gmail_backfill_cmd(ctx: commands.Context, count: str = "25"):
+    """Archive the last N emails, or all: !gmail backfill [count|all]"""
+    user_id = str(ctx.author.id)
+    raw = (count or "25").strip().lower()
+    if raw in ("all", "0", ""):
+        n = 0  # walk the entire mailbox
+    else:
+        try:
+            n = max(1, int(raw))
+        except ValueError:
+            n = 25
+    loop = ctx.bot.loop
+
+    def _progress(processed: int, stored: int, skipped: int, failed: int) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ctx.send(
+                    f" Backfilling... {processed} processed "
+                    f"({stored} new, {skipped} already stored, {failed} failed)."
+                ),
+                loop,
+            )
+        except Exception:
+            pass
+
+    target = "ALL mail" if n == 0 else f"the last {n} email(s)"
+    try:
+        await ctx.send(f" Backfilling {target} into your archive...")
+        result = await asyncio.to_thread(
+            backfill_gmail_messages, user_id, n, _progress
+        )
+    except Exception as exc:
+        await ctx.send(
+            f"Gmail backfill failed: `{type(exc).__name__}: {exc}`"
+        )
+        return
+    if result.get("status") != "ok":
+        error = result.get("error") or "unknown error"
+        if result.get("status") == "busy":
+            await ctx.send(
+                " A backfill is already running. Progress posts here as it "
+                "goes; `!gmail history` shows what's archived so far."
+            )
+        elif "rateLimitExceeded" in str(error):
+            await ctx.send(
+                " Gmail's per-user quota was hit mid-walk. It resets each "
+                "minute and the walk retries automatically; just run "
+                "`!gmail backfill all` again and it resumes where it stopped."
+            )
+        else:
+            await ctx.send(f"Gmail backfill failed: `{error}`")
+        return
+    await ctx.send(
+        f" Backfill complete: **{result['stored']} new** archived, "
+        f"**{result['skipped']}** already stored, **{result['failed']}** failed. "
+        f"`!gmail history` to see them."
+    )
+    # Embed the freshly archived mail into the vector store in the background
+    # (resumable: embedded_at guards are on each row, sweep loop catches stragglers).
+    try:
+        from src.services.gmail_watch import embed_pending_gmail
+        asyncio.create_task(embed_pending_gmail(user_id, 0))
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -4784,6 +5024,11 @@ async def wipe_memory(ctx: commands.Context):
     except Exception:
         pass
     try:
+        SESSION_COMPRESSED.pop(uid, None)
+        SESSION_COMPRESSION_INFLIGHT.discard(uid)
+    except Exception:
+        pass
+    try:
         c.execute("DELETE FROM chat_history WHERE user_id = ?", (uid,))
         conn.commit()
     except Exception as e:
@@ -4859,7 +5104,7 @@ async def on_ready():
     print("Advisor controls: !cancel / !status")
     print("==========================================")
 
-    load_history_on_boot(limit=100)
+    load_history_on_boot()
 
     print(f" [DEBUG] on_ready: BACKGROUND_TASKS_STARTED={BACKGROUND_TASKS_STARTED}", flush=True)
     if BACKGROUND_TASKS_STARTED:
@@ -4902,6 +5147,34 @@ async def on_ready():
         print(" [MONITOR] Persistent financial monitor started.")
     except Exception as exc:
         print(f" [MONITOR] Monitor watchdog failed to start: {type(exc).__name__}: {exc}")
+
+    # Gmail watcher: history-API polling for new mail. Deterministic digest
+    # to Discord; LLM triage only for users who opted in via !gmail autoparse.
+    try:
+        from src.services.gmail_watch import gmail_watchdog_loop, _connected_users
+        if _connected_users():
+            t_gmail = bot.loop.create_task(gmail_watchdog_loop())
+            _PERSISTENT_TASKS.add(t_gmail)
+            t_gmail.add_done_callback(_PERSISTENT_TASKS.discard)
+            print(" [GMAIL WATCH] started.")
+        else:
+            print(" [GMAIL WATCH] no connected Gmail accounts; loop not started.")
+    except Exception as exc:
+        print(f" [GMAIL WATCH] failed to start: {type(exc).__name__}: {exc}")
+
+    # Gmail vector indexing: sweep archived mail that has not been embedded
+    # yet into Qdrant (domain gmail_message, excluded from retrieval by default).
+    try:
+        from src.services.gmail_watch import gmail_embed_loop, _connected_users
+        if _connected_users():
+            t_gembed = bot.loop.create_task(gmail_embed_loop())
+            _PERSISTENT_TASKS.add(t_gembed)
+            t_gembed.add_done_callback(_PERSISTENT_TASKS.discard)
+            print(" [GMAIL EMBED] loop started.")
+        else:
+            print(" [GMAIL EMBED] no connected Gmail accounts; loop not started.")
+    except Exception as exc:
+        print(f" [GMAIL EMBED] failed to start: {type(exc).__name__}: {exc}")
 
     # Converge Qdrant with SQLite ground truth: delete stale claim points,
     # re-index claims missed while embed/Qdrant was down.
@@ -4976,19 +5249,108 @@ async def _send_thinking_placeholder(message: discord.Message, handle: _AdvisorR
         print(f" [MESSAGE] Thinking placeholder failed: {type(exc).__name__}: {exc}")
 
 
+async def _run_queued_advisor_item(uid: str, item: dict) -> None:
+    """Drain one queued message after the user's active turn completes."""
+    handle = item["handle"]
+    task = asyncio.create_task(
+        chat_with_delilah(
+            item["prompt"],
+            item["author_id"],
+            handle,
+            image_b64_list=item.get("images") or [],
+        ),
+        name=f"advisor:queued:{item['author_id']}:{item['message_id']}",
+    )
+    ACTIVE_ADVISOR_TASKS[uid] = task
+    await _set_advisor_status(
+        uid,
+        phase="starting",
+        started_at=time.monotonic(),
+        cancelled=False,
+        cancel_requested=False,
+        attempts=0,
+        tool_calls=0,
+        output_chars=0,
+        last_tool=None,
+        pending_tools=[],
+        queued=False,
+    )
+    placeholder = asyncio.create_task(
+        _send_thinking_placeholder(item["message"], handle),
+        name=f"thinking:queued:{item['author_id']}:{item['message_id']}",
+    )
+    try:
+        await task
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f" [QUEUE] advisor task crashed uid={uid}: {type(exc).__name__}: {exc}", flush=True)
+    finally:
+        if not placeholder.done():
+            placeholder.cancel()
+        try:
+            await placeholder
+        except BaseException:
+            pass
+        if ACTIVE_ADVISOR_TASKS.get(uid) is task:
+            ACTIVE_ADVISOR_TASKS.pop(uid, None)
+        pending = PENDING_ADVISOR_MESSAGES.get(uid) or []
+        if pending:
+            next_item = pending.pop(0)
+            if not pending:
+                PENDING_ADVISOR_MESSAGES.pop(uid, None)
+            asyncio.create_task(_run_queued_advisor_item(uid, next_item), name=f"advisor:queue-drain:{uid}")
+
+
+def _queue_advisor_item(uid: str, item: dict) -> int | None:
+    queue = PENDING_ADVISOR_MESSAGES.setdefault(uid, [])
+    if len(queue) >= MAX_PENDING_ADVISOR_MESSAGES:
+        return None
+    queue.append(item)
+    return len(queue)
+
+
+@bot.command(name="btw")
+async def btw_command(ctx: commands.Context, *, message: str = ""):
+    """Queue a side note/question without cancelling the active advisor turn."""
+    uid = str(ctx.author.id)
+    if not message.strip():
+        await ctx.send("Usage: `!btw your side question or note`")
+        return
+    if not (ACTIVE_ADVISOR_TASKS.get(uid) and not ACTIVE_ADVISOR_TASKS[uid].done()):
+        await ctx.send("No active turn—send it normally and I’ll answer it.")
+        return
+    item = {
+        "prompt": "[SIDE NOTE FROM USER — answer this after the current task]\n" + message.strip(),
+        "images": [],
+        "author_id": ctx.author.id,
+        "message_id": getattr(ctx.message, "id", "btw"),
+        "channel": ctx.channel,
+        "message": ctx.message,
+        "handle": _AdvisorReplyHandle(ctx.channel, source_message_id=getattr(ctx.message, "id", None)),
+    }
+    position = _queue_advisor_item(uid, item)
+    if position is None:
+        await ctx.send(f"The side-message queue is full ({MAX_PENDING_ADVISOR_MESSAGES}). Use `!cancel` or wait for the current task.")
+    else:
+        await ctx.send(f"Queued your side note as #{position}; I’ll answer it after the current task.")
+
+
 @bot.event
 async def on_message(message: discord.Message):
-    user_id = str(message.author.id)
-    src.core.state.CURRENT_USER_ID.set(str(message.author.id))
+    effective_id = os.getenv("SPOOF_USER_ID") or str(message.author.id)
+    user_id = effective_id
+    src.core.state.CURRENT_USER_ID.set(effective_id)
     if message.author.id == bot.user.id:
         return
-    src.core.state.CURRENT_USER_ID.set(str(message.author.id))
 
     message_id = getattr(message, "id", None)
     attachment_count = len(message.attachments or [])
     print(
         f" [MESSAGE] received id={message_id} author={message.author.id} "
-        f"content_chars={len(message.content or '')} attachments={attachment_count}",
+        f"channel={message.channel.id} guild={message.guild.id if message.guild else None} "
+        f"content_chars={len(message.content or '')} attachments={attachment_count} "
+        f"content={_safe_message_log_text(message.content)!r}",
         flush=True,
     )
 
@@ -5078,20 +5440,82 @@ async def on_message(message: discord.Message):
         return
 
     prompt = message.content.strip()
+    # Preserve pasted/raw message content as a workspace artifact. This keeps
+    # large pasted tables or documents available for later sandbox processing
+    # without relying on the model context to retain the entire payload.
+    if prompt:
+        try:
+            import sandbox_client
+            # Only save and append artifact notice if the message is large (e.g. pasted code/data/document)
+            if len(prompt) > 2500:
+                raw_path = await sandbox_client.save_workspace_file(
+                    str(user_id), "message.txt", prompt.encode("utf-8")
+                )
+                if raw_path:
+                    prompt = (
+                        f"[RAW MESSAGE SAVED TO WORKSPACE: {raw_path}]\n"
+                        f"Original user request: {prompt[:2000]}\n"
+                        "Work from this saved artifact when the user asks you to inspect, filter, "
+                        "transform, or summarize the pasted content."
+                    )
+            else:
+                # Silently save to workspace in background without modifying prompt
+                await sandbox_client.save_workspace_file(
+                    str(user_id), "message.txt", prompt.encode("utf-8")
+                )
+        except Exception as exc:
+            print(f" [MESSAGE] raw message preservation failed: {type(exc).__name__}: {exc}")
     if pdf_texts:
         prompt = (prompt + "\n" if prompt else "") + "\n".join(pdf_texts)
+
+    # Preserve originals in the user's persistent workspace. Large text files
+    # (especially CSV/XLSX exports) are represented by metadata below instead
+    # of being dumped into the advisor prompt.
+    saved_attachment_notes = []
+    try:
+        import sandbox_client
+        for att in message.attachments:
+            if int(getattr(att, "size", 0) or 0) > 100 * 1024 * 1024:
+                saved_attachment_notes.append(
+                    f"Attachment {att.filename!r} was not saved: exceeds the 100 MB workspace limit."
+                )
+                continue
+            raw_attachment = await att.read(use_cached=False)
+            saved_path = await sandbox_client.save_workspace_file(
+                str(user_id), att.filename, raw_attachment
+            )
+            if saved_path:
+                saved_attachment_notes.append(
+                    f"Attachment saved to workspace: {saved_path}"
+                )
+            else:
+                saved_attachment_notes.append(
+                    f"Attachment {att.filename!r} could not be saved to workspace."
+                )
+    except Exception as exc:
+        print(f" [MESSAGE] workspace attachment preservation failed: {type(exc).__name__}: {exc}")
+
+    if saved_attachment_notes:
+        prompt = (prompt + "\n\n" if prompt else "") + "[UPLOADED FILES]\n" + "\n".join(saved_attachment_notes)
 
     text_attachments = []
     text_extensions = (
         '.txt', '.py', '.csv', '.json', '.md', '.log', '.yml', 
         '.yaml', '.xml', '.ini', '.sh', '.js', '.html', '.css'
     )
+    spreadsheet_extensions = ('.csv', '.tsv', '.xlsx', '.xls', '.ods')
     for att in message.attachments:
         mime = att.content_type or ""
         fname = att.filename.lower()
         if att.size > 2_000_000:
             continue
-        if mime.startswith('text/') or mime.startswith('application/json') or fname.endswith(text_extensions):
+        # Keep small text snippets convenient, but never inline a large upload;
+        # the original is already available at the workspace path above.
+        if (
+            att.size <= 200_000
+            and not fname.endswith(spreadsheet_extensions)
+            and (mime.startswith('text/') or mime.startswith('application/json') or fname.endswith(text_extensions))
+        ):
             try:
                 file_bytes = await att.read()
                 file_text = file_bytes.decode('utf-8')
@@ -5148,7 +5572,7 @@ async def on_message(message: discord.Message):
         print(f"ℹ [MESSAGE] nothing to process id={message_id}")
         return
 
-    uid = str(message.author.id)
+    uid = effective_id
     handle = _AdvisorReplyHandle(message.channel, source_message_id=message_id)
     placeholder_task = None
 
@@ -5164,12 +5588,20 @@ async def on_message(message: discord.Message):
             if existing is not None and not existing.done():
                 print(f" [MESSAGE] existing advisor task uid={uid}")
                 try:
-                    await asyncio.wait_for(
-                        message.channel.send(
-                            " **I'm already working on your previous request.** "
-                            "Use `!status` to check progress or `!cancel` to stop it."
-                        ),
-                        timeout=8.0,
+                    position = _queue_advisor_item(uid, {
+                        "prompt": prompt,
+                        "images": images,
+                        "author_id": message.author.id,
+                        "message_id": message_id,
+                        "channel": message.channel,
+                        "message": message,
+                        "handle": handle,
+                    })
+                    if position is None:
+                        response = f" **I'm already working on your previous request, and the queue is full ({MAX_PENDING_ADVISOR_MESSAGES}).** Use `!status` or `!cancel`."
+                    else:
+                        response = f" **Queued this request as #{position}.** I’ll start it after the current task finishes. Use `!status` to check progress."
+                    await asyncio.wait_for(message.channel.send(response), timeout=8.0
                     )
                 except Exception as exc:
                     print(f" [MESSAGE] busy response failed: {type(exc).__name__}: {exc}")
@@ -5235,6 +5667,14 @@ async def on_message(message: discord.Message):
                 pass
             except Exception:
                 pass
+        # Start exactly one queued request after this turn.  The active task
+        # itself is removed by chat_with_delilah's finally block.
+        pending = PENDING_ADVISOR_MESSAGES.get(uid) or []
+        if pending and not (ACTIVE_ADVISOR_TASKS.get(uid) and not ACTIVE_ADVISOR_TASKS[uid].done()):
+            next_item = pending.pop(0)
+            if not pending:
+                PENDING_ADVISOR_MESSAGES.pop(uid, None)
+            asyncio.create_task(_run_queued_advisor_item(uid, next_item), name=f"advisor:queue-drain:{uid}")
 
 import uvicorn
 

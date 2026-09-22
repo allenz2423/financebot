@@ -782,7 +782,6 @@ async def plaid_polling_loop(conn: sqlite3.Connection, tx_queue: asyncio.Queue, 
     Background polling loop for Plaid updates across discovered users and databases.
     """
     import src.core.state as state
-    from src.db.queries import PLAID_SYNC_STATE
     last_balance_update: Dict[str, float] = {}
     logger.info("Starting Plaid background polling loop...")
     
@@ -795,7 +794,7 @@ async def plaid_polling_loop(conn: sqlite3.Connection, tx_queue: asyncio.Queue, 
                 client_id, secret, tokens = _get_user_plaid_creds(user_id=uid)
                 if not tokens:
                     continue
-                PLAID_SYNC_STATE[uid] = True
+                state.PLAID_SYNC_STATE["active"] = True
                 try:
                     await sync_plaid_transactions(conn, tx_queue, bot, channel_id, post_discord=True, user_id=uid)
                     now = asyncio.get_event_loop().time()
@@ -805,7 +804,7 @@ async def plaid_polling_loop(conn: sqlite3.Connection, tx_queue: asyncio.Queue, 
                 except Exception as exc:
                     logger.error(f"Plaid sync failed for user {uid}: {exc}")
                 finally:
-                    PLAID_SYNC_STATE[uid] = False
+                    state.PLAID_SYNC_STATE["active"] = False
         except Exception as exc:
             logger.error(f"Plaid polling loop global error: {exc}", exc_info=True)
         await asyncio.sleep(PLAID_POLL_INTERVAL_SECONDS)

@@ -39,7 +39,7 @@ async def browser_navigate(url: str, timeout_ms: int = 30000) -> str:
     if not url.lower().startswith(("http://", "https://")):
         return "Error: URL must start with http:// or https://"
 
-    endpoint = f"{BROWSERLESS_URL}/content"
+    endpoint = f"{BROWSERLESS_URL}/content?stealth=true"
     payload = {
         "url": url,
         "gotoOptions": {
@@ -67,7 +67,7 @@ async def browser_wait_and_scrape(url: str, wait_for_selector: Optional[str] = N
     if not url.lower().startswith(("http://", "https://")):
         return "Error: URL must start with http:// or https://"
 
-    endpoint = f"{BROWSERLESS_URL}/content"
+    endpoint = f"{BROWSERLESS_URL}/content?stealth=true"
     payload: Dict[str, Any] = {
         "url": url,
         "gotoOptions": {
@@ -97,7 +97,7 @@ async def browser_extract_links(url: str, timeout_ms: int = 30000) -> str:
     if not url.lower().startswith(("http://", "https://")):
         return "Error: URL must start with http:// or https://"
 
-    endpoint = f"{BROWSERLESS_URL}/content"
+    endpoint = f"{BROWSERLESS_URL}/content?stealth=true"
     payload = {
         "url": url,
         "gotoOptions": {

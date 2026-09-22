@@ -39,6 +39,16 @@ def get_primary_user_id() -> str:
         pass
     return "primary_user"
 
+
+def _normalize_user_ref(subject: str, user_id: Optional[str] = None) -> str:
+    """Map the LLM-facing 'user:current' placeholder onto the caller's real tenant
+    partition (``user:<id>``) so world-model isolation (``eid != user_prefix``)
+    never hides those claims. Other refs pass through unchanged."""
+    if subject == "user:current":
+        uid = str(user_id or get_primary_user_id()).strip()
+        return f"user:{uid}"
+    return subject
+
 def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -56,6 +66,7 @@ def upsert_entity(
     attributes: Optional[Dict[str, Any]] = None
 ) -> str:
     """Create or update a canonical entity node in the Active World Model."""
+    entity_id = _normalize_user_ref(entity_id)
     aliases_json = json.dumps(aliases or [])
     attributes_json = json.dumps(attributes or {})
     
@@ -89,17 +100,19 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
     Multi-tenant safe: user:<id> entities belonging to other users are never matched.
     """
     matched_ids = set()
-    normalized_q = query.lower()
+    normalized_q = _normalize_user_ref(query.lower())
     target_user_id = str(user_id or get_primary_user_id()).strip() if user_id is not None else None
     user_prefix = f"user:{target_user_id}" if target_user_id else None
+    if user_prefix:
+        normalized_q = normalized_q.replace("user:current", user_prefix)
 
     with _get_connection() as conn:
         c = conn.cursor()
-        
+
         # 1. Direct scan against aliases and canonical names
         c.execute("SELECT entity_id, canonical_name, aliases FROM kg_entities")
         for row in c.fetchall():
-            eid = row["entity_id"]
+            eid = _normalize_user_ref(row["entity_id"], target_user_id)
             if eid.startswith("user:") and user_prefix and eid != user_prefix:
                 continue
 
@@ -108,7 +121,7 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
             if re.search(r"\b" + re.escape(name) + r"\b", normalized_q) or eid.lower() in normalized_q:
                 matched_ids.add(eid)
                 continue
-            
+
             try:
                 aliases = json.loads(row["aliases"]) if row["aliases"] else []
                 for alias in aliases:
@@ -129,7 +142,7 @@ def resolve_entities(query: str, user_id: Optional[str] = None) -> List[str]:
                     ORDER BY rank LIMIT 10
                 """, (fts_query,))
                 for row in c.fetchall():
-                    tid = row["target_id"]
+                    tid = _normalize_user_ref(row["target_id"], target_user_id)
                     if tid.startswith("user:") and user_prefix and tid != user_prefix:
                         continue
                     matched_ids.add(tid)
@@ -225,7 +238,8 @@ def assert_claim(
     valid_to: Optional[str] = None,
     evidence_refs: Optional[List[str]] = None,
     parent_claim_ids: Optional[List[str]] = None,
-    claim_id: Optional[str] = None
+    claim_id: Optional[str] = None,
+    owner_user_id: Optional[str] = None
 ) -> str:
     """
     Assert an epistemic claim into the Active World Model.
@@ -239,6 +253,7 @@ def assert_claim(
     explicit retraction via retract_world_model_claim().
     """
     cid = claim_id or f"claim_{uuid.uuid4().hex[:12]}"
+    subject_id = _normalize_user_ref(subject_id, owner_user_id)
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     v_from = valid_from or now_utc
     scalar_str = str(scalar_value) if scalar_value is not None else None
@@ -312,8 +327,9 @@ def assert_claim(
         import asyncio
         from src.services.qdrant_client import index_single_claim
         loop = asyncio.get_running_loop()
-        u_id = subject_id.replace("user:", "") if subject_id.startswith("user:") else ""
-        loop.create_task(index_single_claim(cid, subject_id, predicate, str(object_id or scalar_value or ""), source_authority, u_id))
+        u_id = owner_user_id or (subject_id.replace("user:", "") if subject_id.startswith("user:") else "")
+        embed_value = scalar_str if scalar_str is not None else (str(object_id) if object_id else "")
+        loop.create_task(index_single_claim(cid, subject_id, predicate, embed_value, source_authority, u_id))
     except Exception as e:
         print(f" [VECTOR SYNC FAILED] claim={cid}: {type(e).__name__}: {e}")
 
@@ -484,6 +500,11 @@ def build_world_model_context(query: str, max_tokens: int = 180, user_id: Option
     return context_str
 
 
+# Diagnostics from the most recent build_semantic_world_model_context call.
+# Not part of the API — consumed by tests/harnesses to explain gate decisions.
+_LAST_RETRIEVAL_DIAG: Dict[str, Any] = {}
+
+
 async def build_semantic_world_model_context(query: str, max_tokens: int = 250, user_id: Optional[str] = None) -> str:
     """
     Semantic Memory RAG: Uses vector search (Qdrant) + entity resolution to inject
@@ -506,10 +527,23 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     # 2. Semantic vector search via Qdrant for relevant claims/dossiers
     vector_claims = []
     vector_dossiers = []
+    vector_web = []
+    vector_mail = []
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # No intent detection of any kind — the embedding model is the sole
+    # relevance gate. Fetch a wide candidate pool and keep only what clears
+    # the score floor: broad queries naturally surface many hits, narrow
+    # ones few.
+    hits = []
     try:
-        from src.services.qdrant_client import search_vectors
-        hits = await search_vectors(query, limit=6, user_id=target_user_id)
+        from src.services.qdrant_client import search_vectors, retrieval_domains_for_query
+        # Mail-targeted queries (receipts, bills, orders, statements) also open
+        # the gmail_message domain; every other query keeps the claim-only
+        # universe exactly as benchmarked (MRR@10 0.681 with no distractors).
+        hits = await search_vectors(
+            query, limit=100, user_id=target_user_id,
+            domains=retrieval_domains_for_query(query),
+        )
 
         # Vector points can lag SQLite (supersessions, missed indexing) — only
         # trust hits whose claim is still CURRENT in the knowledge graph.
@@ -526,12 +560,34 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                 ).fetchall()
                 active_claim_ids = {r[0] for r in rows}
 
+        # The relevance gate is score-relative and outlier-robust: the band is
+        # anchored ONLY on scores of results that are eligible to render
+        # (claims/dossiers). Non-claim domains (background knowledge, cached
+        # text, snapshots) never render, so letting them set the anchor lets
+        # adversarial prose drag the floor up and erase genuine claims. With
+        # fewer than three claim hits, fall back to the best claim score
+        # explicitly instead of silently anchoring on noise.
+        renderable_domains = ("world_model_claim", "world_model_dossier")
+        claim_scores_sorted = sorted(
+            (h.get("score", 0.0) for h in hits
+             if h.get("payload", {}).get("domain") in renderable_domains),
+            reverse=True,
+        )
+        non_claim_scores = sorted(
+            (h.get("score", 0.0) for h in hits
+             if h.get("payload", {}).get("domain") not in renderable_domains),
+            reverse=True,
+        )
+        if claim_scores_sorted:
+            anchor = claim_scores_sorted[2] if len(claim_scores_sorted) >= 3 else claim_scores_sorted[0]
+        else:
+            anchor = 0.0
+        relevance_floor = max(0.33, anchor - 0.10)
         for h in hits:
             score = h.get("score", 0.0)
             payload = h.get("payload", {})
             domain = payload.get("domain", "")
-            # Filter for semantic relevance (score >= 0.44)
-            if score >= 0.44:
+            if score >= relevance_floor:
                 if domain == "world_model_claim":
                     if payload.get("claim_id") and payload["claim_id"] not in active_claim_ids:
                         continue
@@ -539,21 +595,239 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
                         "subject_id": payload.get("subject_id", user_anchor),
                         "predicate": payload.get("predicate", "fact"),
                         "scalar_value": payload.get("value", ""),
+                        "claim_id": payload.get("claim_id"),
                         "source_authority": payload.get("authority", 5),
                         "score": score
                     })
                 elif domain == "world_model_dossier":
                     vector_dossiers.append({
                         "title": payload.get("title", ""),
-                        "text": payload.get("text", "")[:300],
+                        "text": payload.get("text", ""),
                         "score": score
                     })
+                elif domain == "web_search_result":
+                    vector_web.append({
+                        "url": str(payload.get("url", "") or ""),
+                        "title": str(payload.get("title", "") or ""),
+                        "section_name": str(payload.get("section_name", "") or ""),
+                        "query": str(payload.get("query", "") or ""),
+                        "fetched_at": str(payload.get("fetched_at", "") or ""),
+                        "text": str(payload.get("text", "") or ""),
+                        "score": score
+                    })
+                elif domain == "gmail_message":
+                    vector_mail.append({
+                        "subject": str(payload.get("subject", "") or ""),
+                        "sender_email": str(payload.get("sender_email", "") or ""),
+                        "date": str(payload.get("date", "") or ""),
+                        "section_name": str(payload.get("section_name", "") or ""),
+                        "text": str(payload.get("text", "") or ""),
+                        "score": score,
+                    })
         vector_claims.sort(key=lambda x: x["score"], reverse=True)
-        vector_claims = vector_claims[:3]
         vector_dossiers.sort(key=lambda x: x["score"], reverse=True)
-        vector_dossiers = vector_dossiers[:2]
+        vector_web.sort(key=lambda x: x["score"], reverse=True)
+        vector_mail.sort(key=lambda x: x["score"], reverse=True)
     except Exception as e:
         logger.debug(f"Semantic vector search in world model context failed: {e}")
+
+    # 2b. Collection completeness from SQLite, gated purely by the embedding
+    # model's scores. Terse claims ("owns X") rank below rich dossiers in
+    # vector space, so a collection surfaces only a top-N slice of itself.
+    # When the same predicate survives the relevance band repeatedly, the
+    # query is about that whole cluster — pull every active claim for the
+    # predicates the search surfaced, from the authoritative KG. Whether a
+    # surfaced predicate cluster really is a collection is decided below by
+    # plateau shape on raw hits, not by count alone.
+    # Band-side predicate stats (kept for diagnostics; the plateau gate below
+    # works on raw hits instead).
+    pred_scores: Dict[str, List[float]] = {}
+    for c in vector_claims:
+        p = str(c.get("predicate", ""))
+        if p:
+            pred_scores.setdefault(p, []).append(float(c.get("score", 0.0)))
+
+    # Plateau detection over RAW top-100 claim hits (not band survivors).
+    # The band is a rendering filter; deciding expansion from band survivors
+    # is circular — a strong co-occurring cluster (e.g. dossiers on perfume
+    # queries) raises the floor and hides the very cluster expansion exists
+    # to recover. Instead, judge each predicate's own score distribution in
+    # the raw candidate pool:
+    #   enough claims   (>= MIN_CLUSTER_HITS in the raw top-100)
+    #   tight spread    (cluster max-min <= 0.15: one coherent plateau)
+    #   live cluster    (cluster bottom >= best claim score - 0.15: the cluster
+    #                    is topically engaged with this query, not incidental)
+    #   top-2 presence  (the cluster is one of the two largest raw claim
+    #                    groups: the query is about these, not a long tail)
+    # The "live cluster" check also kills the narrow-query false positive:
+    # when one specific claim towers over everything (e.g. a payment-due hit
+    # at 0.69 above an owns cluster at 0.38), the owns mass is background
+    # similarity, not a collection the query is asking for.
+    MIN_CLUSTER_HITS = 10
+    raw_pred_scores: Dict[str, List[float]] = {}
+    for h in hits:
+        payload = h.get("payload", {})
+        if payload.get("domain") == "world_model_claim" and payload.get("predicate"):
+            raw_pred_scores.setdefault(str(payload["predicate"]), []).append(float(h.get("score", 0.0)))
+    best_claim_score = claim_scores_sorted[0] if claim_scores_sorted else 0.0
+    raw_counts_ranked = sorted(
+        ((p, len(ss)) for p, ss in raw_pred_scores.items()), key=lambda kv: -kv[1]
+    )
+    cluster_eval = []
+    target_preds: set = set()
+    expansion_reason = "insufficient_claim_evidence"
+    if raw_counts_ranked:
+        for rank_i, (p, raw_count) in enumerate(raw_counts_ranked):
+            ss = raw_pred_scores[p]
+            if raw_count < MIN_CLUSTER_HITS:
+                continue
+            s_sorted = sorted(ss, reverse=True)
+            spread = s_sorted[0] - s_sorted[-1]
+            gap_ok = s_sorted[-1] >= best_claim_score - 0.15
+            top2 = rank_i < 2
+            is_plateau = spread <= 0.15 and gap_ok and top2
+            cluster_eval.append({
+                "predicate": p, "raw_count": raw_count,
+                "top": round(s_sorted[0], 3), "bottom": round(s_sorted[-1], 3),
+                "spread": round(spread, 3), "gap_ok": gap_ok, "top2": top2,
+                "plateau": is_plateau,
+            })
+            if is_plateau:
+                target_preds.add(p)
+        if target_preds:
+            expansion_reason = "broad_plateau"
+        elif cluster_eval:
+            expansion_reason = "no_plateau"
+        else:
+            expansion_reason = "narrow_query"
+
+    pre_expansion_count = len(vector_claims)
+
+    if target_preds:
+        with _get_connection() as conn:
+            user_rows = conn.execute(
+                "SELECT predicate, COALESCE(scalar_value, object_id), source_authority "
+                "FROM kg_claims WHERE subject_id = ? AND tx_retracted_at IS NULL "
+                "AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)",
+                (user_anchor, now_utc, now_utc),
+            ).fetchall()
+            other_rows = conn.execute(
+                "SELECT subject_id, predicate, COALESCE(scalar_value, object_id), source_authority "
+                "FROM kg_claims WHERE subject_id != ? AND tx_retracted_at IS NULL "
+                "AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)",
+                (user_anchor, now_utc, now_utc),
+            ).fetchall()
+
+        already = {str(c.get("scalar_value", "")).strip().lower() for c in vector_claims}
+
+        def _add_claim(subj: str, pred: str, val: str, auth, score: float):
+            if not val or val.lower() in already:
+                return False
+            already.add(val.lower())
+            vector_claims.append({
+                "subject_id": subj,
+                "predicate": pred,
+                "scalar_value": val,
+                "source_authority": auth or 4,
+                "score": score,
+            })
+            return True
+
+        # (a) the user's own claims for the predicates the search surfaced.
+        for pred, val, auth in user_rows:
+            if pred not in target_preds:
+                continue
+            _add_claim(user_anchor, pred, str(val or "").strip(), auth, 0.76)
+
+        # (b) claims about items the user possesses: match claim subjects
+        # against the possession list the search surfaced.
+        owned_names = [
+            str(r[1] or "").strip().lower()
+            for r in user_rows if r[0] == "owns" and str(r[1] or "").strip()
+        ]
+        item_claims: Dict[str, tuple] = {}  # (item, subject, predicate) -> shortest value wins
+        for subj, pred, val, auth in other_rows:
+            if pred not in target_preds:
+                continue
+            hay = f"{subj} {str(val or '')[:120]}".lower()
+            item = next((n for n in owned_names if n and n in hay), None)
+            if not item:
+                continue
+            key = (item, str(subj), str(pred))
+            cur = item_claims.get(key)
+            val_s = str(val or "").strip()
+            if cur is None or len(val_s) < len(cur[2]):
+                item_claims[key] = (subj, pred, val_s, auth)
+        for (item, subj, pred), (_s, pred, val, auth) in item_claims.items():
+            _add_claim(subj, pred, val, auth, 0.78)
+        vector_claims.sort(key=lambda x: x["score"], reverse=True)
+
+    expanded_claim_count = len(vector_claims) - pre_expansion_count
+    owns_scores = pred_scores.get("owns", [])
+    owns_spread = (max(owns_scores) - min(owns_scores)) if len(owns_scores) >= 2 else 0.0
+    owns_others_max = max(
+        (s for p, ss in pred_scores.items() if p != "owns" for s in ss),
+        default=0.0,
+    )
+    _LAST_RETRIEVAL_DIAG.clear()
+    _LAST_RETRIEVAL_DIAG.update({
+        "query": query,
+        "n_hits": len(hits),
+        "claim_domain_scores_top20": [round(s, 3) for s in claim_scores_sorted[:20]],
+        "non_claim_scores_top20": [round(s, 3) for s in non_claim_scores[:20]],
+        "non_claim_in_band": sum(1 for s in non_claim_scores if s >= relevance_floor),
+        "anchor": round(anchor, 3),
+        "band_floor": round(relevance_floor, 3),
+        "in_band_claims": pre_expansion_count,
+        "pred_in_band_counts": {p: len(ss) for p, ss in pred_scores.items()},
+        "pred_raw_counts": {e["predicate"]: e["raw_count"] for e in cluster_eval},
+        "owns_in_band": len(owns_scores),
+        "owns_score_spread": round(owns_spread, 3),
+        "owns_cluster_gap": round((min(owns_scores) - owns_others_max) if owns_scores else 0.0, 3),
+        "cluster_eval": cluster_eval,
+        "expansion_triggered": bool(target_preds),
+        "expansion_reason": expansion_reason,
+        "expanded_claim_count": expanded_claim_count,
+    })
+    # The budget follows the retrieval: everything the embedding model kept
+    # above the score floor gets room in the prompt. A narrow query injects
+    # a few lines; a collection-wide query injects the whole set. Web findings
+    # are capped at two entries and contribute a small title+summary share.
+    retrieval_words = sum(
+        len(str(c.get("scalar_value", "")).split()) + 8
+        for c in vector_claims
+    ) + sum(len(d.get("text", "").split()) + 10 for d in vector_dossiers)
+    retrieval_words += sum(40 + len(w.get("text", "").split()) // 8 for w in vector_web)
+    retrieval_words += sum(40 + len(w.get("text", "").split()) // 8 for w in vector_mail)
+    if retrieval_words:
+        max_tokens = max(max_tokens or 0, int(retrieval_words / 0.75) + 30)
+
+    # Pinned (immutable) knowledge: user-confirmed claims and URLs render with
+    # a (PINNED) marker so the model treats them as authoritative without
+    # re-verification. Pins are user-scoped; the table may not exist yet on
+    # older DBs, so degrade to an empty set rather than failing retrieval.
+    pinned_urls = set()
+    immutable_claim_keys = set()
+    try:
+        with _get_connection() as conn:
+            pin_rows = conn.execute(
+                "SELECT url FROM web_knowledge_pins WHERE user_id = ?",
+                (target_user_id,),
+            ).fetchall()
+            for r in pin_rows:
+                u = str(r["url"] or "").strip().rstrip("/")
+                if u:
+                    pinned_urls.add(u)
+            imm_rows = conn.execute(
+                "SELECT predicate, scalar_value FROM kg_claims WHERE immutable = 1"
+            ).fetchall()
+            for r in imm_rows:
+                val = str(r["scalar_value"] or "").strip()
+                if val:
+                    immutable_claim_keys.add((str(r["predicate"] or ""), val.lower()))
+    except Exception:
+        pinned_urls = set()
+        immutable_claim_keys = set()
 
     # 3. If explicit named entities were mentioned, pull their direct claims too
     entity_claims = []
@@ -564,12 +838,10 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
         entity_claims = subgraph.get("claims", [])
 
     # If no semantic hits, no dossiers, and no named entities matched:
-    # Do NOT stuff the prompt with random user facts. Return empty or clean fallback.
-    if not vector_claims and not vector_dossiers and not entity_claims:
-        # If query is a general financial health or dashboard check, fallback to standard build_world_model_context
-        general_keywords = {"overview", "dashboard", "how am i doing", "status", "profile", "summary", "everything", "all"}
-        if any(w in query.lower() for w in general_keywords):
-            return build_world_model_context(query, max_tokens=max_tokens, user_id=target_user_id)
+    # Do NOT stuff the prompt with random user facts. The embedding model
+    # said nothing in memory is relevant — inject nothing. A lone web finding
+    # above the floor is still injected: surfacing past research is the point.
+    if not vector_claims and not vector_dossiers and not vector_web and not vector_mail and not entity_claims:
         return ""
 
     target_max_words = int(max_tokens * 0.75) if max_tokens else 200
@@ -587,7 +859,7 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     # Display relevant dossiers (e.g. Fragrance Freeze or specific policy)
     if vector_dossiers:
         lines.append("[RELEVANT DIRECTIVES & DOSSIERS]")
-        for d in vector_dossiers[:2]:
+        for d in vector_dossiers:
             d_line = f"• [{d['title']}]: {d['text']}"
             lines.append(d_line)
             current_words += len(d_line.split())
@@ -601,16 +873,24 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
             "subject_id": c.get("subject_id"),
             "predicate": c.get("predicate"),
             "scalar_value": c.get("scalar_value") or c.get("object_id"),
+            "claim_id": c.get("claim_id") or c.get("id"),
             "source_authority": c.get("source_authority", 4),
         }
         for c in entity_claims
     ]
 
-    # Deduplicate claims by (subject_id, predicate)
+    # Deduplicate claims by (subject_id, predicate, value). Multi-value
+    # predicates like "owns" hold many distinct claims on the same
+    # (subject, predicate) pair — deduping on the pair alone collapses a
+    # 64-bottle fragrance collection into a single line.
     seen = set()
     deduped_claims = []
     for c in all_claims:
-        k = (c.get("subject_id"), c.get("predicate"))
+        k = (
+            c.get("subject_id"),
+            c.get("predicate"),
+            str(c.get("scalar_value", "")).strip().lower(),
+        )
         if k not in seen:
             seen.add(k)
             deduped_claims.append(c)
@@ -618,14 +898,112 @@ async def build_semantic_world_model_context(query: str, max_tokens: int = 250, 
     if deduped_claims:
         lines.append("[RELEVANT GROUND TRUTH CLAIMS]")
         for c in deduped_claims:
-            claim_line = f"• {c['subject_id']} -> {c['predicate']}: {c['scalar_value']} (Auth: {c.get('source_authority', 5)}/5)"
+            pinned_mark = " (PINNED)" if (
+                str(c["predicate"] or "").strip() and
+                str(c.get("scalar_value", "") or "").strip().lower() in {
+                    v for p, v in immutable_claim_keys if p == str(c["predicate"] or "").strip()
+                }
+            ) else ""
+            claim_id_mark = f" (claim: {c['claim_id']})" if c.get("claim_id") else ""
+            claim_line = f"• {c['subject_id']} -> {c['predicate']}: {c['scalar_value']} (Auth: {c.get('source_authority', 5)}/5){claim_id_mark}{pinned_mark}"
             lines.append(claim_line)
             current_words += len(claim_line.split())
             if current_words >= target_max_words:
                 break
 
+    # Prior web research: past search/fetch results that cleared the relevance
+    # floor. Rendering these lets the model answer from stored research
+    # instead of re-running search_web/fetch_webpage. Entries carry the URL
+    # (so a still-open question can be re-verified deliberately) and either a
+    # (PINNED) marker for user-confirmed authority or an age marker.
+    if vector_web:
+        lines.append("[PRIOR WEB RESEARCH]")
+        for w in vector_web[:2]:
+            if not w.get("url"):
+                continue
+            age_mark = ""
+            if w.get("fetched_at"):
+                try:
+                    fd = datetime.strptime(w["fetched_at"], "%Y-%m-%d %H:%M:%S")
+                    age_days = max(0, (datetime.now(timezone.utc) - fd.replace(tzinfo=timezone.utc)).days)
+                    age_mark = f" (age: {age_days}d)"
+                except Exception:
+                    age_mark = ""
+            url_norm = w["url"].strip().rstrip("/")
+            trust_mark = " (PINNED)" if url_norm in pinned_urls else age_mark
+            w_title = w.get("title") or w.get("url")
+            if w.get("section_name"):
+                w_title = f"{w_title} [{w['section_name']}]"
+            summary = re.sub(r"\s+", " ", w.get("text", "") or " ").strip()
+            if len(summary) > 280:
+                summary = summary[:277].rstrip() + "..."
+            lines.append(f"• [WEB] {w_title} — {w['url']}{trust_mark}: {summary}")
+            current_words += 40 + len(summary.split()) // 4
+            if current_words >= target_max_words:
+                break
+        lines.append("")
+
+    # Email correspondence (gmail sections): indexed mail joins retrieval ONLY
+    # for mail-targeted queries (receipts, bills, orders, statements). Entries
+    # carry sender + subject + date so the model can answer from stored mail
+    # instead of asking the user to re-share it.
+    if vector_mail:
+        lines.append("[EMAIL RECEIPTS & CORRESPONDENCE]")
+        for m in vector_mail[:2]:
+            subject = re.sub(r"\s+", " ", (m.get("subject") or "")).strip()
+            sender = (m.get("sender_email") or "").strip() or "(unknown sender)"
+            date_s = (str(m.get("date") or "") or "date?")[:10]
+            section = f" [{m['section_name']}]" if m.get("section_name") else ""
+            summary = re.sub(r"\s+", " ", m.get("text", "") or " ").strip()
+            if len(summary) > 280:
+                summary = summary[:277].rstrip() + "..."
+            lines.append(f"• [MAIL] {subject or '(no subject)'}{section} — {sender} ({date_s}): {summary}")
+            current_words += 40 + len(summary.split()) // 4
+            if current_words >= target_max_words:
+                break
+        lines.append("")
+
     lines.append("==================================================")
     return "\n".join(lines)
+
+
+def pin_knowledge_immutable(user_id: str, kind: str, ref: str, reason: str = "") -> str:
+    """Pin a claim or web URL as immutable knowledge for the user.
+
+    Pinned claims get kg_claims.immutable = 1; pinned URLs are recorded in
+    web_knowledge_pins. Both render with a (PINNED) marker in semantic
+    context, which tells the advisor the fact is user-confirmed authority and
+    must not be re-verified or silently contradicted by newer web noise.
+    """
+    user_id = str(user_id or "").strip()
+    kind = str(kind or "").strip().lower()
+    ref = str(ref or "").strip()
+    if not user_id or kind not in ("claim", "web") or not ref:
+        return (
+            "pin_knowledge_immutable requires kind ('claim' | 'web') and ref "
+            "(a claim_id or a URL)."
+        )
+
+    if kind == "claim":
+        with _get_connection() as conn:
+            row = conn.execute(
+                "SELECT claim_id FROM kg_claims WHERE claim_id = ?", (ref,)
+            ).fetchone()
+            if row is None:
+                return f"No claim found with claim_id {ref}; nothing pinned."
+            conn.execute(
+                "UPDATE kg_claims SET immutable = 1 WHERE claim_id = ?", (ref,)
+            )
+            conn.commit()
+        return f"Pinned claim {ref} as immutable. It will render with a (PINNED) marker and not require re-verification."
+
+    with _get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO web_knowledge_pins (user_id, url, reason) VALUES (?, ?, ?)",
+            (user_id, str(ref)[:2048], str(reason or "")[:500]),
+        )
+        conn.commit()
+    return f"Pinned {ref} as immutable web knowledge. It will render with a (PINNED) marker."
 
 # ============================================================
 # 5. EXPLAINABILITY & PROVENANCE AUDIT
@@ -664,12 +1042,21 @@ def explain_claim(claim_id: str) -> Dict[str, Any]:
 # 5b. COMPREHENSIVE QUERY & MANAGEMENT FUNCTIONS
 # ============================================================
 
-def get_world_model_entity(entity_id_or_name: str) -> Dict[str, Any]:
+def get_world_model_entity(entity_id_or_name: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Retrieve full profile and active claims for an entity by ID or name/alias.
+    Multi-tenant safe: entities belonging to other users are excluded.
     """
-    resolved = resolve_entities(entity_id_or_name)
+    entity_id_or_name = _normalize_user_ref(entity_id_or_name, user_id)
+    resolved = resolve_entities(entity_id_or_name, user_id=user_id)
     target_id = resolved[0] if resolved else entity_id_or_name.strip().lower()
+    # If resolution found nothing and the input isn't a valid entity ID,
+    # fall back to the user anchor so the current user's profile is always reachable.
+    if not target_id or not resolved:
+        if user_id:
+            target_id = f"user:{user_id}"
+        else:
+            target_id = "primary_user"
 
     with _get_connection() as conn:
         c = conn.cursor()
@@ -679,15 +1066,7 @@ def get_world_model_entity(entity_id_or_name: str) -> Dict[str, Any]:
         """, (target_id,))
         ent_row = c.fetchone()
         if not ent_row:
-            # Fallback exact canonical_name search
-            c.execute("""
-                SELECT entity_id, entity_type, canonical_name, aliases, attributes, created_at
-                FROM kg_entities WHERE lower(canonical_name) = ?
-            """, (entity_id_or_name.strip().lower(),))
-            ent_row = c.fetchone()
-            if not ent_row:
-                return {"error": f"Entity '{entity_id_or_name}' not found in Active World Model."}
-            target_id = ent_row["entity_id"]
+            return {"error": f"Entity '{entity_id_or_name}' not found or unauthorized."}
 
         subgraph = get_entity_subgraph([target_id], depth=1)
         entity_info = dict(ent_row)
@@ -732,7 +1111,7 @@ def search_world_model(query: str, limit: int = 5, user_id: Optional[str] = None
             
             for row in c.fetchall():
                 res = dict(row)
-                tid = res.get("target_id", "")
+                tid = _normalize_user_ref(res.get("target_id", ""), target_user_id)
                 # Multi-tenant isolation: do not leak another user's entity, dossier, or claims
                 if tid.startswith("user:") and user_prefix and tid != user_prefix:
                     continue
@@ -756,6 +1135,143 @@ def search_world_model(query: str, limit: int = 5, user_id: Optional[str] = None
             return [{"error": f"FTS search error: {err}"}]
 
     return results
+
+
+def list_world_model_claims(
+    predicate: Optional[str] = None,
+    subject_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    value_contains: str = "",
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """
+    Deterministic enumeration of claims from SQLite — NOT semantic search.
+    Use for "list all my X" / "how many X do I have" questions: every active
+    claim is returned regardless of embedding similarity.
+    """
+    resolved_subject = subject_id or (f"user:{user_id}" if user_id else None)
+    sql = [
+        "SELECT claim_id, subject_id, predicate, object_id, scalar_value,",
+        "provenance_type, source_authority, valid_from, tx_asserted_at",
+        "FROM kg_claims WHERE tx_retracted_at IS NULL",
+    ]
+    params: List[Any] = []
+    if predicate:
+        sql.append("AND predicate = ?")
+        params.append(predicate.strip())
+    if resolved_subject:
+        sql.append("AND subject_id = ?")
+        params.append(resolved_subject)
+    if value_contains:
+        sql.append("AND LOWER(scalar_value) LIKE ?")
+        params.append(f"%{value_contains.lower()}%")
+    sql.append("ORDER BY tx_asserted_at DESC LIMIT ?")
+    params.append(max(1, min(int(limit), 500)))
+
+    with _get_connection() as conn:
+        c = conn.cursor()
+        c.execute(" ".join(sql), params)
+        rows = [dict(r) for r in c.fetchall()]
+        total_active = c.execute(
+            "SELECT COUNT(*) FROM kg_claims WHERE tx_retracted_at IS NULL"
+        ).fetchone()[0]
+
+    return {
+        "count": len(rows),
+        "total_active_claims_in_model": total_active,
+        "truncated": len(rows) >= max(1, min(int(limit), 500)),
+        "claims": rows,
+    }
+
+async def search_world_model_semantic(query: str, limit: int = 5, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Vector-first world model search: Qdrant semantic hits merged with FTS5 BM25.
+    Falls back to pure FTS when the embedding/vector pipeline is unavailable.
+    """
+    results: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    target_user_id = str(user_id or get_primary_user_id()).strip()
+    user_prefix = f"user:{target_user_id}"
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        from src.services.qdrant_client import search_vectors
+        hits = await search_vectors(query, limit=max(limit * 2, 8), user_id=target_user_id)
+
+        # Only trust claim hits that are still CURRENT in SQLite (vectors lag
+        # supersessions/retractions).
+        hit_claim_ids = [
+            h.get("payload", {}).get("claim_id") for h in hits
+            if h.get("payload", {}).get("domain") == "world_model_claim"
+            and h.get("payload", {}).get("claim_id")
+        ]
+        active_claim_ids = set()
+        if hit_claim_ids:
+            with _get_connection() as conn:
+                placeholders = ",".join("?" for _ in hit_claim_ids)
+                rows = conn.execute(
+                    f"SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority "
+                    f"FROM kg_claims WHERE claim_id IN ({placeholders}) "
+                    "AND tx_retracted_at IS NULL AND valid_from <= ? "
+                    "AND (valid_to IS NULL OR valid_to > ?)",
+                    hit_claim_ids + [now_utc, now_utc],
+                ).fetchall()
+                active_claim_ids = {r[0] for r in rows}
+                active_rows = {r[0]: dict(r) for r in rows}
+
+        for h in hits:
+            payload = h.get("payload", {})
+            domain = payload.get("domain", "")
+            score = h.get("score", 0.0)
+            if score < 0.44:
+                continue
+            if domain == "world_model_claim":
+                cid = payload.get("claim_id")
+                if not cid or cid not in active_claim_ids:
+                    continue
+                row = active_rows[cid]
+                results.append({
+                    "target_id": cid,
+                    "target_type": "claim",
+                    "title": f"{row['subject_id']} -> {row['predicate']}",
+                    "content": str(row["object_id"] or row["scalar_value"] or ""),
+                    "predicate": row["predicate"],
+                    "source_authority": row["source_authority"],
+                    "score": round(score, 4),
+                    "retrieval": "vector",
+                })
+                seen_ids.add(cid)
+            elif domain == "world_model_dossier":
+                doc_id = payload.get("doc_id")
+                if not doc_id or doc_id in seen_ids:
+                    continue
+                results.append({
+                    "target_id": doc_id,
+                    "target_type": "dossier",
+                    "title": payload.get("title", ""),
+                    "content": str(payload.get("text", ""))[:300],
+                    "tags": payload.get("tags", ""),
+                    "score": round(score, 4),
+                    "retrieval": "vector",
+                })
+                seen_ids.add(doc_id)
+    except Exception as e:
+        logger.debug(f"Semantic world model search failed, falling back to FTS: {e}")
+
+    # Merge FTS results (exact/keyword matches the vector index may miss),
+    # skipping anything already surfaced by the vector pass.
+    for res in search_world_model(query, limit=limit, user_id=user_id):
+        tid = res.get("target_id")
+        if tid and tid in seen_ids:
+            continue
+        res["retrieval"] = "fts"
+        results.append(res)
+        if tid:
+            seen_ids.add(tid)
+
+    results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+    return results[:limit]
+
 
 def get_world_model_dossier(doc_id_or_title: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     """

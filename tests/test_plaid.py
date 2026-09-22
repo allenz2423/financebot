@@ -144,3 +144,33 @@ def test_transaction_removal_and_modification(tmp_path):
     cur.execute("SELECT status FROM transactions WHERE transaction_id = 'tx_100'")
     assert cur.fetchone()[0] == "Removed"
     conn.close()
+
+
+def test_plaid_polling_loop_marks_shared_sync_state():
+    """The polling loop must use the shared PLAID_SYNC_STATE gate and actually run a sync.
+
+    Regression: the loop imported a non-existent PLAID_SYNC_STATE from
+    src.db.queries (ImportError swallowed each iteration, so autosync never
+    ran) and wrote uid-keyed entries into the shared {"active": bool} dict.
+    """
+    from src.core import state
+
+    class _BreakLoop(BaseException):
+        pass
+
+    sync_mock = AsyncMock()
+    hourly_mock = AsyncMock()
+
+    with patch("plaid_sync.discover_polling_targets", return_value=[("data/finances.db", "u1")]), \
+         patch("plaid_sync._get_user_plaid_creds", return_value=("cid", "secret", ["access-1"])), \
+         patch("plaid_sync.sync_plaid_transactions", sync_mock), \
+         patch("plaid_sync.run_hourly_balance_update", hourly_mock), \
+         patch("plaid_sync.PLAID_HOURLY_UPDATE_INTERVAL_SECONDS", 0.0), \
+         patch("asyncio.sleep", new=AsyncMock(side_effect=_BreakLoop)):
+        state.PLAID_SYNC_STATE["active"] = True  # simulate a sync in progress
+        with pytest.raises(_BreakLoop):
+            asyncio.run(plaid_sync.plaid_polling_loop(None, None, None, 0))
+
+    sync_mock.assert_awaited_once()
+    hourly_mock.assert_awaited_once()
+    assert state.PLAID_SYNC_STATE["active"] is False

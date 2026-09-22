@@ -26,6 +26,11 @@ networks:
   sandbox-egress:
     driver: bridge
     internal: true
+  # Public internet is opt-in for the isolated execution sandbox. Keep this
+  # separate from the shared egress network so sandbox code can reach public
+  # HTTPS endpoints without gaining peer access to OmniRoute/browser services.
+  sandbox-internet:
+    driver: bridge
   egress:
     driver: bridge
 
@@ -34,6 +39,7 @@ volumes:
   sandbox-packages:
   sandbox-workspace:
   qdrant_data:
+  omniroute-data:
 
 services:
   # ============================================================
@@ -50,6 +56,9 @@ services:
     environment:
       - OLLAMA_URL=http://ollama:11434/api/chat
       - SEARXNG_URL=http://searxng:8080/search
+      - OMNIROUTE_SEARCH_ENABLED=${OMNIROUTE_SEARCH_ENABLED:-1}
+      - OMNIROUTE_SEARCH_URL=http://omniroute:20128/v1/search
+      - OMNIROUTE_SEARCH_PROVIDER=${OMNIROUTE_SEARCH_PROVIDER:-duckduckgo-free}
       - SANDBOX_URL=http://sandbox:8100/execute
       - SANDBOX_SHELL_URL=http://sandbox:8100/shell
       - SANDBOX_INSTALL_URL=http://sandbox-installer:8100/install
@@ -58,11 +67,15 @@ services:
       - QDRANT_URL=http://qdrant:6333
       - OLLAMA_EMBED_URL=http://ollama:11434/api/embed
       - BROWSERLESS_URL=http://browserless:3000
+      - OPENROUTER_FREE_MODELS=poolside/laguna-s-2.1:free,qwen/qwen3.8-27b:free,nvidia/nemotron-3-super-120b-a12b:free
+      - OPENROUTER_FREE_VISION_MODELS=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+      - OPENROUTER_PAID_MODEL=openrouter/auto
       - MCP_WEB_BROWSER_URL=http://mcp-web-browser:3000/sse
       - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data
       - sandbox-workspace:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - financebot-internal
       - egress
@@ -76,6 +89,7 @@ services:
       - qdrant
       - browserless
       - mcp-web-browser
+      - omniroute
     deploy:
       resources:
         reservations:
@@ -171,6 +185,38 @@ services:
       - QDRANT__TELEMETRY_DISABLED=true
 
   # ============================================================
+  # OmniRoute — local LLM gateway (free-tier-first routing + fallback)
+  # ============================================================
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    container_name: financebot-omniroute
+    restart: unless-stopped
+    environment:
+      - PORT=20128
+      - HOST=0.0.0.0
+      - OMNIROUTE_PORT=20128
+      - OMNIROUTE_DATA_DIR=/app/data
+      - OMNIROUTE_ALLOW_DEFAULT_DATA_DIR=1
+      - INITIAL_PASSWORD=${OMNIROUTE_INITIAL_PASSWORD}
+      - JWT_SECRET=${OMNIROUTE_JWT_SECRET}
+      - API_KEY_SECRET=${OMNIROUTE_API_KEY_SECRET}
+      - STORAGE_ENCRYPTION_KEY=${OMNIROUTE_STORAGE_ENCRYPTION_KEY}
+      - OMNIROUTE_MEMORY_MB=${OMNIROUTE_MEMORY_MB:-2048}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - JINA_API_KEY=${JINA_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+    volumes:
+      - omniroute-data:/app/data
+    networks:
+      - financebot-internal
+      - egress
+    ports:
+      - "20128:20128"
+
+  # ============================================================
   # Browserless — headless Chromium sidecar for deep JS web scraping
   # ============================================================
   browserless:
@@ -185,7 +231,10 @@ services:
     environment:
       - CONCURRENT=5
       - QUEUED=10
-      - TIMEOUT=60000
+      # This Browserless image treats TIMEOUT=-1 as a zero-millisecond
+      # timeout, which immediately returns 408. Use a long explicit window;
+      # the bot still closes sessions on cancel/mission cleanup.
+      - TIMEOUT=3600000
       - PREBOOT_CHROME=true
       - KEEP_ALIVE=true
 
@@ -218,17 +267,24 @@ services:
     restart: unless-stopped
     environment:
       - SANDBOX_DEFAULT_TIMEOUT=90
-      - SANDBOX_MAX_TIMEOUT=300
+      - SANDBOX_MAX_TIMEOUT=14400
       - SANDBOX_INTERNAL_TOKEN=${SANDBOX_INTERNAL_TOKEN}
       - SANDBOX_MEMORY_LIMIT_MB=1536
       - SANDBOX_PACKAGES_DIR=/opt/packages
       - SANDBOX_HOST_PROJECT_DIR=/host/project
       - SANDBOX_HOST_DB_PATH=/host/data/finances.db
+      # Bulk scripts cannot invoke Delilah-native tools; they use these
+      # internal HTTP search services directly from the internet-enabled
+      # sandbox network.
+      - OMNIROUTE_SEARCH_URL=http://omniroute:20128/v1/search
+      - OMNIROUTE_SEARCH_PROVIDER=${OMNIROUTE_SEARCH_PROVIDER:-duckduckgo-free}
+      - SEARXNG_URL=http://searxng:8080/search
     volumes:
       - sandbox-packages:/opt/packages:ro
       - sandbox-workspace:/workspace
     networks:
       - financebot-internal
+      - sandbox-internet
     mem_limit: 3072m
     cpus: 8.0
     pids_limit: 1024

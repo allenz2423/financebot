@@ -41,6 +41,11 @@ COPY README.md /host/project/README.md
 COPY searxng /host/project/searxng
 COPY squid.conf /host/project/squid.conf
 
+# COPY recreates files as root and preserves the host's mode bits, undoing the
+# chown above. Re-chown after ingestion so the app user can read every file,
+# including 0600 ones (configs, credentials-adjacent source).
+RUN chown -R sandbox:sandbox /host/project /host/data
+
 ENV MPLCONFIGDIR=/tmp/mplconfig
 
 USER sandbox

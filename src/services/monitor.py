@@ -723,7 +723,15 @@ def _eval_category_budget_overpacing(conn: sqlite3.Connection, cfg: dict, user_i
         days_elapsed = period.get("elapsed_days", 1)
         days_in_month = period.get("days_in_month", 30)
 
-        if spent >= min_spent and (spent >= limit or pacing_pct >= pace_threshold_pct):
+        # A projected budget overrun is actionable even when the current
+        # burn-rate percentage is just below the configured threshold. This
+        # keeps the rule based on the actual forecast rather than the calendar
+        # day on which the test/monitor happens to run.
+        if spent >= min_spent and (
+            spent >= limit
+            or pacing_pct >= pace_threshold_pct
+            or projected >= limit
+        ):
             if spent >= limit:
                 msg = (
                     f"{cat} budget BLOWN: ${spent:,.2f} spent of ${limit:,.2f} limit ({pct_used:.1f}%) "
@@ -1213,9 +1221,9 @@ MONITOR_POLL_INTERVAL_SECONDS = int(os.getenv("MONITOR_POLL_INTERVAL_SECONDS", "
 MONITOR_DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID", "")
 
 
-async def _deliver_alerts(alert_ids: List[int], bot, channel_id) -> None:
+async def _deliver_alerts(alert_ids: List[int], bot, channel_id, user_id: str) -> None:
     """Best-effort Discord delivery for newly fired alerts."""
-    if not alert_ids or not bot or not channel_id:
+    if not alert_ids or not bot or not channel_id or not user_id:
         return
     try:
         channel = bot.get_channel(int(channel_id))
@@ -1226,7 +1234,7 @@ async def _deliver_alerts(alert_ids: List[int], bot, channel_id) -> None:
     from src.services.monitor import list_alerts  # local import safety
     # The caller already holds conn; we re-read alerts via the shared conn.
     import src.db.queries as queries
-    alerts = list_alerts(queries.conn, "1", limit=len(alert_ids), include_acked=False)
+    alerts = list_alerts(queries.conn, user_id, limit=len(alert_ids), include_acked=False)
     for alert in alerts:
         if alert["id"] not in alert_ids:
             continue
@@ -1267,7 +1275,7 @@ async def monitor_watchdog_loop():
                 channel_id = os.getenv("DISCORD_CHANNEL_ID")
                 bot = getattr(queries, "bot", None)
                 for r in results:
-                    await _deliver_alerts(r.get("alert_ids", []), bot, channel_id)
+                    await _deliver_alerts(r.get("alert_ids", []), bot, channel_id, r.get("user_id"))
                 # Push via ntfy for critical alerts.
                 try:
                     for r in results:

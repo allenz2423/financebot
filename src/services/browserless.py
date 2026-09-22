@@ -39,8 +39,8 @@ async def scrape_rendered_page(url: str, wait_for_selector: Optional[str] = None
     except Exception:
         pass
 
-    # 2. Resilient Fallback: Direct Browserless HTTP invocation
-    endpoint = f"{BROWSERLESS_URL}/content"
+    # 2. Resilient Fallback: Direct Browserless HTTP invocation with stealth
+    endpoint = f"{BROWSERLESS_URL}/content?stealth=true"
     payload: Dict[str, Any] = {
         "url": url,
         "gotoOptions": {

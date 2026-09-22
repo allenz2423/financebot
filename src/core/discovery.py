@@ -43,6 +43,10 @@ CAPABILITY_REGISTRY = {
         "Simulations": ["simulate_cash_flow_scenario", "simulate_debt_payoff", "calculate_rebalancing_drift"],
         "Reports": ["generate_financial_digest"],
     },
+    "Workspace & File Delivery": {
+        "Files": ["list_workspace_files", "send_workspace_file"],
+        "Execute & Write Files": ["run_python_sandbox", "run_shell", "install_python_package"],
+    },
     "Settings": {
         "Preferences": ["set_user_timezone", "get_user_timezone"]
     },
