@@ -45,10 +45,33 @@ class InvalidLifecycleTransition(SessionStoreError):
     """Raised when a terminal turn/tool call is changed to another state."""
 
 
+class TaskNotFound(SessionStoreError):
+    """A task or task step is absent from the requested owner scope."""
+
+
+class ConcurrentTaskUpdate(SessionStoreError):
+    """A task or step changed after the caller's expected version was read."""
+
+
 _FTS_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _TURN_TERMINAL = {"completed", "failed", "cancelled"}
 _TOOL_TERMINAL = {"succeeded", "failed", "cancelled"}
 _VALID_ROLES = {"system", "user", "assistant", "tool", "developer"}
+_TASK_STATUSES = {
+    "queued", "running", "waiting_user", "waiting_approval", "verifying",
+    "needs_reconciliation", "succeeded", "partial", "failed", "cancelled",
+}
+_TASK_STEP_STATUSES = _TASK_STATUSES | {"pending", "ready", "skipped"}
+_TASK_LANES = {"interactive", "background"}
+_ALLOWED_TASK_EVENT_KEYS = {
+    "status", "lane", "from", "to", "version", "expectedversion",
+    "steporder", "dependencyids", "nextaction", "reasoncode", "waitreason",
+    "questionid", "question", "allowedanswers", "expiresat", "approvalid",
+    "actionfingerprint", "toolcallid", "receiptid", "resultref", "evidenceref",
+    "sourcemessageid", "steeredstepid", "correction", "type", "format",
+    "enum", "required",
+}
+_UNSET = object()
 
 
 def _now() -> str:
@@ -82,6 +105,29 @@ def _decode(raw: str | None, default: Any) -> Any:
         return json.loads(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _task_event_payload(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Keep task events to task metadata and evidence references, not execution data."""
+    payload = {} if value is None else value
+    if not isinstance(payload, Mapping):
+        raise TypeError("task event payload must be a mapping")
+
+    def inspect(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                normalized = re.sub(r"[^a-z]", "", str(key).casefold())
+                if normalized not in _ALLOWED_TASK_EVENT_KEYS:
+                    raise ValueError(
+                        f"unsupported task event payload field {key!r}"
+                    )
+                inspect(nested)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                inspect(nested)
+
+    inspect(payload)
+    return payload
 
 
 def _escape_like(value: str) -> str:
@@ -205,9 +251,17 @@ class SessionStore:
         if row is None:
             return None
         item = dict(row)
-        for column in ("metadata_json", "arguments_json", "result_json"):
+        for column in (
+            "metadata_json", "arguments_json", "result_json",
+            "dependency_ids_json", "retry_policy_json", "payload_json",
+        ):
             if column in item:
-                item[column.removesuffix("_json")] = _decode(item.pop(column), {} if column != "result_json" else None)
+                default = (
+                    None if column == "result_json"
+                    else [] if column == "dependency_ids_json"
+                    else {}
+                )
+                item[column.removesuffix("_json")] = _decode(item.pop(column), default)
         return item
 
     def _ensure_session(
@@ -424,22 +478,448 @@ class SessionStore:
 
     complete_tool_call = finish_tool_call
 
+    @staticmethod
+    def _insert_task_event(
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        event_type: str,
+        payload: Mapping[str, Any] | None = None,
+        step_id: str | None = None,
+    ) -> int:
+        cursor = conn.execute(
+            """INSERT INTO task_events(task_id, step_id, event_type, payload_json, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                task_id,
+                step_id,
+                _required(event_type, "event_type"),
+                _json(_task_event_payload(payload), default={}),
+                _now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _validate_task_status(status: str, *, step: bool = False) -> str:
+        value = _required(status, "status").casefold()
+        allowed = _TASK_STEP_STATUSES if step else _TASK_STATUSES
+        if value not in allowed:
+            raise ValueError(f"status must be one of {sorted(allowed)}")
+        return value
+
+    def create_task_run(
+        self,
+        user_id: str,
+        session_id: str,
+        objective: str,
+        *,
+        task_id: str | None = None,
+        parent_task_id: str | None = None,
+        status: str = "queued",
+        lane: str = "interactive",
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        scope = self._scope(user_id, session_id, channel_id, thread_id)
+        task_key = _required(task_id or f"task_{uuid.uuid4().hex}", "task_id")
+        goal = _required(objective, "objective")
+        task_status = self._validate_task_status(status)
+        task_lane = _required(lane, "lane").casefold()
+        if task_lane not in _TASK_LANES:
+            raise ValueError(f"lane must be one of {sorted(_TASK_LANES)}")
+        parent_key = _scope_part(parent_task_id) or None
+        now = _now()
+        with self._write() as conn:
+            session_pk = int(self._ensure_session(conn, scope, None)["id"])
+            if parent_key is not None:
+                parent = conn.execute(
+                    "SELECT task_id FROM task_runs WHERE task_id=? AND user_id=?",
+                    (parent_key, scope[0]),
+                ).fetchone()
+                if parent is None:
+                    raise TaskNotFound("parent task is not present in the requested owner scope")
+            conn.execute(
+                """INSERT INTO task_runs(
+                       task_id, user_id, session_id, parent_task_id, objective,
+                       status, lane, enqueued_at, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_key, scope[0], session_pk, parent_key, goal,
+                    task_status, task_lane, now, now, now,
+                ),
+            )
+            self._insert_task_event(
+                conn, task_id=task_key, event_type="task.created",
+                payload={"status": task_status, "lane": task_lane},
+            )
+            return self._row(
+                conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def _task_pk(self, conn: sqlite3.Connection, user_id: str, task_id: str) -> sqlite3.Row:
+        row = conn.execute(
+            """SELECT t.*, s.session_key, s.channel_id, s.thread_id
+               FROM task_runs t JOIN sessions s ON s.id=t.session_id
+               WHERE t.task_id=? AND t.user_id=? AND s.user_id=?""",
+            (_required(task_id, "task_id"), _required(user_id, "user_id"), _required(user_id, "user_id")),
+        ).fetchone()
+        if row is None:
+            raise TaskNotFound("task is not present in the requested owner scope")
+        return row
+
+    def _validate_task_links(
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        *,
+        tool_call_id: int | None,
+        receipt_id: str | None,
+    ) -> tuple[int | None, str | None]:
+        call_pk = None if tool_call_id is None else int(tool_call_id)
+        receipt_key = _scope_part(receipt_id) or None
+        call_key = None
+        if call_pk is not None:
+            call = conn.execute(
+                """SELECT tc.id, tc.call_key FROM tool_calls tc JOIN sessions s ON s.id=tc.session_id
+                   WHERE tc.id=? AND s.user_id=?""",
+                (call_pk, _required(user_id, "user_id")),
+            ).fetchone()
+            if call is None:
+                raise TaskNotFound("tool call is not present in the requested owner scope")
+            call_key = str(call["call_key"])
+        if receipt_key is not None:
+            if not self._has_table("tool_receipts"):
+                raise TaskNotFound("tool receipt is not present in the requested owner scope")
+            receipt = conn.execute(
+                "SELECT receipt_id, call_id FROM tool_receipts WHERE receipt_id=? AND user_id=?",
+                (receipt_key, _required(user_id, "user_id")),
+            ).fetchone()
+            if receipt is None:
+                raise TaskNotFound("tool receipt is not present in the requested owner scope")
+            if call_key is not None and str(receipt["call_id"]) != call_key:
+                raise ValueError("tool-call and receipt links must refer to the same call ID")
+        return call_pk, receipt_key
+
+    def add_task_step(
+        self,
+        user_id: str,
+        task_id: str,
+        step_order: int,
+        *,
+        step_id: str | None = None,
+        dependency_ids: list[str] | tuple[str, ...] = (),
+        status: str = "pending",
+        next_action: str | None = None,
+        retry_policy: Mapping[str, Any] | None = None,
+        tool_call_id: int | None = None,
+        receipt_id: str | None = None,
+    ) -> dict[str, Any]:
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        step_key = _required(step_id or f"step_{uuid.uuid4().hex}", "step_id")
+        order = int(step_order)
+        if order < 0:
+            raise ValueError("step_order must be non-negative")
+        step_status = self._validate_task_status(status, step=True)
+        dependencies = [_required(item, "dependency_id") for item in dependency_ids]
+        if len(set(dependencies)) != len(dependencies):
+            raise ValueError("dependency_ids must be unique")
+        call_pk, receipt_key = self._validate_task_links(
+            self.connection, owner, tool_call_id=tool_call_id, receipt_id=receipt_id
+        )
+        now = _now()
+        with self._write() as conn:
+            self._task_pk(conn, owner, task_key)
+            for dependency in dependencies:
+                prior = conn.execute(
+                    "SELECT step_order FROM task_steps WHERE task_id=? AND step_id=?",
+                    (task_key, dependency),
+                ).fetchone()
+                if prior is None or int(prior[0]) >= order:
+                    raise ValueError("each dependency must be an existing earlier step in this task")
+            conn.execute(
+                """INSERT INTO task_steps(
+                       step_id, task_id, step_order, dependency_ids_json, status,
+                       next_action, retry_policy_json, tool_call_id, receipt_id,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    step_key, task_key, order, _json(dependencies, default=[]),
+                    step_status, next_action, _json(retry_policy, default={}),
+                    call_pk, receipt_key, now, now,
+                ),
+            )
+            conn.execute(
+                "UPDATE task_runs SET version=version+1, updated_at=? WHERE task_id=? AND user_id=?",
+                (now, task_key, owner),
+            )
+            self._insert_task_event(
+                conn, task_id=task_key, step_id=step_key, event_type="step.created",
+                payload={"step_order": order, "status": step_status, "dependency_ids": dependencies},
+            )
+            return self._row(
+                conn.execute("SELECT * FROM task_steps WHERE step_id=?", (step_key,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def transition_task_run(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        expected_status: str,
+        expected_version: int,
+        new_status: str,
+        wait_reason: Any = _UNSET,
+        current_step_id: Any = _UNSET,
+        cancellation_requested: Any = _UNSET,
+        result_ref: Any = _UNSET,
+    ) -> dict[str, Any]:
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        before = self._validate_task_status(expected_status)
+        after = self._validate_task_status(new_status)
+        version = int(expected_version)
+        if version < 0:
+            raise ValueError("expected_version must be non-negative")
+        updates: dict[str, Any] = {}
+        if wait_reason is not _UNSET:
+            updates["wait_reason"] = None if wait_reason is None else str(wait_reason)
+        if current_step_id is not _UNSET:
+            updates["current_step_id"] = None if current_step_id is None else _required(current_step_id, "current_step_id")
+        if cancellation_requested is not _UNSET:
+            updates["cancellation_requested"] = int(bool(cancellation_requested))
+        if result_ref is not _UNSET:
+            updates["result_ref"] = None if result_ref is None else _required(result_ref, "result_ref")
+        now = _now()
+        with self._write() as conn:
+            self._task_pk(conn, owner, task_key)
+            if updates.get("current_step_id") is not None:
+                step = conn.execute(
+                    "SELECT 1 FROM task_steps WHERE task_id=? AND step_id=?",
+                    (task_key, updates["current_step_id"]),
+                ).fetchone()
+                if step is None:
+                    raise TaskNotFound("current step is not part of this task")
+            assignments = ["status=?", "version=version+1", "updated_at=?"]
+            values: list[Any] = [after, now]
+            for column, value in updates.items():
+                assignments.append(f"{column}=?")
+                values.append(value)
+            values.extend([task_key, owner, before, version])
+            cursor = conn.execute(
+                f"UPDATE task_runs SET {', '.join(assignments)} "
+                "WHERE task_id=? AND user_id=? AND status=? AND version=?",
+                values,
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task status/version changed before transition")
+            self._insert_task_event(
+                conn, task_id=task_key, event_type="task.transitioned",
+                payload={"from": before, "to": after, "expected_version": version, "version": version + 1},
+            )
+            return self._row(
+                conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def transition_task_step(
+        self,
+        user_id: str,
+        task_id: str,
+        step_id: str,
+        *,
+        expected_status: str,
+        expected_version: int,
+        new_status: str,
+        next_action: Any = _UNSET,
+        retry_policy: Any = _UNSET,
+        tool_call_id: Any = _UNSET,
+        receipt_id: Any = _UNSET,
+    ) -> dict[str, Any]:
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        step_key = _required(step_id, "step_id")
+        before = self._validate_task_status(expected_status, step=True)
+        after = self._validate_task_status(new_status, step=True)
+        version = int(expected_version)
+        if version < 0:
+            raise ValueError("expected_version must be non-negative")
+        updates: dict[str, Any] = {}
+        if next_action is not _UNSET:
+            updates["next_action"] = None if next_action is None else str(next_action)
+        if retry_policy is not _UNSET:
+            updates["retry_policy_json"] = _json(retry_policy, default={})
+        if tool_call_id is not _UNSET or receipt_id is not _UNSET:
+            existing = self.get_task_step(owner, task_key, step_key)
+            selected_call = existing["tool_call_id"] if tool_call_id is _UNSET else tool_call_id
+            selected_receipt = existing["receipt_id"] if receipt_id is _UNSET else receipt_id
+            call_pk, receipt_key = self._validate_task_links(
+                self.connection, owner, tool_call_id=selected_call, receipt_id=selected_receipt
+            )
+            updates["tool_call_id"] = call_pk
+            updates["receipt_id"] = receipt_key
+        now = _now()
+        with self._write() as conn:
+            self._task_pk(conn, owner, task_key)
+            assignments = ["status=?", "version=version+1", "updated_at=?"]
+            values: list[Any] = [after, now]
+            for column, value in updates.items():
+                assignments.append(f"{column}=?")
+                values.append(value)
+            values.extend([step_key, task_key, before, version])
+            cursor = conn.execute(
+                f"UPDATE task_steps SET {', '.join(assignments)} "
+                "WHERE step_id=? AND task_id=? AND status=? AND version=?",
+                values,
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task-step status/version changed before transition")
+            conn.execute(
+                "UPDATE task_runs SET version=version+1, updated_at=? WHERE task_id=? AND user_id=?",
+                (now, task_key, owner),
+            )
+            self._insert_task_event(
+                conn, task_id=task_key, step_id=step_key, event_type="step.transitioned",
+                payload={"from": before, "to": after, "expected_version": version, "version": version + 1},
+            )
+            return self._row(
+                conn.execute("SELECT * FROM task_steps WHERE step_id=?", (step_key,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def append_task_event(
+        self,
+        user_id: str,
+        task_id: str,
+        event_type: str,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        step_id: str | None = None,
+    ) -> dict[str, Any]:
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        step_key = _scope_part(step_id) or None
+        with self._write() as conn:
+            self._task_pk(conn, owner, task_key)
+            if step_key is not None and conn.execute(
+                "SELECT 1 FROM task_steps WHERE task_id=? AND step_id=?",
+                (task_key, step_key),
+            ).fetchone() is None:
+                raise TaskNotFound("task step is not present in the requested owner scope")
+            event_id = self._insert_task_event(
+                conn, task_id=task_key, step_id=step_key,
+                event_type=event_type, payload=payload,
+            )
+            return self._row(
+                conn.execute("SELECT * FROM task_events WHERE event_id=?", (event_id,)).fetchone()
+            )  # type: ignore[return-value]
+
+    def get_task_step(self, user_id: str, task_id: str, step_id: str) -> dict[str, Any]:
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        step_key = _required(step_id, "step_id")
+        with self._lock:
+            self._task_pk(self.connection, owner, task_key)
+            row = self.connection.execute(
+                "SELECT * FROM task_steps WHERE task_id=? AND step_id=?",
+                (task_key, step_key),
+            ).fetchone()
+            if row is None:
+                raise TaskNotFound("task step is not present in the requested owner scope")
+            return self._row(row)  # type: ignore[return-value]
+
+    def get_task(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        include_steps: bool = True,
+        include_events: bool = True,
+    ) -> dict[str, Any]:
+        owner = _required(user_id, "user_id")
+        with self._lock:
+            row = self._task_pk(self.connection, owner, task_id)
+            result = self._row(row)  # type: ignore[assignment]
+            if include_steps:
+                result["steps"] = [
+                    self._row(item)
+                    for item in self.connection.execute(
+                        "SELECT * FROM task_steps WHERE task_id=? ORDER BY step_order, step_id",
+                        (result["task_id"],),
+                    ).fetchall()
+                ]
+            if include_events:
+                result["events"] = [
+                    self._row(item)
+                    for item in self.connection.execute(
+                        "SELECT * FROM task_events WHERE task_id=? ORDER BY event_id",
+                        (result["task_id"],),
+                    ).fetchall()
+                ]
+            return result
+
+    def list_tasks(
+        self,
+        user_id: str,
+        *,
+        statuses: list[str] | tuple[str, ...] | None = None,
+        lane: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        owner = _required(user_id, "user_id")
+        limit = max(1, min(int(limit), 500))
+        clauses = ["t.user_id=?"]
+        params: list[Any] = [owner]
+        if statuses is not None:
+            normalized = [self._validate_task_status(item) for item in statuses]
+            if not normalized:
+                return []
+            clauses.append(f"t.status IN ({','.join('?' for _ in normalized)})")
+            params.extend(normalized)
+        if lane is not None:
+            selected_lane = _required(lane, "lane").casefold()
+            if selected_lane not in _TASK_LANES:
+                raise ValueError(f"lane must be one of {sorted(_TASK_LANES)}")
+            clauses.append("t.lane=?")
+            params.append(selected_lane)
+        params.append(limit)
+        with self._lock:
+            rows = self.connection.execute(
+                f"SELECT t.* FROM task_runs t JOIN sessions s ON s.id=t.session_id "
+                f"WHERE {' AND '.join(clauses)} "
+                "AND s.user_id=t.user_id ORDER BY t.enqueued_at, t.task_id LIMIT ?",
+                params,
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
     def _prune(self, conn: sqlite3.Connection, session_pk: int) -> None:
-        # Retention is explicit and bounded.  Foreign-key cascades remove
-        # dependent messages/tool calls when old turns leave the window.
+        # Retention is normally bounded. Keep any turn whose tool-call row is
+        # referenced by a durable task step: migration 006 cascades from turn
+        # to tool call, and deleting that evidence would violate task history.
+        # Such referenced turns may exceed the ordinary retention cap.
         conn.execute(
             """DELETE FROM turns WHERE session_id=? AND status IN ('completed','failed','cancelled')
-               AND id NOT IN (SELECT id FROM turns WHERE session_id=? ORDER BY id DESC LIMIT ?)""",
-            (session_pk, session_pk, self.max_turns_per_session),
+               AND id NOT IN (SELECT id FROM turns WHERE session_id=? ORDER BY id DESC LIMIT ?)
+               AND id NOT IN (
+                   SELECT tc.turn_id FROM tool_calls tc
+                   JOIN task_steps ts ON ts.tool_call_id=tc.id
+                   WHERE tc.session_id=? AND tc.turn_id IS NOT NULL
+               )""",
+            (session_pk, session_pk, self.max_turns_per_session, session_pk),
         )
         conn.execute(
             """DELETE FROM messages WHERE session_id=? AND id NOT IN
                (SELECT id FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?)""",
             (session_pk, session_pk, self.max_messages_per_session),
         )
+        # Task steps are durable references to execution evidence. Preserve a
+        # linked tool-call row even if that makes the per-session cap a soft
+        # bound; deleting it would silently erase the task's evidence link.
         conn.execute(
             """DELETE FROM tool_calls WHERE session_id=? AND id NOT IN
-               (SELECT id FROM tool_calls WHERE session_id=? ORDER BY id DESC LIMIT ?)""",
+               (SELECT id FROM tool_calls WHERE session_id=? ORDER BY id DESC LIMIT ?)
+               AND id NOT IN (
+                   SELECT tool_call_id FROM task_steps WHERE tool_call_id IS NOT NULL
+               )""",
             (session_pk, session_pk, self.max_tool_calls_per_session),
         )
 
@@ -517,5 +997,6 @@ class SessionStore:
 
 
 __all__ = [
-    "IdempotencyConflict", "InvalidLifecycleTransition", "SessionNotFound", "SessionStore", "SessionStoreError",
+    "ConcurrentTaskUpdate", "IdempotencyConflict", "InvalidLifecycleTransition",
+    "SessionNotFound", "SessionStore", "SessionStoreError", "TaskNotFound",
 ]

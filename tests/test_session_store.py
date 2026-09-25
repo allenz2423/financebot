@@ -2,7 +2,13 @@ import sqlite3
 
 import pytest
 
-from src.db.session_store import IdempotencyConflict, SessionStore
+from src.db.session_store import (
+    ConcurrentTaskUpdate,
+    IdempotencyConflict,
+    SessionNotFound,
+    SessionStore,
+    TaskNotFound,
+)
 
 
 def make_store():
@@ -57,12 +63,233 @@ def test_bounded_retention_and_safe_fts_search_with_like_fallback():
 
 def test_migration_is_idempotent_and_fts_is_derived():
     with make_store() as store:
-        store.connection.execute("SELECT name FROM sqlite_master WHERE name IN ('sessions','turns','messages','tool_calls')")
+        store.connection.execute(
+            "SELECT name FROM sqlite_master WHERE name IN "
+            "('sessions','turns','messages','tool_calls','task_runs','task_steps','task_events')"
+        )
         store.connection.commit()
         # Re-running the migration runner must not duplicate schema objects.
         from src.db.migrations import apply_all
         apply_all(store.connection)
         store.connection.commit()
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('task_runs','task_steps','task_events')"
+        ).fetchone()[0] == 3
         store.add_message("u", "s", role="assistant", content="durable", message_id="a")
         if store._fts_enabled:
             assert store.connection.execute("SELECT count(*) FROM messages_fts").fetchone()[0] == 1
+
+
+def test_task_steps_events_and_existing_evidence_links_survive_restart(tmp_path):
+    path = tmp_path / "durable-tasks.db"
+    with SessionStore(path) as store:
+        store.begin_turn("owner-1", "session-1", turn_id="turn-1")
+        call = store.record_tool_call(
+            "owner-1", "session-1", tool_name="search_gmail",
+            arguments={"query": "newer_than:1d"}, call_id="gmail-call", turn_id="turn-1",
+        )
+        from src.services.tool_receipts import ReceiptStore
+        receipt = ReceiptStore(store.connection).prepare(
+            receipt_id="gmail-receipt", call_id="gmail-call", user_id="owner-1",
+            turn_id="turn-1", round_id=1, tool_name="search_gmail", origin="native",
+            arguments={"query": "newer_than:1d"},
+        )
+        task = store.create_task_run(
+            "owner-1", "session-1", "Find recent mail", task_id="task-1", lane="background"
+        )
+        first = store.add_task_step(
+            "owner-1", task["task_id"], 0, step_id="step-1", status="ready",
+            next_action="search_gmail", retry_policy={"mode": "safe_read"},
+            tool_call_id=call["id"], receipt_id=receipt.receipt_id,
+        )
+        second = store.add_task_step(
+            "owner-1", task["task_id"], 1, step_id="step-2",
+            dependency_ids=["step-1"], status="pending", next_action="summarize",
+        )
+        advanced = store.transition_task_step(
+            "owner-1", task["task_id"], first["step_id"], expected_status="ready",
+            expected_version=0, new_status="running",
+        )
+        task = store.get_task("owner-1", task["task_id"])
+        task = store.transition_task_run(
+            "owner-1", task["task_id"], expected_status="queued",
+            expected_version=task["version"], new_status="running",
+            current_step_id=advanced["step_id"],
+        )
+        assert second["dependency_ids"] == ["step-1"]
+
+    with SessionStore(path) as reopened:
+        recovered = reopened.get_task("owner-1", "task-1")
+        assert recovered["status"] == "running"
+        assert recovered["current_step_id"] == "step-1"
+        assert recovered["steps"][0]["tool_call_id"] == call["id"]
+        assert recovered["steps"][0]["receipt_id"] == "gmail-receipt"
+        assert recovered["steps"][0]["retry_policy"] == {"mode": "safe_read"}
+        assert [event["event_type"] for event in recovered["events"]] == [
+            "task.created", "step.created", "step.created",
+            "step.transitioned", "task.transitioned",
+        ]
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            reopened.connection.execute(
+                "UPDATE task_events SET event_type='rewritten' WHERE task_id='task-1'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            reopened.connection.execute("DELETE FROM task_events WHERE task_id='task-1'")
+        with pytest.raises(sqlite3.IntegrityError):
+            reopened.connection.execute("DELETE FROM task_runs WHERE task_id='task-1'")
+        with pytest.raises(sqlite3.IntegrityError):
+            reopened.connection.execute("DELETE FROM sessions WHERE id=?", (recovered["session_id"],))
+
+
+def test_task_reads_and_evidence_links_are_owner_scoped():
+    with make_store() as store:
+        task = store.create_task_run("owner-a", "session-a", "private objective", task_id="task-a")
+        store.add_task_step("owner-a", task["task_id"], 0, step_id="step-a")
+        call = store.record_tool_call(
+            "owner-b", "session-b", tool_name="read_ledger", call_id="other-owner-call"
+        )
+        from src.services.tool_receipts import ReceiptStore
+        receipt = ReceiptStore(store.connection).prepare(
+            receipt_id="other-owner-receipt", call_id="other-owner-call",
+            user_id="owner-b", turn_id="turn-b", round_id=1,
+            tool_name="read_ledger", origin="native", arguments={},
+        )
+        owner_call = store.record_tool_call(
+            "owner-a", "session-a", tool_name="read_ledger", call_id="owner-call"
+        )
+        mismatched_receipt = ReceiptStore(store.connection).prepare(
+            receipt_id="mismatched-receipt", call_id="different-call",
+            user_id="owner-a", turn_id="turn-a", round_id=1,
+            tool_name="read_ledger", origin="native", arguments={},
+        )
+        assert store.list_tasks("owner-b") == []
+        with pytest.raises(TaskNotFound):
+            store.get_task("owner-b", "task-a")
+        with pytest.raises(TaskNotFound):
+            store.get_task_step("owner-b", "task-a", "step-a")
+        with pytest.raises(TaskNotFound):
+            store.add_task_step("owner-b", "task-a", 0, step_id="foreign-step")
+        with pytest.raises(TaskNotFound):
+            store.add_task_step(
+                "owner-a", "task-a", 1, step_id="foreign-call-step",
+                tool_call_id=call["id"],
+            )
+        with pytest.raises(TaskNotFound):
+            store.add_task_step(
+                "owner-a", "task-a", 1, step_id="foreign-receipt-step",
+                receipt_id=receipt.receipt_id,
+            )
+        with pytest.raises(ValueError, match="same call ID"):
+            store.add_task_step(
+                "owner-a", "task-a", 1, step_id="mismatched-evidence-step",
+                tool_call_id=owner_call["id"], receipt_id=mismatched_receipt.receipt_id,
+            )
+        with pytest.raises(ValueError, match="unsupported task event payload field"):
+            store.append_task_event(
+                "owner-a", "task-a", "bad.event",
+                payload={"nested": {"receipt_status": "confirmed"}},
+            )
+        with pytest.raises(ValueError, match="unsupported task event payload field"):
+            store.append_task_event(
+                "owner-a", "task-a", "bad.event",
+                payload={"tool_arguments": {"account": "checking"}},
+            )
+        with pytest.raises(ValueError, match="unsupported task event payload field"):
+            store.append_task_event(
+                "owner-a", "task-a", "bad.event",
+                payload={"receipt": {"status": "confirmed"}},
+            )
+        with pytest.raises(ValueError, match="unsupported task event payload field"):
+            store.append_task_event(
+                "owner-a", "task-a", "bad.event",
+                payload={"result": {"balance": 123}},
+            )
+        with pytest.raises(SessionNotFound):
+            store.list_messages("owner-b", "session-a")
+
+
+def test_step_partial_status_and_task_linked_calls_survive_retention_pruning():
+    with make_store() as store:
+        store.begin_turn("u", "s", turn_id="old-linked-turn")
+        call = store.record_tool_call(
+            "u", "s", tool_name="read_ledger", call_id="old-linked-call",
+            turn_id="old-linked-turn",
+        )
+        task = store.create_task_run("u", "s", "retain evidence", task_id="retained-task")
+        step = store.add_task_step(
+            "u", task["task_id"], 0, step_id="retained-step",
+            tool_call_id=call["id"],
+        )
+        transitioned = store.transition_task_step(
+            "u", task["task_id"], step["step_id"], expected_status="pending",
+            expected_version=0, new_status="partial",
+        )
+        assert transitioned["status"] == "partial"
+        store.finish_turn("u", "s", "old-linked-turn", status="completed")
+
+        for index in range(5):
+            later_turn = f"later-turn-{index}"
+            store.begin_turn("u", "s", turn_id=later_turn)
+            store.record_tool_call(
+                "u", "s", tool_name="read_ledger", call_id=f"later-call-{index}",
+                turn_id=later_turn,
+            )
+            store.finish_turn("u", "s", later_turn, status="completed")
+        assert store.connection.execute(
+            "SELECT id FROM tool_calls WHERE id=?", (call["id"],)
+        ).fetchone()[0] == call["id"]
+        assert store.get_task_step("u", task["task_id"], step["step_id"])["tool_call_id"] == call["id"]
+
+
+def test_competing_task_and_step_transitions_use_status_version_cas(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    path = tmp_path / "task-cas.db"
+    with SessionStore(path) as setup:
+        task = setup.create_task_run("owner-1", "session-1", "CAS objective", task_id="cas-task")
+        step = setup.add_task_step("owner-1", task["task_id"], 0, step_id="cas-step")
+
+    stores = [SessionStore(path), SessionStore(path)]
+
+    def race_task(index, target_status):
+        try:
+            stores[index].transition_task_run(
+                "owner-1", "cas-task", expected_status="queued", expected_version=1,
+                new_status=target_status,
+            )
+            return "won"
+        except ConcurrentTaskUpdate:
+            return "lost"
+
+    barrier = Barrier(2)
+
+    def concurrent_task(item):
+        index, target_status = item
+        barrier.wait(timeout=5)
+        return race_task(index, target_status)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(concurrent_task, enumerate(("running", "cancelled"))))
+    assert sorted(outcomes) == ["lost", "won"]
+
+    step_barrier = Barrier(2)
+
+    def concurrent_step(item):
+        index, target_status = item
+        step_barrier.wait(timeout=5)
+        try:
+            stores[index].transition_task_step(
+                "owner-1", "cas-task", "cas-step", expected_status="pending",
+                expected_version=0, new_status=target_status,
+            )
+            return "won"
+        except ConcurrentTaskUpdate:
+            return "lost"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        step_outcomes = list(pool.map(concurrent_step, enumerate(("ready", "cancelled"))))
+    assert sorted(step_outcomes) == ["lost", "won"]
+    for store in stores:
+        store.close()
