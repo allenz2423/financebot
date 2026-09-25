@@ -1158,6 +1158,23 @@ class SessionStore:
                 raise TaskNotFound("task step is not present in the requested owner scope")
             return self._row(row)  # type: ignore[return-value]
 
+    def list_task_steps(
+        self, user_id: str, task_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Return bounded step metadata without loading task events or all steps."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        bounded_limit = max(1, min(int(limit), 20))
+        with self._lock:
+            self._task_pk(self.connection, owner, task_key)
+            rows = self.connection.execute(
+                """SELECT step_id, status, substr(next_action, 1, 201) AS next_action
+                   FROM task_steps WHERE task_id=?
+                   ORDER BY step_order, step_id LIMIT ?""",
+                (task_key, bounded_limit),
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
     def has_confirmed_task_call(
         self, user_id: str, task_id: str, *, tool_name: str, arguments: Any
     ) -> bool:
@@ -1325,6 +1342,46 @@ class SessionStore:
                 f"SELECT t.* FROM task_runs t JOIN sessions s ON s.id=t.session_id "
                 f"WHERE {' AND '.join(clauses)} "
                 f"AND s.user_id=t.user_id ORDER BY {ordering} LIMIT ?",
+                params,
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
+    def list_task_summaries(
+        self,
+        user_id: str,
+        *,
+        session_id: str,
+        channel_id: str | None,
+        thread_id: str | None,
+        statuses: list[str] | tuple[str, ...] | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Read bounded task fields for model-facing progress summaries."""
+        owner = _required(user_id, "user_id")
+        session = _required(session_id, "session_id")
+        bounded_limit = max(1, min(int(limit), 20))
+        clauses = [
+            "t.user_id=?", "s.session_key=?", "s.channel_id=?",
+            "s.thread_id=?", "s.user_id=t.user_id",
+        ]
+        params: list[Any] = [
+            owner, session, _scope_part(channel_id), _scope_part(thread_id),
+        ]
+        if statuses is not None:
+            normalized = [self._validate_task_status(item) for item in statuses]
+            if not normalized:
+                return []
+            clauses.append(f"t.status IN ({','.join('?' for _ in normalized)})")
+            params.extend(normalized)
+        params.append(bounded_limit)
+        with self._lock:
+            rows = self.connection.execute(
+                f"""SELECT t.task_id, substr(t.objective, 1, 501) AS objective,
+                           t.status, t.lane, t.updated_at,
+                           substr(t.wait_reason, 1, 201) AS wait_reason
+                    FROM task_runs t JOIN sessions s ON s.id=t.session_id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY t.updated_at DESC, t.task_id LIMIT ?""",
                 params,
             ).fetchall()
             return [self._row(row) for row in rows]  # type: ignore[misc]

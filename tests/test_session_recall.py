@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from src.db.session_store import SessionStore
 from src.agent.runtime import CURRENT_TURN_ID
 from src.services import llm
@@ -353,3 +355,103 @@ def test_durable_recall_caps_results_and_each_message_content(monkeypatch):
     )
     assert len(found) == 10
     assert all(len(item["content"]) <= 1600 for item in found)
+
+
+def test_task_list_is_owner_and_conversation_scoped_and_bounded(monkeypatch):
+    store = SessionStore(connection=sqlite3.connect(":memory:", isolation_level=None))
+    store.create_task_run(
+        "owner", "session-a", "O" * 1000, task_id="task-a",
+        channel_id="channel-a", thread_id="thread-a",
+    )
+    for index in range(25):
+        store.add_task_step(
+            "owner", "task-a", index, step_id=f"step-{index:02}",
+            next_action="N" * 1000,
+        )
+    current = store.get_task("owner", "task-a", include_steps=False, include_events=False)
+    store.transition_task_run(
+        "owner", "task-a", expected_status="queued",
+        expected_version=current["version"], new_status="waiting_user",
+        wait_reason="W" * 1000,
+    )
+    for index in range(25):
+        store.create_task_run(
+            "owner", "session-a", f"bulk objective {index}", task_id=f"bulk-{index:02}",
+            channel_id="channel-a", thread_id="thread-a",
+        )
+    store.create_task_run(
+        "owner", "session-b", "Other conversation task", task_id="task-b",
+        channel_id="channel-a", thread_id="thread-a",
+    )
+    store.create_task_run(
+        "other-owner", "session-a", "Other owner's task", task_id="task-c",
+        channel_id="channel-a", thread_id="thread-a",
+    )
+    store.create_task_run(
+        "owner", "session-a", "Other channel with same key", task_id="task-d",
+        channel_id="channel-b", thread_id="thread-a",
+    )
+    store.create_task_run(
+        "owner", "session-a", "Other thread with same key", task_id="task-e",
+        channel_id="channel-a", thread_id="thread-b",
+    )
+    store.create_task_run(
+        "owner", "session-c", "Unthreaded task", task_id="task-f",
+        channel_id="channel-a", thread_id=None,
+    )
+    store.create_task_run(
+        "owner", "session-a", "Saved as succeeded", task_id="task-done",
+        status="succeeded", channel_id="channel-a", thread_id="thread-a",
+    )
+    monkeypatch.setattr(llm, "_DURABLE_SESSION_STORE", store)
+
+    listed = llm._list_durable_tasks(
+        "owner", session_id="session-a", channel_id="channel-a",
+        thread_id="thread-a", limit=999,
+    )
+    assert len(listed) == 20
+    assert all(task["task_id"] != "task-b" for task in listed)
+    assert all(task["task_id"] != "task-c" for task in listed)
+    assert all(task["task_id"] != "task-d" for task in listed)
+    assert all(task["task_id"] != "task-e" for task in listed)
+    bounded = llm._list_durable_tasks(
+        "owner", session_id="session-a", channel_id="channel-a",
+        thread_id="thread-a", status="waiting_user",
+    )
+    assert len(bounded) == 1
+    assert bounded[0]["task_id"] == "task-a"
+    assert len(bounded[0]["objective"]) == 500
+    assert bounded[0]["status"] == "waiting_user"
+    assert len(bounded[0]["wait_reason"]) == 200
+    assert len(bounded[0]["steps"]) == 20
+    assert len(bounded[0]["steps"][0]["next_action"]) == 200
+    assert llm._list_durable_tasks(
+        "owner", session_id="session-a", channel_id="channel-a",
+        thread_id="thread-a", status="running",
+    ) == []
+    assert llm._list_durable_tasks(
+        "owner", session_id="session-b", channel_id="channel-a", thread_id="thread-a"
+    )[0]["task_id"] == "task-b"
+    assert llm._list_durable_tasks(
+        "owner", session_id="session-a", channel_id="channel-b", thread_id="thread-a"
+    )[0]["task_id"] == "task-d"
+    assert llm._list_durable_tasks(
+        "owner", session_id="session-a", channel_id="channel-a", thread_id="thread-b"
+    )[0]["task_id"] == "task-e"
+    assert llm._list_durable_tasks(
+        "owner", session_id="session-c", channel_id="channel-a", thread_id=None
+    )[0]["task_id"] == "task-f"
+    assert llm._list_durable_tasks(
+        "owner", session_id="session-c", channel_id="channel-a", thread_id="thread-b"
+    ) == []
+    completed = llm._list_durable_tasks(
+        "owner", session_id="session-a", channel_id="channel-a",
+        thread_id="thread-a", status="succeeded",
+    )[0]
+    assert completed["status"] == "succeeded"
+    assert "result_ref" not in completed
+    with pytest.raises(ValueError, match="recognized task state"):
+        llm._list_durable_tasks(
+            "owner", session_id="session-a", channel_id="channel-a",
+            thread_id="thread-a", status="not-a-state",
+        )

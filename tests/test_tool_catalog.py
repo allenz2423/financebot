@@ -66,6 +66,22 @@ def test_await_user_is_registered_as_a_bounded_durable_question_tool():
     assert "only tool call" in schema["description"]
 
 
+def test_task_list_is_registered_as_read_only_durable_progress_lookup():
+    import src.services.llm as llm
+
+    assert "task_list" in llm.KNOWN_TOOLS
+    assert "task_list" in llm.EXPECTED_TOOL_NAMES
+    schema = next(
+        tool["function"] for tool in llm.BOT_TOOLS_SCHEMA
+        if tool["function"]["name"] == "task_list"
+    )
+    assert schema["parameters"]["properties"]["limit"]["maximum"] == 20
+    assert "does not resume tasks" in schema["description"]
+    assert "prove that an external action happened" in schema["description"]
+    assert "task_list" in llm._INPUT_ONLY_REPLY_ALLOWED_TOOLS
+    assert "task_list" not in llm.MUTATION_TOOLS
+
+
 def test_every_advertised_tool_has_a_dispatch_branch_or_registry_handler():
     import src.services.llm as llm
 
