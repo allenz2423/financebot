@@ -9,6 +9,7 @@ import hashlib
 import ipaddress
 import random
 import socket
+import subprocess
 import time
 import math
 from collections import Counter
@@ -31,6 +32,11 @@ from PIL import Image
 
 from src.core.state import *
 from src.utils.helpers import *
+from src.services.transaction_evidence import (
+    build_identity_queries,
+    evaluate_merchant_search,
+    parse_merchant_descriptor,
+)
 
 
 # ============================================================
@@ -436,63 +442,6 @@ def _merchant_search_query(query: str) -> str:
 
     return " ".join(kept) if kept else q
 
-
-def _merchant_search_queries(query: str) -> list[str]:
-    """Build progressively broader queries for noisy merchant descriptors."""
-    raw = re.sub(r"\s+", " ", str(query or "")).strip()
-    normalized = _merchant_search_query(raw)
-
-    if not normalized:
-        return []
-
-    out = []
-
-    def add(value: str):
-        value = re.sub(r"\s+", " ", value).strip()
-        if value and value.lower() not in {x.lower() for x in out}:
-            out.append(value)
-
-    tokens = normalized.split()
-
-    # First try the cleaned descriptor.
-    add(normalized)
-
-    # Exact phrase often works much better for brands.
-    add(f'"{normalized}"')
-
-    # Remove short transaction/channel prefixes:
-    # TST XING FU TANG HUDSON -> XING FU TANG HUDSON
-    trimmed = tokens[:]
-    while len(trimmed) >= 2 and len(trimmed[0]) <= 3:
-        trimmed.pop(0)
-        value = " ".join(trimmed)
-        add(value)
-        add(f'"{value}"')
-
-    # Remove obvious location suffixes:
-    locationish = {
-        "avenel", "hudson", "brooklyn", "manhattan", "ny", "nyc",
-        "usa", "us", "gb", "uk", "ca", "ch", "herald", "square",
-        "7th", "ave",
-    }
-
-    trimmed = tokens[:]
-    while len(trimmed) >= 2 and trimmed[-1].lower() in locationish:
-        trimmed.pop()
-        value = " ".join(trimmed)
-        add(value)
-        add(f'"{value}"')
-
-    # Finally try progressively shorter multi-word phrases.
-    trimmed = tokens[:]
-    while len(trimmed) >= 3:
-        value = " ".join(trimmed[:-1])
-        if len(value.split()) >= 2:
-            add(value)
-            add(f'"{value}"')
-        trimmed.pop()
-
-    return out[:10]
 
 def _merchant_search_queries(query: str) -> list[str]:
     """Build a small ordered set of progressively broader merchant queries."""
@@ -1240,6 +1189,7 @@ async def search_searxng(
     time_range: str | None = None,
     scrape: bool = True,
     user_id: str | None = None,
+    preserve_exact_quotes: bool = False,
 ) -> dict:
     """
     Search SearXNG.
@@ -1288,7 +1238,7 @@ async def search_searxng(
 
     # Strip outer and inner restrictive quotes/brackets that break SearXNG/Bing matching
     # (e.g. '"Summer 2027" software engineering' -> 'Summer 2027 software engineering')
-    clean_q = re.sub(r'[\"\'\`\[\]\(\)]', ' ', q)
+    clean_q = q if preserve_exact_quotes else re.sub(r'[\"\'\`\[\]\(\)]', ' ', q)
     clean_q = re.sub(r'\s+', ' ', clean_q).strip()
 
     now = time.time()
@@ -1554,13 +1504,30 @@ async def _host_is_public(hostname: str) -> bool:
     if host in blocked_names or host.endswith(".local"):
         return False
     try:
-        infos = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        )
+        try:
+            # Avoid a resolver subprocess for literal IPs.
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            # A subprocess can be terminated on timeout; a cancelled
+            # run_in_executor/getaddrinfo call can leave a worker thread alive
+            # and stall asyncio teardown in offline environments.
+            resolved = subprocess.run(
+                ["getent", "ahosts", host],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            addresses = []
+            for line in resolved.stdout.splitlines():
+                candidate = line.split()[0] if line.split() else ""
+                try:
+                    addresses.append(ipaddress.ip_address(candidate))
+                except ValueError:
+                    continue
     except Exception:
         return False
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+    for ip in addresses:
         if (
             ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_multicast or ip.is_reserved or ip.is_unspecified
@@ -2303,69 +2270,48 @@ async def search_merchant(query: str, *, scrape: bool = True) -> dict:
     transaction descriptors and stops at the first query producing evidence
     that actually overlaps the merchant identity.
     """
-    candidates = _merchant_search_queries(query)
-    if not candidates:
+    descriptor = parse_merchant_descriptor(query)
+    query_specs = build_identity_queries(descriptor)
+    if not query_specs:
         return {
             "query": "",
             "results": [],
             "text": "[relevance: none]\nEmpty merchant query.",
+            "identity_status": "NO_IDENTITY",
+            "identity_reasons": ["empty_merchant_candidate"],
         }
 
-    best = None
-
-    for candidate in candidates:
-        result = await search_searxng(candidate, scrape=scrape)
+    for query_spec in query_specs:
+        candidate = str(query_spec["query"])
+        try:
+            result = await search_searxng(
+                candidate,
+                scrape=scrape,
+                preserve_exact_quotes=query_spec["kind"] == "exact_identity",
+            )
+        except Exception as exc:
+            print(f" [MERCHANT SEARCH] query failed for {candidate!r}: {type(exc).__name__}: {exc}")
+            continue
         results = result.get("results") or []
-
-        if results:
-            identity = _research_identity_tokens(candidate)
-            if identity:
-                relevant = []
-                for item in results:
-                    evidence = " ".join(
-                        [
-                            str(item.get("title") or ""),
-                            str(item.get("snippet") or ""),
-                            str(item.get("url") or ""),
-                        ]
-                    ).lower()
-
-                    hits = sum(
-                        1
-                        for token in identity
-                        if re.search(
-                            rf"\b{re.escape(token)}\b",
-                            re.sub(r"[^a-z0-9]+", " ", evidence),
-                        )
-                    )
-
-                    if hits:
-                        relevant.append(item)
-
-                if relevant:
-                    result["results"] = relevant
-                    result["text"] = _format_raw_search_results(
-                        candidate,
-                        relevant,
-                        sorted(
-                            {
-                                engine
-                                for item in relevant
-                                for engine in item.get("engines", [])
-                            }
-                        ),
-                        result.get("time_range"),
-                    )
-                    print(
-                        f" [MERCHANT SEARCH] {query!r} -> {candidate!r} "
-                        f"({len(relevant)} relevant results)"
-                    )
-                    return result
-
-            else:
-                return result
-
-        best = result
+        evidence = evaluate_merchant_search(descriptor, results)
+        if evidence.usable_for_identity:
+            result["results"] = list(evidence.results)
+            result["identity_status"] = evidence.identity
+            result["identity_reasons"] = list(evidence.reasons)
+            result["identity_score"] = evidence.score
+            result["merchant_candidate"] = descriptor.merchant_candidate
+            result["processor_tokens"] = list(descriptor.processor_tokens)
+            result["text"] = _format_raw_search_results(
+                candidate,
+                list(evidence.results),
+                sorted({engine for item in evidence.results for engine in item.get("engines", [])}),
+                result.get("time_range"),
+            )
+            print(
+                f" [MERCHANT SEARCH] {query!r} -> {candidate!r} "
+                f"({len(evidence.results)} strong identity results)"
+            )
+            return result
 
     print(f" [MERCHANT SEARCH] No relevant evidence for {query!r}")
     return {
@@ -2375,6 +2321,10 @@ async def search_merchant(query: str, *, scrape: bool = True) -> dict:
             f'[web search: "{query}"] [relevance: none]\n'
             "No search candidate contained usable merchant-identity evidence."
         ),
+        "identity_status": "NO_IDENTITY",
+        "identity_reasons": ["no_strong_identity_evidence"],
+        "merchant_candidate": descriptor.merchant_candidate,
+        "processor_tokens": list(descriptor.processor_tokens),
     }
 
 

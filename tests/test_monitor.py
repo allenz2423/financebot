@@ -289,6 +289,14 @@ def test_category_budget_overpacing_evaluator(monkeypatch):
     # We fix the date to day 10 of current month
     from datetime import datetime
     now_dt = datetime.now()
+    fixed_now = now_dt.replace(day=10, hour=12, minute=0, second=0, microsecond=0)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(mon, "datetime", FixedDateTime)
     tx_date = f"{now_dt.year:04d}-{now_dt.month:02d}-05"
 
     conn.execute(
@@ -369,4 +377,3 @@ def test_deliver_alerts_scopes_alerts_to_user():
         "UPDATE monitor_alerts SET delivered_discord = 1 WHERE id = ?", (7,)
     )
     fake_conn.commit.assert_called_once()
-

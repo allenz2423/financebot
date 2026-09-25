@@ -28,7 +28,7 @@ CAPABILITY_REGISTRY = {
         "Net Worth": ["get_net_worth_history"],
     },
     "Web Research": {
-        "Search & Extract": ["search_web", "fetch_webpage", "crawl_deeper"],
+        "Search & Extract": ["search_web", "research_topic", "fetch_webpage", "crawl_deeper"],
         "Merchants": ["get_known_merchant", "save_known_merchant", "get_unique_unregistered_merchants"],
     },
     "Active World Model": {
@@ -44,7 +44,7 @@ CAPABILITY_REGISTRY = {
         "Reports": ["generate_financial_digest"],
     },
     "Workspace & File Delivery": {
-        "Files": ["list_workspace_files", "send_workspace_file"],
+        "Files": ["list_workspace_files", "read_workspace_file", "send_workspace_file"],
         "Execute & Write Files": ["run_python_sandbox", "run_shell", "install_python_package"],
     },
     "Settings": {
@@ -88,4 +88,3 @@ def explore_domain(domain: str) -> str:
 def list_domains() -> str:
     """Returns the top-level list of domains."""
     return "Available Domains:\n- " + "\n- ".join(CAPABILITY_REGISTRY.keys())
-

@@ -130,29 +130,35 @@ def resolve_canonical_merchant(
     cleaned = clean_raw_merchant_descriptor(raw)
     clean_key = re.sub(r"\s+", " ", cleaned.strip().lower())
 
+    def _hit(row, matched_by: str) -> Dict[str, Any]:
+        return {
+            "raw_merchant": raw,
+            "canonical_name": row[0],
+            "category": row[1],
+            "confidence": row[2] or "high",
+            "source": row[3] or "unknown",
+            "evidence_url": row[4] or "",
+            "updated_at": row[5] or "",
+            "matched_by": matched_by,
+        }
+
     def _execute(db_conn: sqlite3.Connection) -> Dict[str, Any]:
         c = db_conn.cursor()
 
         # 1. Exact match on known_merchants.merchant_key
         c.execute("""
-            SELECT canonical_name, category, confidence
+            SELECT canonical_name, category, confidence, source, evidence_url, updated_at
             FROM known_merchants
             WHERE merchant_key = ?
             LIMIT 1
         """, (raw_key,))
         row = c.fetchone()
         if row:
-            return {
-                "raw_merchant": raw,
-                "canonical_name": row[0],
-                "category": row[1],
-                "confidence": row[2] or "high",
-                "matched_by": "registry_exact",
-            }
+            return _hit(row, "registry_exact")
 
         # 2. Match on merchant_aliases.alias_key
         c.execute("""
-            SELECT km.canonical_name, km.category, km.confidence
+            SELECT km.canonical_name, km.category, km.confidence, km.source, km.evidence_url, km.updated_at
             FROM merchant_aliases ma
             JOIN known_merchants km ON km.id = ma.known_merchant_id
             WHERE ma.alias_key = ?
@@ -160,35 +166,23 @@ def resolve_canonical_merchant(
         """, (raw_key,))
         row = c.fetchone()
         if row:
-            return {
-                "raw_merchant": raw,
-                "canonical_name": row[0],
-                "category": row[1],
-                "confidence": row[2] or "high",
-                "matched_by": "alias_exact",
-            }
+            return _hit(row, "alias_exact")
 
         # 3. Match using cleaned descriptor key on known_merchants
         if clean_key != raw_key:
             c.execute("""
-                SELECT canonical_name, category, confidence
+                SELECT canonical_name, category, confidence, source, evidence_url, updated_at
                 FROM known_merchants
                 WHERE merchant_key = ?
                 LIMIT 1
             """, (clean_key,))
             row = c.fetchone()
             if row:
-                return {
-                    "raw_merchant": raw,
-                    "canonical_name": row[0],
-                    "category": row[1],
-                    "confidence": "high",
-                    "matched_by": "registry_cleaned",
-                }
+                return _hit(row, "registry_cleaned") | {"confidence": "high"}
 
             # Match using cleaned key on merchant_aliases
             c.execute("""
-                SELECT km.canonical_name, km.category, km.confidence
+                SELECT km.canonical_name, km.category, km.confidence, km.source, km.evidence_url, km.updated_at
                 FROM merchant_aliases ma
                 JOIN known_merchants km ON km.id = ma.known_merchant_id
                 WHERE ma.alias_key = ?
@@ -196,13 +190,7 @@ def resolve_canonical_merchant(
             """, (clean_key,))
             row = c.fetchone()
             if row:
-                return {
-                    "raw_merchant": raw,
-                    "canonical_name": row[0],
-                    "category": row[1],
-                    "confidence": "high",
-                    "matched_by": "alias_cleaned",
-                }
+                return _hit(row, "alias_cleaned") | {"confidence": "high"}
 
         # 4. Fallback to algorithmic cleaned descriptor
         return {
@@ -210,6 +198,9 @@ def resolve_canonical_merchant(
             "canonical_name": cleaned,
             "category": None,
             "confidence": "medium" if cleaned != raw else "low",
+            "source": "heuristic_cleaner",
+            "evidence_url": "",
+            "updated_at": "",
             "matched_by": "heuristic_cleaner",
         }
 

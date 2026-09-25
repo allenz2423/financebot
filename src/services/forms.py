@@ -437,6 +437,7 @@ def get_stirling_candidates() -> list[str]:
             ],
             stderr=subprocess.DEVNULL,
             text=True,
+            timeout=1.0,
         ).strip()
         if ip:
             candidates.insert(1, f"http://{ip}:8080")
@@ -774,6 +775,12 @@ def match_form_fields_to_profile(
     overrides = dict(field_overrides or {})
     matched: dict[str, Any] = {}
 
+    def _field_text(value: Any) -> Any:
+        """Keep scalar form values readable and serialize JSON-like values consistently."""
+        if isinstance(value, (bool, list, dict)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return value
+
     # Check if overrides contains semantic keys (e.g. overrides['first_name'] = 'Alice')
     effective_profile = dict(user_profile)
     for k, v in list(overrides.items()):
@@ -791,7 +798,7 @@ def match_form_fields_to_profile(
 
         # If explicitly overridden by field name
         if field_name in overrides:
-            matched[field_name] = overrides[field_name]
+            matched[field_name] = _field_text(overrides[field_name])
             continue
 
         attr, score = match_field_to_attribute(field_name, label, tooltip)
@@ -810,7 +817,7 @@ def match_form_fields_to_profile(
     # Include any overrides that targeted exact field names not yet in matched
     for k, v in overrides.items():
         if k not in effective_profile:
-            matched[k] = v
+            matched[k] = _field_text(v)
 
     return matched
 
@@ -1348,7 +1355,14 @@ async def async_fill_pdf_form(
             pdf_bytes = pdf_bytes[idx:]
 
         # 2. Check Stirling PDF availability
-        stirling_base = await _get_active_stirling_url(client)
+        # Local test/workspace PDFs do not need a remote discovery probe. This
+        # also keeps an offline local fill deterministic and prevents a stalled
+        # Docker daemon from delaying an otherwise in-process PyMuPDF path.
+        stirling_base = (
+            None
+            if clean_url.startswith("file://") or os.path.exists(clean_url)
+            else await _get_active_stirling_url(client)
+        )
         extracted_fields: list[dict[str, Any]] = []
 
         if stirling_base:

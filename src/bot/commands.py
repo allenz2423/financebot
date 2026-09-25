@@ -1775,21 +1775,10 @@ class _TriageNoteModal(discord.ui.Modal, title="Add Context & Tag"):
 
 
 class _TransactionCategorySelect(discord.ui.Select):
-    CATEGORIES = [
-        "Dining Out",
-        "Groceries",
-        "Shopping",
-        "Entertainment",
-        "Utilities",
-        "Transportation / Gas",
-        "Healthcare / Medical",
-        "Income / Paycheck",
-        "Credit Card Bill Payment",
-        "P2P Transfer",
-        "Travel / Vacation",
-        "Subscription",
-        "Business / Tax Deductible",
-    ]
+    from src.services.transaction_taxonomy import LEGACY_TRANSACTION_CATEGORIES
+    # Keep the existing one-level triage control compatible while the
+    # hierarchical category UI is introduced separately.
+    CATEGORIES = list(LEGACY_TRANSACTION_CATEGORIES[:-1])
 
     def __init__(self, triage_view: "_TransactionTriageView", current_category: str):
         options = [
@@ -2354,11 +2343,16 @@ async def model_command(ctx: commands.Context):
     user_id = str(ctx.author.id)
     provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
     active = os.getenv("OPENAI_MODEL", "") if provider == "openai" else src.core.state.ADVISOR_MODEL
+    cloud_temp = src.core.state.get_cloud_temperature()
+    local_temp = src.core.state.get_local_temperature()
+    current_temp = cloud_temp if provider == "openai" else local_temp
     await ctx.send(
-        f" Current provider: **{provider.upper()}**\n Current model: `{active}`\n\n"
+        f" Current provider: **{provider.upper()}**\n Current model: `{active}` (temp: `{current_temp}`)\n"
+        f" Configured: Cloud temp `{cloud_temp}`, Local temp `{local_temp}`\n\n"
         f"**Usage:**\n"
         f"`!switch local` or `!switch cloud`\n"
         f"`!model list`\n"
+        f"`!model temp [cloud|local] [value]`\n"
         f"`!model set cloud:<model_name>`\n"
         f"`!model set local:<model_name>`"
     )
@@ -2396,9 +2390,52 @@ async def model_get(ctx: commands.Context):
     provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
     if provider == "openai":
         model = os.getenv("OPENAI_MODEL", "")
-        await ctx.send(f"☁️ **Current advisor model (Cloud):** `{model}`")
+        temp = src.core.state.get_cloud_temperature()
+        await ctx.send(f"☁️ **Current advisor model (Cloud):** `{model}` (temperature: `{temp}`)")
     else:
-        await ctx.send(f"🖥️ **Current advisor model (Local):** `{src.core.state.ADVISOR_MODEL}`")
+        temp = src.core.state.get_local_temperature()
+        await ctx.send(f"🖥️ **Current advisor model (Local):** `{src.core.state.ADVISOR_MODEL}` (temperature: `{temp}`)")
+
+@model_command.command(name="temp")
+@commands.has_permissions(administrator=True)
+async def model_temp(ctx: commands.Context, target: str = "", value: str = ""):
+    target = target.strip().lower()
+    if not target:
+        cloud_temp = src.core.state.get_cloud_temperature()
+        local_temp = src.core.state.get_local_temperature()
+        await ctx.send(
+            f"🌡️ **Model Temperatures:**\n"
+            f"• Cloud: `{cloud_temp}` (`CLOUD_CHAT_TEMPERATURE`)\n"
+            f"• Local: `{local_temp}` (`LOCAL_CHAT_TEMPERATURE`)\n\n"
+            f"Usage: `!model temp cloud <value>` or `!model temp local <value>`"
+        )
+        return
+    if not value:
+        if target in ("cloud", "openai"):
+            temp = src.core.state.get_cloud_temperature()
+            await ctx.send(f"☁️ Current Cloud temperature: `{temp}`")
+        elif target in ("local", "ollama"):
+            temp = src.core.state.get_local_temperature()
+            await ctx.send(f"🖥️ Current Local temperature: `{temp}`")
+        else:
+            await ctx.send("Usage: `!model temp [cloud|local] [value]`")
+        return
+    try:
+        val_float = float(value)
+        if val_float < 0.0 or val_float > 2.0:
+            await ctx.send(" Temperature must be between 0.0 and 2.0.")
+            return
+    except ValueError:
+        await ctx.send(" Invalid temperature. Must be a number between 0.0 and 2.0.")
+        return
+    if target in ("cloud", "openai"):
+        os.environ["CLOUD_CHAT_TEMPERATURE"] = str(val_float)
+        await ctx.send(f"☁️ Cloud model temperature set to `{val_float}`.")
+    elif target in ("local", "ollama"):
+        os.environ["LOCAL_CHAT_TEMPERATURE"] = str(val_float)
+        await ctx.send(f"🖥️ Local model temperature set to `{val_float}`.")
+    else:
+        await ctx.send(" Unknown target. Use `cloud` or `local`.")
 
 @model_command.command(name="list")
 @commands.has_permissions(administrator=True)
@@ -4793,6 +4830,45 @@ async def reclassify_all_error(ctx: commands.Context, error: commands.CommandErr
     else:
         await ctx.send(f" Command error: {error}")
 
+
+@bot.command(name="kevclassify")
+@commands.has_permissions()
+async def kev_classify(ctx: commands.Context, limit: int = 100, mode: str = "shadow"):
+    """Run an explicit KEV transaction pass; shadow is the safe default."""
+    user_id = str(ctx.author.id)
+    mode = str(mode or "shadow").strip().lower()
+    if mode not in {"shadow", "apply"}:
+        await ctx.send(" Mode must be `shadow` or `apply`.")
+        return
+    try:
+        from src.services.kev_transactions import (
+            KevTransactionPolicy,
+            classify_pending_transactions,
+        )
+        policy = KevTransactionPolicy(shadow=(mode == "shadow"))
+        result = await classify_pending_transactions(
+            conn,
+            user_id=user_id,
+            limit=limit,
+            policy=policy,
+            apply=(mode == "apply"),
+        )
+        await ctx.send(
+            f" KEV `{mode}` pass complete: **{result.processed}** processed, "
+            f"**{result.auto_accepted}** high-confidence, **{result.review}** review, "
+            f"**{result.failed}** failed, **{result.latency_ms:.0f}ms**."
+        )
+    except Exception as exc:
+        await ctx.send(f" KEV transaction pass failed safely: `{type(exc).__name__}`")
+
+
+@kev_classify.error
+async def kev_classify_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(" You need administrator permissions.")
+    else:
+        await ctx.send(f" KEV command error: {error}")
+
 @bot.command(name="inspectmemory", aliases=["inspectmemories", "memories", "viewmemory"])
 async def inspect_memory(ctx: commands.Context):
     """View all active memories and verified world model claims in an interactive paginated report."""
@@ -5496,7 +5572,13 @@ async def on_message(message: discord.Message):
         print(f" [MESSAGE] workspace attachment preservation failed: {type(exc).__name__}: {exc}")
 
     if saved_attachment_notes:
-        prompt = (prompt + "\n\n" if prompt else "") + "[UPLOADED FILES]\n" + "\n".join(saved_attachment_notes)
+        prompt = (prompt + "\n\n" if prompt else "") + (
+            "[UPLOADED FILES]\n"
+            + "\n".join(saved_attachment_notes)
+            + "\nThese are local workspace artifacts. Use read_workspace_file for text "
+            "or run_python_sandbox/run_shell for parsing. Do not call fetch_webpage "
+            "with a file:// URL or workspace path."
+        )
 
     text_attachments = []
     text_extensions = (
@@ -5688,7 +5770,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 
 
-__all__ = ['check_now', 'on_raw_reaction_add', '_send_transaction_browser', 'queue_worker', '_AdvisorReplyHandle', 'researchstatus_command', 'help_command', 'test_push_cmd', 'ntfy_setup_cmd', 'model_set', 'set_budget', 'model_get', 'BACKGROUND_TASKS_STARTED', 'on_message', '_ReportCloseView', '_ollama_installed_models', 'dbstatus_command', 'model_command', 'preload_advisor_model', 'locked_command', 'audit_transaction_command', 'clear_all', 'merchantstatus_command', 'wipe_memory_error', 'TRANSACTION_BROWSER_VIEWS', 'clear_chat', '_ReportPageView', 'recategorize_error', 'model_command_error', 'audit_categories', 'wipe_memory', 'check_now_error', 'audit_categories_error', 'clear_chat_error', 'corrections_command', 'integrity_command', '_send_error_embed', '_open_verification_db', '_ollama_base_url', '_ollama_warm_model', '_audit_identity_mismatches', 'model_list', '_close_all_control_messages', 'snapshot_command', '_ollama_unload_model', 'recategorize', 'clear_all_error', '_TransactionPageView', 'REPORT_CONTROL_VIEWS', 'main', '_db_identity_mismatches', 'on_ready', 'REPORT_CONTROL_MESSAGES', 'unlocked_command', '_send_thinking_placeholder', 'reclassify_all', '_send_command_report', 'reclassify_all_error', '_HelpPageView']
+__all__ = ['check_now', 'on_raw_reaction_add', '_send_transaction_browser', 'queue_worker', '_AdvisorReplyHandle', 'researchstatus_command', 'help_command', 'test_push_cmd', 'ntfy_setup_cmd', 'model_set', 'set_budget', 'model_get', 'model_temp', 'BACKGROUND_TASKS_STARTED', 'on_message', '_ReportCloseView', '_ollama_installed_models', 'dbstatus_command', 'model_command', 'preload_advisor_model', 'locked_command', 'audit_transaction_command', 'clear_all', 'merchantstatus_command', 'wipe_memory_error', 'TRANSACTION_BROWSER_VIEWS', 'clear_chat', '_ReportPageView', 'recategorize_error', 'model_command_error', 'audit_categories', 'wipe_memory', 'check_now_error', 'audit_categories_error', 'clear_chat_error', 'corrections_command', 'integrity_command', '_send_error_embed', '_open_verification_db', '_ollama_base_url', '_ollama_warm_model', '_audit_identity_mismatches', 'model_list', '_close_all_control_messages', 'snapshot_command', '_ollama_unload_model', 'recategorize', 'clear_all_error', '_TransactionPageView', 'REPORT_CONTROL_VIEWS', 'main', '_db_identity_mismatches', 'on_ready', 'REPORT_CONTROL_MESSAGES', 'unlocked_command', '_send_thinking_placeholder', 'reclassify_all', 'kev_classify', '_send_command_report', 'reclassify_all_error', '_HelpPageView']
 
 
 

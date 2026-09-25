@@ -24,9 +24,27 @@ from src.services.sandbox import run_what_if_scenario
 from src.services.budgeting import predict_next_paydays, calculate_locked_liabilities, calculate_credit_float_velocity, get_safe_to_spend_metrics
 from src.services.advisor_tools import NEW_50_TOOLS_SCHEMA, ADVISOR_TOOLS_DISPATCH
 from src.services.tool_contract import (
+    ensure_tool_call_id,
     tool_call_repeat_key,
     validate_tool_arguments,
 )
+from src.services.claim_evidence import (
+    build_claim_repair_prompt,
+    evaluate_claims,
+    safe_claim_fallback,
+)
+from src.services.tool_receipts import ReceiptLifecycleError, ReceiptStore
+from src.services.provider_protocol import parse_stream_line
+from src.services.route_profiles import AUTO_ROUTE_NAMES, parse_route_profiles, profile_for
+from src.services.tool_results import ToolResultEnvelope
+from src.services.tool_registry import ToolDefinition, ToolRegistry
+from src.services.tool_catalog import validate_tool_catalog
+from src.services.tool_intent import infer_required_tools
+from src.services.tool_execution_evidence import tool_result_indicates_failure
+from src.services.browser_evidence import browser_tool_ran, observed_page
+from src.services.progress_policy import ProgressPolicy
+from src.services.result_contracts import contract_for, extract_facts
+from src.services.tool_grants import consume_grant, issue_grant
 from src.services.world_model import (
     build_world_model_context,
     build_semantic_world_model_context,
@@ -42,6 +60,16 @@ from src.services.world_model import (
     get_world_model_dossier,
     retract_world_model_claim
 )
+from src.agent.events import MessageEvent, TurnRequest
+from src.agent.runtime import (
+    AgentRuntime,
+    CURRENT_CHANNEL_ID,
+    CURRENT_SESSION_KEY,
+    CURRENT_THREAD_ID,
+    CURRENT_TURN_ID,
+    RuntimeHooks,
+)
+from src.db.session_store import SessionStore
 
 import os
 import re
@@ -50,6 +78,7 @@ import sqlite3
 import asyncio
 import contextvars
 import hashlib
+import uuid
 import ipaddress
 import random
 import socket
@@ -64,6 +93,77 @@ from html import unescape
 # provider's model identifier so a rate-limited model is not retried at the
 # start of every advisor round.
 _OPENROUTER_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
+_DURABLE_SESSION_STORE: SessionStore | None = None
+
+
+def _durable_session_store() -> SessionStore | None:
+    """Return the durable conversational store without making it a hard dependency.
+
+    The legacy loop must remain able to start when a pre-existing SQLite file
+    needs repair. Session persistence is therefore best-effort at the adapter
+    boundary; ledger/database correctness remains owned by the existing paths.
+    """
+
+    global _DURABLE_SESSION_STORE
+    if _DURABLE_SESSION_STORE is not None:
+        return _DURABLE_SESSION_STORE
+    try:
+        _DURABLE_SESSION_STORE = SessionStore(src.core.state.DB_PATH)
+    except Exception as exc:
+        print(f" [SESSION STORE] unavailable: {type(exc).__name__}: {exc}")
+        return None
+    return _DURABLE_SESSION_STORE
+
+
+def _record_durable_tool_call(
+    *,
+    user_id: str,
+    tool_name: str,
+    arguments: dict,
+    call_id: str,
+    status: str,
+    result: object = None,
+    error: str | None = None,
+) -> None:
+    """Best-effort durable tool lifecycle recording for the active turn."""
+
+    store = _durable_session_store()
+    turn_id = CURRENT_TURN_ID.get()
+    session_id = CURRENT_SESSION_KEY.get()
+    if store is None or not turn_id or not session_id or not call_id:
+        return
+    try:
+        if status in {"pending", "running"}:
+            store.record_tool_call(
+                user_id,
+                session_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                call_id=call_id,
+                turn_id=turn_id,
+                status=status,
+                channel_id=CURRENT_CHANNEL_ID.get(),
+                thread_id=CURRENT_THREAD_ID.get(),
+            )
+        else:
+            store.finish_tool_call(
+                user_id,
+                session_id,
+                call_id,
+                status=status,
+                result=result,
+                error=error,
+                channel_id=CURRENT_CHANNEL_ID.get(),
+                thread_id=CURRENT_THREAD_ID.get(),
+            )
+    except Exception as exc:
+        # Observability must never turn a completed financial operation into a
+        # second failure. The receipt store remains the authoritative execution
+        # ledger for the legacy path during this migration.
+        print(
+            f" [SESSION STORE] tool lifecycle failed tool={tool_name}: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _redact_inline_credentials(text: str) -> str:
@@ -95,6 +195,11 @@ from PIL import Image
 from src.core.state import *
 from src.utils.helpers import *
 from src.services.search import *
+from src.services.audit_workflow import (
+    mark_batch_corrected,
+    mark_batch_locked,
+    validate_lock_ids,
+)
 from src.services.gmail import *
 from src.db.queries import *
 from src.services.negotiator import generate_negotiation_script
@@ -677,7 +782,7 @@ async def classify_transaction_batch(
         return {}
     merchants = [item["clean_merchant"] for item in batch_items]
     print(
-        f" [LLM Call] Sending batch of {len(batch_items)} to {src.core.state.ADVISOR_MODEL}: {merchants}"
+        f" [LLM Call] Sending batch of {len(batch_items)} to {src.core.state.CLASSIFIER_MODEL}: {merchants}"
     )
     system_msg = (
         "You are Delilah's transaction classification engine.\n"
@@ -712,7 +817,7 @@ async def classify_transaction_batch(
             res = await client.post(
                 OLLAMA_URL,
                 json={
-                    "model": src.core.state.ADVISOR_MODEL,
+                    "model": src.core.state.CLASSIFIER_MODEL,
                     "messages": [
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_msg},
@@ -817,6 +922,7 @@ async def process_transaction_batch(
     prepared = []
     needs_model = []
     resolved: dict[str, tuple[str, str]] = {}
+    kev_result = None
 
     for task in batch:
         if not isinstance(task, tuple) or len(task) != 7:
@@ -838,10 +944,75 @@ async def process_transaction_batch(
             "txn_date": txn_date,
             "clean_merchant": clean_merchant,
             "reconciled_msg": reconciled_msg,
+            "user_id": user_id,
         }
         prepared.append(item)
 
         needs_model.append(item)
+
+    # KEV is an opt-in typed fast path.  Shadow mode records predictions while
+    # deliberately leaving the established search/LLM route unchanged.
+    kev_enabled = str(os.getenv("KEV_TX_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    kev_shadow = str(os.getenv("KEV_TX_SHADOW", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    if (kev_enabled or kev_shadow) and prepared:
+        try:
+            from src.services.kev_transactions import (
+                KevTransactionPolicy,
+                classify_transaction_batch as classify_with_kev,
+            )
+            kev_policy = KevTransactionPolicy()
+            kev_result = await classify_with_kev(
+                prepared,
+                conn=conn,
+                policy=kev_policy,
+                user_id=user_id,
+            )
+            print(
+                f" [KEV TX] batch={kev_result.batch_id} processed={kev_result.processed} "
+                f"deterministic={kev_result.deterministic} auto={kev_result.auto_accepted} "
+                f"review={kev_result.review} failed={kev_result.failed} "
+                f"latency_ms={kev_result.latency_ms:.1f}"
+            )
+            if kev_enabled and not kev_shadow:
+                kev_by_id = kev_result.by_transaction()
+                applied_ids: set[str] = set()
+                if kev_result.auto_accepted or kev_result.deterministic:
+                    try:
+                        from src.services.kev_transactions import apply_auto_predictions
+                        apply_counts = apply_auto_predictions(
+                            conn, kev_result, user_id=user_id, overwrite=False
+                        )
+                        applied_ids = set(apply_counts.get("applied_ids", []))
+                        print(f" [KEV TX] ledger apply counts={apply_counts}")
+                    except Exception as apply_error:
+                        # The prediction remains recorded, but a failed ledger
+                        # apply is not treated as a successful classification.
+                        print(f" [KEV TX] guarded apply failed; fallback remains authoritative: {apply_error}")
+                remaining = []
+                for item in needs_model:
+                    prediction = kev_by_id.get(str(item["tx_id"]))
+                    if (prediction and str(item["tx_id"]) in applied_ids
+                            and prediction.status in {"auto", "deterministic"}
+                            and prediction.category):
+                        category = prediction.category
+                        resolved[str(item["tx_id"])] = (
+                            category,
+                            f" **{category}** • **{item['clean_merchant']}** (${item['amount']:.2f})\n "
+                            f"KEV typed classification (confidence {prediction.category_confidence:.3f}).",
+                        )
+                    elif prediction and not kev_policy.fallback_enabled:
+                        resolved[str(item["tx_id"])] = (
+                            "Uncategorized Purchase",
+                            f" **Review required** • **{item['clean_merchant']}** (${item['amount']:.2f})\n "
+                            "KEV did not meet the configured automatic confidence policy and the fallback is disabled.",
+                        )
+                    else:
+                        remaining.append(item)
+                needs_model = remaining
+        except Exception as kev_error:
+            # A KEV outage must return control to the existing classifier; it
+            # must never turn a transaction into a silently accepted result.
+            print(f" [KEV TX] unavailable; using existing classifier fallback: {kev_error}")
 
     if needs_model:
         web_results = await asyncio.gather(
@@ -855,30 +1026,51 @@ async def process_transaction_batch(
         model_candidates = []
         for item, web_result in zip(needs_model, web_results):
             item["web_context"] = _search_payload_to_web_context(web_result)
+            item["identity_status"] = str(web_result.get("identity_status") or "NO_IDENTITY") if isinstance(web_result, dict) else "NO_IDENTITY"
+            item["search_evidence"] = (web_result.get("results") or []) if isinstance(web_result, dict) else []
             wc = item["web_context"]
-            if not wc.strip() or "[relevance: none]" in wc.lower():
+            if item["identity_status"] not in {"STRONG_IDENTITY", "CONFIRMED_IDENTITY"}:
                 resolved[str(item["tx_id"])] = (
                     "Uncategorized Purchase ",
-                    f" **Merchant unresolved** • **{item['clean_merchant']}** (${item['amount']:.2f})\n No relevant merchant-identification evidence was returned.",
+                    f" **Human review required** • **{item['clean_merchant']}** (${item['amount']:.2f})\n Merchant identity evidence was insufficient; no category was applied.",
                 )
+                item["needs_human_review"] = True
                 unresolved_items.append(item)
             else:
                 model_candidates.append(item)
 
-        model_results: dict[str, tuple[str, str]] = {}
-        for start_idx in range(0, len(model_candidates), 15):
-            chunk = model_candidates[start_idx : start_idx + 15]
-            model_results.update(await classify_transaction_batch(chunk))
-
-        for item in model_candidates:
-            tx_id_str = str(item["tx_id"])
-            if tx_id_str in model_results:
-                category, explanation = model_results[tx_id_str]
-                judgment = f" **{category}** • **{item['clean_merchant']}** (${item['amount']:.2f})\n {explanation}"
-            else:
-                category = "Uncategorized "
-                judgment = f" **Model Unavailable** • **{item['clean_merchant']}** (${item['amount']:.2f})\n Failed to classify in batch."
-            resolved[tx_id_str] = (category, judgment)
+        if model_candidates:
+            from src.services.local_transaction_classifier import classify_with_local_llm
+            local_items = [
+                {
+                    "id": item["tx_id"],
+                    "merchant": item["clean_merchant"],
+                    "clean_merchant": item["clean_merchant"],
+                    "amount": item["amount"],
+                    "date": item["txn_date"],
+                    "account_used": item["account_used"],
+                    "identity_status": item["identity_status"],
+                    "search_evidence": item["search_evidence"],
+                    "kev_signals": {},
+                }
+                for item in model_candidates
+            ]
+            local_results = await classify_with_local_llm(local_items)
+            local_by_id = {str(result.transaction_row_id): result for result in local_results}
+            for item in model_candidates:
+                tx_id_str = str(item["tx_id"])
+                local = local_by_id.get(tx_id_str)
+                if local and local.status == "accepted" and local.category:
+                    resolved[tx_id_str] = (
+                        local.category,
+                        f" **{local.category}** • **{item['clean_merchant']}** (${item['amount']:.2f})\n Local adjudicator accepted the category from verified merchant evidence.",
+                    )
+                else:
+                    resolved[tx_id_str] = (
+                        "Uncategorized Purchase ",
+                        f" **Human review required** • **{item['clean_merchant']}** (${item['amount']:.2f})\n Local adjudicator abstained: {(local.reason if local else 'no valid result')}",
+                    )
+                    item["needs_human_review"] = True
 
     target_c = DISCORD_CHANNEL_ID
 
@@ -887,10 +1079,18 @@ async def process_transaction_batch(
     for item in prepared:
         tx_id = item["tx_id"]
         category, judgment = resolved[str(tx_id)]
-        c.execute(
-            "UPDATE transactions SET status = 'Evaluated', judgment = ?, category = ?, clean_merchant = ? WHERE user_id = ? AND id = ?",
-            (judgment, category, item["clean_merchant"], user_id, tx_id),
-        )
+        if item.get("needs_human_review"):
+            # Weak identity is not an evaluated classification. Preserve the
+            # current category and keep the row available for human review.
+            c.execute(
+                "UPDATE transactions SET status = 'Pending Evaluation', judgment = ?, clean_merchant = ? WHERE user_id = ? AND id = ?",
+                (judgment, item["clean_merchant"], user_id, tx_id),
+            )
+        else:
+            c.execute(
+                "UPDATE transactions SET status = 'Evaluated', judgment = ?, category = ?, clean_merchant = ? WHERE user_id = ? AND id = ?",
+                (judgment, category, item["clean_merchant"], user_id, tx_id),
+            )
         conn.commit()
         if channel:
             try:
@@ -1447,6 +1647,7 @@ BOT_TOOLS_SCHEMA = [
                 "properties": {
                     "items": {
                         "type": "array",
+                        "minItems": 1,
                         "maxItems": 50,
                         "items": {
                             "type": "object",
@@ -1478,6 +1679,7 @@ BOT_TOOLS_SCHEMA = [
                 "properties": {
                     "transaction_row_ids": {
                         "type": "array",
+                        "minItems": 1,
                         "maxItems": 100,
                         "items": {"type": "integer"}
                     }
@@ -1969,7 +2171,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "sync_plaid_accounting",
-            "description": "Run the complete Plaid accounting workflow: fresh balance refresh, transaction sync, reconciliation, and upcoming cash-flow summary.",
+            "description": "Run the complete Plaid accounting workflow: fresh balance refresh, transaction sync, reconciliation, and upcoming cash-flow summary. If the user asks to run, start, perform, or do a Plaid sync, call this tool immediately in the current response; do not merely promise or describe the sync.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2041,6 +2243,33 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["thread_id"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "research_topic",
+            "description": (
+                "Run a bounded, read-only research workflow for a general topic. "
+                "Search one or more query variants, deduplicate and rank candidate sources, "
+                "fetch only the strongest bounded set, and return source cards with URLs, "
+                "snippets, fetched excerpts, query provenance, and fetch status. This is an "
+                "evidence packet, not an automatic conclusion: inspect source quality and "
+                "conflicts before making claims. Useful for technical questions, organizations, "
+                "products, travel, fact checking, and merchant identity."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Primary research question or topic."},
+                    "queries": {"type": "array", "items": {"type": "string"}, "description": "Optional alternate queries, capped by the controller."},
+                    "max_sources": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Maximum distinct source cards."},
+                    "fetch_top": {"type": "integer", "minimum": 0, "maximum": 8, "description": "How many top sources to fetch for excerpts."},
+                    "max_chars": {"type": "integer", "minimum": 1000, "maximum": 12000, "description": "Maximum excerpt size per fetched source."},
+                    "time_range": {"type": "string", "enum": ["day", "week", "month", "year"]},
+                },
+                "required": ["query"],
+            },
+        },
     },
     {
         "type": "function",
@@ -2201,6 +2430,33 @@ BOT_TOOLS_SCHEMA = [
             "parameters": {
                 "type": "object",
                 "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_workspace_file",
+            "description": (
+                "Read a text or small document from the current user's persistent "
+                "workspace. Use this for uploaded files or saved artifacts; do not "
+                "send workspace paths to fetch_webpage. Returns bounded UTF-8 text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path returned by list_workspace_files or an upload notice.",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200000,
+                        "description": "Maximum decoded text characters to return.",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },
@@ -3318,6 +3574,7 @@ EXPECTED_TOOL_NAMES = {
     "get_upcoming_cash_flow",
     "sync_plaid_accounting",
     "refresh_knowledge_base",
+    "research_topic",
     "search_web",
     "fetch_webpage",
     "pull_live_financial_data",
@@ -3325,6 +3582,7 @@ EXPECTED_TOOL_NAMES = {
     "install_python_package",
     "run_shell",
     "list_workspace_files",
+    "read_workspace_file",
     "send_workspace_file",
     "tag_transaction_context",
     "get_transactions_by_context",
@@ -3407,11 +3665,13 @@ EXPECTED_TOOL_NAMES = {
     "monitor_clear_all_rules"
 } | set(ADVISOR_TOOLS_DISPATCH.keys())
 
-if SCHEMA_TOOL_NAMES != EXPECTED_TOOL_NAMES:
-    raise RuntimeError(
-        f"Tool schema drift detected. Missing={EXPECTED_TOOL_NAMES - SCHEMA_TOOL_NAMES}, "
-        f"extra={SCHEMA_TOOL_NAMES - EXPECTED_TOOL_NAMES}"
+SCHEMA_TOOL_NAMES = set(
+    validate_tool_catalog(
+        BOT_TOOLS_SCHEMA,
+        expected_names=EXPECTED_TOOL_NAMES,
+        registered_names=ADVISOR_TOOLS_DISPATCH.keys(),
     )
+)
 
 # Canonical set of tool names exposed by the schema. Used both for validation
 # and as the lookup base for hallucinated-name alias resolution below.
@@ -3513,6 +3773,81 @@ MUTATION_TOOLS = {
     "parse_and_attach_receipt",
     "set_category_budget",
 }
+
+# Text fallbacks are not trusted to authorize side effects. This list keeps
+# the policy explicit during migration instead of inferring mutation risk from
+# arbitrary tool names. Read-only fallback recovery (including the existing
+# form-recovery path) remains available.
+FALLBACK_BLOCKED_TOOLS = MUTATION_TOOLS | {
+    "send_push_alert",
+    "set_user_timezone",
+    "save_to_knowledge_base",
+    "auto_reconcile_ledger",
+    "refresh_knowledge_base",
+    "pin_knowledge_immutable",
+    "retract_world_model_claim",
+    "index_financial_snapshot_to_qdrant",
+    "fill_pdf_form",
+    "sync_plaid_accounting",
+    "pull_live_financial_data",
+    "reconcile_expected_and_planned_transactions",
+    "manage_subscription",
+    "cancel_subscription",
+    "remove_subscription",
+    "add_merchant_alias",
+    "monitor_add_rule",
+    "monitor_delete_rule",
+    "monitor_clear_all_rules",
+    "monitor_run_pass",
+}
+
+
+def _build_advisor_tool_registry() -> ToolRegistry:
+    """Build the registry view for the migrated financial-tool catalog.
+
+    The legacy loop still owns special integrations and audit gates. The
+    financial tool family is now described by one registry object so schema,
+    dispatch metadata, and result normalization can migrate incrementally.
+    """
+
+    schemas = {
+        str(item.get("function", {}).get("name")): item
+        for item in BOT_TOOLS_SCHEMA
+        if isinstance(item, dict) and isinstance(item.get("function"), dict)
+    }
+    definitions = []
+    for name, tool_fn in ADVISOR_TOOLS_DISPATCH.items():
+        schema_entry = schemas.get(name, {})
+        function = schema_entry.get("function", {}) if isinstance(schema_entry, dict) else {}
+
+        def make_handler(fn, tool_name):
+            def handler(**arguments):
+                current_uid = str(src.core.state.CURRENT_USER_ID.get() or "").strip()
+                if not current_uid:
+                    raise ValueError(f"{tool_name}: user_id is required")
+                return fn(current_uid, arguments, conn)
+
+            return handler
+
+        definitions.append(
+            ToolDefinition(
+                name=name,
+                handler=make_handler(tool_fn, name),
+                schema=function.get("parameters") or {"type": "object", "properties": {}},
+                description=str(function.get("description") or ""),
+                toolset="finance",
+                side_effect="mutation" if name in MUTATION_TOOLS else "read",
+                risk="high" if name in MUTATION_TOOLS else "low",
+                user_scope="required",
+            )
+        )
+    return ToolRegistry(definitions)
+
+
+# A single source of metadata for the migrated advisor-tools family. The
+# legacy schema remains available for compatibility until all tool families
+# move to this registry.
+ADVISOR_TOOL_REGISTRY = _build_advisor_tool_registry()
 
 
 def refresh_knowledge_base(*,user_id: str) -> dict:
@@ -3896,11 +4231,11 @@ def _claims_live_browser_state(text: str) -> bool:
 
 
 def _observed_live_browser(trace) -> bool:
-    return False
+    return observed_page(trace)
 
 
 def _browser_tool_ran(trace) -> bool:
-    return False
+    return browser_tool_ran(trace)
 
 
 async def _chat_with_delilah_impl(
@@ -3917,6 +4252,11 @@ async def _chat_with_delilah_impl(
             "and must be a non-empty string."
         )
     user_id = uid
+    # An explicit operational request is an execution obligation, not an
+    # optional model suggestion. Completion guards below require a successful
+    # trace entry for each inferred tool before the turn may finish.
+    required_tools = set(required_tools or ()) | set(infer_required_tools(prompt_text))
+    turn_id = f"turn_{uuid.uuid4().hex}"
     # Raw credential text must never enter the model context or in-memory
     # conversation history, even if a user ignores the secure capture flow.
     prompt_text = _redact_inline_credentials(prompt_text)
@@ -4094,7 +4434,7 @@ EXECUTIVE REPORTING & DISCORD PRESENTATION:
 - LaTeX reports: In sandbox, use modern sans-serif (\usepackage{helvet}), booktabs, tcolorbox, escaped chars (\$, \%), compile in $FINANCEBOT_WORKSPACE, deliver via send_workspace_file.
 
 FILE DELIVERY PROTOCOL (user asks for a file/artifact/report):
-1. Load the needed tools in ONE call: load_tool_schemas(["run_python_sandbox", "run_shell", "send_workspace_file", "list_workspace_files"]).
+1. Load the needed tools in ONE call: load_tool_schemas(["run_python_sandbox", "run_shell", "send_workspace_file", "list_workspace_files", "read_workspace_file"]).
 2. Generate the artifact in the sandbox with run_python_sandbox/run_shell, writing it under $FINANCEBOT_WORKSPACE.
 3. Deliver the finished artifact with send_workspace_file(path=...) — if unsure of the exact path, call list_workspace_files first.
 Never paste the raw artifact content inline as a substitute for sending the file itself.
@@ -4120,6 +4460,12 @@ BULK WEB RESEARCH IN THE SANDBOX:
     system_prompt += """
 RUNTIME CONTRACT:
 - Native tool calls only. No markdown execution blocks.
+- EXPLICIT ACTIONS ARE NOT PLANS: when the user directly asks you to run,
+  start, sync, send, search, update, or perform an operation, emit the
+  corresponding native tool call in this response. Do not substitute a plan,
+  dashboard summary, or "I initiated it" narration. The turn is not complete
+  until the tool returns a successful result/receipt; if it fails, report the
+  failure and do not claim completion.
 - EXTERNAL-ACTION RECEIPTS: never state or imply that an external action was
   performed unless this turn contains the corresponding successful native tool
   result or receipt. If no tool ran, say that no external action was executed.
@@ -4318,6 +4664,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     messages.append(user_msg)
 
     prompt_lower = (prompt_text or "").strip().lower()
+    is_autonomous_wakeup = "[system: autonomous wakeup]" in prompt_lower
     audit_keywords = (
         "classify the unlocked", "classify unlocked", "audit the unlocked",
         "audit unlocked", "classify all", "audit all", "audit the database",
@@ -4493,7 +4840,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
         not wants_audit_exit
         and not (non_audit_task and not continuation_request)
         and (
-            (prior_audit.get("active") and (continuation_request or explicit_audit_request))
+            (prior_audit.get("active") and (continuation_request or explicit_audit_request or is_autonomous_wakeup))
             or explicit_audit_request
             or continuation_of_merchant_plan
         )
@@ -4535,6 +4882,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
             "unresolved_ids": list(prior_audit.get("unresolved_ids", [])),
             "unresolved_reasons": dict(prior_audit.get("unresolved_reasons", {})),
             "unresolved_merchant_keys": list(prior_audit.get("unresolved_merchant_keys", [])),
+            "pending_lock_ids": list(prior_audit.get("pending_lock_ids", [])),
+            "phase": prior_audit.get("phase", "research"),
             "days": prior_audit.get("days", 30),
             "limit": prior_audit.get("limit", 50),
             "status": prior_audit.get("status", "all"),
@@ -4652,7 +5001,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
         if not _audit_is_active():
             if context_policy["gmail_only"]:
                 return [t for t in BOT_TOOLS_SCHEMA if t["function"]["name"] in _GMAIL_ONLY_TOOLS]
-            allowed = core_tools.union(dynamically_loaded_tools)
+            # Keep explicit required tools visible even when lexical intent
+            # seeding selected a neighboring workflow.
+            allowed = core_tools.union(dynamically_loaded_tools).union(required_tools)
             if awm_context:
                 # Semantic world model context is already injected into this
                 # turn's prompt; re-offering the read tools just burns rounds
@@ -4663,6 +5014,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
         audit_state = AUDIT_SESSION_STATE.get(uid, {})
         pending_research = audit_state.get("research_pending") or []
         research_inflight = audit_state.get("research_inflight") or []
+        pending_lock_ids = audit_state.get("pending_lock_ids") or []
         merchant_worklist_ready = bool(
             audit_state.get("merchant_worklist_ready")
         )
@@ -4685,19 +5037,28 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 if tool["function"]["name"] in allowed
             ]
 
+        # A successful correction is a hard transition: the next permitted
+        # side effect is locking exactly those corrected rows. This prevents a
+        # model from ending the turn after classification and leaving the audit
+        # half-finished, or from restarting merchant research.
+        if pending_lock_ids:
+            allowed = {"batch_lock_transactions", "enable_reasoning"}
+            return [
+                tool for tool in BOT_TOOLS_SCHEMA
+                if tool["function"]["name"] in allowed
+            ]
+
         if pending_research:
             allowed = {
                 "search_web",
                 "enable_reasoning",
                 "fetch_webpage",
                 "crawl_deeper",
-                "save_known_merchants",
+                "save_known_merchant",
                 "correct_transaction",
-                "batch_correct_transaction",
+                "batch_correct_transactions",
+                "batch_lock_transactions",
                 "get_unlocked_transactions",
-                "search_web",
-                "fetch_webpage",
-                "crawl_deeper",
             }
             return [
                 tool for tool in BOT_TOOLS_SCHEMA
@@ -4724,7 +5085,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             "get_financial_dashboard",
             "get_recent_transactions",
             "get_planned_transactions",
-            "get_unlocked_transactions"
+            "get_unlocked_transactions",
             "search_web",
             "fetch_webpage",
             "crawl_deeper",
@@ -4851,6 +5212,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
     async def update_live_preview(text: str, alt_text: str = "", force: bool = False):
         nonlocal live_preview_message
+        # A preview is user-visible output, but it is generated before the
+        # provider round has been normalized and before tool execution has
+        # produced receipts.  Keep it disabled until the preview path is
+        # receipt-aware; final output is still sent normally below.  This is
+        # an explicit rollout flag so the old UX can be re-enabled for
+        # controlled experiments without weakening the final claim gate.
+        if os.getenv("ADVISOR_LIVE_PREVIEW", "0").strip().lower() not in {
+            "1", "true", "yes", "on"
+        }:
+            return
         preview = _preview_text(text) or (alt_text or "").strip()
         if not preview:
             return
@@ -4912,9 +5283,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
     OPENROUTER_PAID_MODEL = os.getenv(
         "OPENROUTER_PAID_MODEL",
-        "openrouter/auto-beta",
+        "qwen/qwen3.8-27b:free",
     ).strip()
 
+    provider_round_records: list[dict[str, object]] = []
 
     async def stream_generator(messages_payload, force_no_tools=True, num_predict=None):
         # Scheduled reminders are autonomous agent wakeups. By default,
@@ -4923,17 +5295,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
         is_autonomous_wakeup = "[SYSTEM: AUTONOMOUS WAKEUP]" in (prompt_text or "")
 
         if is_autonomous_wakeup:
-            # Wakeups may optionally override the normal provider. If no
-            # WAKEUP_PROVIDER is configured, inherit LLM_PROVIDER so wakeups
-            # naturally use the same cloud/local backend as normal chats.
+            # Autonomous wakeups default to local inference so a broken
+            # continuation cannot consume paid inference indefinitely.
             llm_provider = os.getenv(
                 "WAKEUP_PROVIDER",
-                os.getenv("LLM_PROVIDER", "openai"),
+                "ollama",
             ).strip().lower()
 
             wakeup_model = os.getenv(
                 "WAKEUP_MODEL",
-                "",
+                src.core.state.ADVISOR_MODEL,
             ).strip()
 
             print(
@@ -4943,6 +5314,23 @@ CURRENT DATABASE FINANCIAL CONTEXT
         else:
             llm_provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
             wakeup_model = None
+
+        route_profile_name = os.getenv("DELILAH_ROUTE_PROFILE", "").strip()
+        route_profile = None
+        route_provider_order: tuple[str, ...] = ()
+        if route_profile_name:
+            route_profile = profile_for(
+                parse_route_profiles(os.getenv("DELILAH_ROUTE_PROFILES", "")),
+                route_profile_name,
+                tool_enabled=not force_no_tools,
+            )
+            profile_provider = route_profile.provider.casefold()
+            if profile_provider not in {llm_provider, "openrouter"}:
+                raise RuntimeError(
+                    f"route profile {route_profile.name!r} targets provider "
+                    f"{route_profile.provider!r}, not active provider {llm_provider!r}"
+                )
+            route_provider_order = route_profile.provider_order
 
         await _set_advisor_status(
             uid,
@@ -5020,6 +5408,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
             else:
                 openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
                 openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+            if route_profile is not None:
+                openai_model = route_profile.model
 
             _openai_tool_ids = set()
             for _i, _m in enumerate(api_messages):
@@ -5039,7 +5429,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             payload = {
                 "messages": api_messages,
                 "stream": True,
-                "temperature": float(os.getenv("CHAT_TEMPERATURE", "0.2")),
+                "temperature": src.core.state.get_cloud_temperature(tool_mode=not force_no_tools),
                 "max_tokens": effective_num_predict,
             }
             # OpenRouter's supported control is reasoning_effort. The old
@@ -5050,9 +5440,41 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 payload["reasoning_effort"] = (
                     "medium" if reasoning_enabled_this_turn else "none"
                 )
+                provider_controls = {
+                    "allow_fallbacks": False,
+                    "require_parameters": True,
+                }
+                if route_provider_order:
+                    provider_controls["order"] = list(route_provider_order)
+                payload["provider"] = provider_controls
             if not force_no_tools:
                 payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+                confirmed_names = {
+                    str(entry.get("name"))
+                    for entry in turn_tool_trace
+                    if entry.get("ok") and entry.get("status") == "confirmed"
+                }
+                pending_required = sorted(
+                    set(required_tools or ()) - confirmed_names
+                )
+                forced_tool_name = next(
+                    (
+                        name for name in pending_required
+                        if any(
+                            (tool.get("function") or {}).get("name") == name
+                            for tool in tools
+                        )
+                    ),
+                    None,
+                )
+                # OpenAI-compatible providers support a named tool choice. Use
+                # it for an explicit action obligation so a compliant model
+                # cannot spend its first response on a dashboard narrative.
+                payload["tool_choice"] = (
+                    {"type": "function", "function": {"name": forced_tool_name}}
+                    if forced_tool_name
+                    else "auto"
+                )
                 _tool_instruction = "Emit your chosen tools as strict JSON objects. Do not wrap them in markdown blocks."
                 found_system = False
                 for _m in payload["messages"]:
@@ -5104,13 +5526,32 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 vision_models = [x.strip() for x in os.getenv("OPENROUTER_FREE_VISION_MODELS", "").split(",") if x.strip()]
                 paid_fallback = os.getenv(
                     "OPENROUTER_PAID_MODEL",
-                    "nvidia/nemotron-3.5-lightning:free",
+                    "qwen/qwen3.8-27b:free",
                 ).strip()
+                if paid_fallback.casefold() in AUTO_ROUTE_NAMES:
+                    raise RuntimeError(
+                        "OpenRouter automatic model routing is disabled. "
+                        "Set OPENROUTER_PAID_MODEL to an explicit model ID or "
+                        "select DELILAH_ROUTE_PROFILE."
+                    )
                 
                 free_candidates = vision_models if has_images else free_models
+                automatic_candidates = [
+                    model for model in (free_candidates + [paid_fallback])
+                    if model.casefold() in AUTO_ROUTE_NAMES
+                ]
+                if automatic_candidates:
+                    raise RuntimeError(
+                        "OpenRouter automatic model routing is disabled: "
+                        + ", ".join(sorted(set(automatic_candidates)))
+                    )
                 free_candidates = free_candidates[:max_free] if free_first_val else []
-                configured_candidates = list(free_candidates)
-                if paid_fallback not in configured_candidates:
+                configured_candidates = (
+                    [route_profile.model]
+                    if route_profile is not None
+                    else list(free_candidates)
+                )
+                if route_profile is None and paid_fallback not in configured_candidates:
                     # A text-only fallback cannot serve a request that carries
                     # images: OpenRouter answers 404 "No endpoints found that
                     # support image input". Only add it when the request has no
@@ -5134,7 +5575,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 "messages": api_messages,
                 "stream": True,
                 "options": {
-                    "temperature": float(os.getenv("CHAT_TEMPERATURE", "0.2")),
+                    "temperature": src.core.state.get_local_temperature(tool_mode=not force_no_tools),
                     "num_predict": effective_num_predict,
                     "num_ctx": src.core.state.ADVISOR_NUM_CTX,
                 }
@@ -5164,6 +5605,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
             image_count_for_payload = 0
             payload["messages"] = api_messages
             for _extra_model in list(OPENROUTER_FREE_MODELS) + [OPENROUTER_PAID_MODEL]:
+                if _extra_model.casefold() in AUTO_ROUTE_NAMES:
+                    continue
                 if _extra_model and _extra_model not in models_to_try:
                     models_to_try.append(_extra_model)
             return True
@@ -5184,6 +5627,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             round_started_at = time.monotonic()
             first_content_at = None
             reasoning_text = ""
+            finish_reason = None
 
             try:
                 async with httpx.AsyncClient(timeout=600.0) as client:
@@ -5223,21 +5667,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 was_interrupted = True
                                 break
 
-                            delta = {}
-                            if llm_provider == "openai":
-                                if line.startswith("data:"): raw = line[5:].strip()
-                                else: continue
-                                if raw == "[DONE]": break
-                                try: data = json.loads(raw)
-                                except: continue
-                                choices = data.get("choices") or []
-                                if not choices: continue
-                                delta = choices[0].get("delta") or {}
-                            else:
-                                try: data = json.loads(line)
-                                except: continue
-                                msg = data.get("message") or {}
-                                delta = {"content": msg.get("content") or "", "tool_calls": msg.get("tool_calls") or []}
+                            event = parse_stream_line(line, llm_provider)
+                            if event is None:
+                                continue
+                            if event.done and not event.delta:
+                                break
+                            delta = event.delta
+                            if event.finish_reason:
+                                finish_reason = event.finish_reason
 
                             chunk = delta.get("content") or ""
                             d_reasoning = (
@@ -5288,11 +5725,39 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                     if f_delta.get("name"): existing["function"]["name"] += f_delta["name"]
                                     if f_delta.get("arguments"): existing["function"]["arguments"] += f_delta["arguments"]
                         request_success = True
+                        provider_round_records.append(
+                            {
+                                "turn_id": turn_id,
+                                "provider": llm_provider,
+                                "route_profile": route_profile_name or None,
+                                "provider_order": list(route_provider_order),
+                                "requested_model": candidate_model,
+                                "finish_reason": finish_reason,
+                                "tools_offered": 0 if force_no_tools else len(tools),
+                                "native_tool_calls": len(streamed_tool_calls),
+                                "text_chars": len(full_text),
+                                "latency_ms": round(
+                                    (time.monotonic() - round_started_at) * 1000
+                                ),
+                            }
+                        )
+                        try:
+                            receipt_store.record_provider_round(
+                                provider_round_records[-1]
+                            )
+                        except Exception as observability_err:
+                            # Observability must never turn a valid provider
+                            # response into a failed tool turn.
+                            print(
+                                " [PROVIDER OBSERVABILITY FAILED] "
+                                f"{type(observability_err).__name__}: {observability_err}"
+                            )
                         print(
                             f" [STREAM STATS] uid={uid} model={candidate_model} "
                             f"first_content_after={((first_content_at - round_started_at) if first_content_at else -1):.1f}s "
                             f"chunks={chunk_count} chars={len(full_text)} "
                             f"reasoning_chars={len(reasoning_text)} "
+                            f"finish_reason={finish_reason or 'unspecified'} "
                             f"round_seconds={time.monotonic() - round_started_at:.1f}s"
                         )
             except (httpx.TimeoutException, httpx.RequestError) as e:
@@ -5566,46 +6031,58 @@ CURRENT DATABASE FINANCIAL CONTEXT
     }
 
     def _tool_result_indicates_failure(result) -> bool:
-        """Detect tool rejections/errors returned as normal strings."""
-        text = str(result or "").strip()
-        if not text:
-            return False
-
-        upper = text.upper()
-        first_line = upper.splitlines()[0].strip() if upper.splitlines() else upper
-
-        failure_prefixes = (
-            "REJECTED:",
-            "ERROR:",
-            "FAILED:",
-            "FAILURE:",
-            "DENIED:",
-            "REFUSED:",
-            "BLOCKED:",
-        )
-
-        if first_line.startswith(failure_prefixes):
-            return True
-
-        failure_phrases = (
-            "WAS REJECTED",
-            "REQUEST REJECTED",
-            "PERMISSION DENIED",
-            "DATABASE COMMIT FAILED",
-            "TOOL EXECUTION ERROR",
-            "IS LOCKED",
-            "IMMUTABLE",
-            "MUST BE UNLOCKED",
-            "WEB RESEARCH IS REQUIRED",
-            "NO SUCH",
-        )
-
-        return any(phrase in upper for phrase in failure_phrases)
+        """Detect dispatcher errors, including legacy textual failures."""
+        return tool_result_indicates_failure(result)
 
     # Authoritative execution record for this turn. This is persisted as compact
     # system metadata so the next turn can accurately answer questions about
     # which tools actually ran, instead of reconstructing history from memory.
     turn_tool_trace: list[dict[str, object]] = []
+    receipt_store = ReceiptStore(conn)
+
+    def _normalize_round_tool_calls(
+        calls: list[dict] | None,
+        *,
+        default_origin: str = "native",
+    ) -> list[dict]:
+        """Assign correlation IDs and preserve native/fallback call origin."""
+        normalized_calls: list[dict] = []
+        seen_call_ids: set[str] = set()
+        for ordinal, raw_call in enumerate(calls or []):
+            if not isinstance(raw_call, dict):
+                normalized_calls.append(raw_call)
+                continue
+            origin = str(raw_call.get("_delilah_origin") or default_origin).casefold()
+            if origin not in {"native", "fallback"}:
+                origin = default_origin
+            normalized = ensure_tool_call_id(
+                raw_call,
+                origin=origin,
+                turn_id=str(uid),
+                round_id=attempts,
+                ordinal=ordinal,
+            )
+            # Provider retries occasionally duplicate a call ID inside one
+            # assistant message. OpenAI-compatible transcripts require IDs to
+            # be unique, so repair the later occurrence before it reaches
+            # history or dispatch.
+            if str(normalized.get("id") or "") in seen_call_ids:
+                normalized.pop("id", None)
+                normalized = ensure_tool_call_id(
+                    normalized,
+                    origin=origin,
+                    turn_id=str(uid),
+                    round_id=attempts,
+                    ordinal=ordinal,
+                )
+                normalized["_delilah_duplicate_id_repaired"] = True
+            seen_call_ids.add(str(normalized.get("id") or ""))
+            # Private controller metadata is stripped before conversation
+            # history is sent to a provider, but remains available at the
+            # execution boundary.
+            normalized["_delilah_origin"] = origin
+            normalized_calls.append(normalized)
+        return normalized_calls
 
     def _normalize_identity_text(value) -> str:
         return " ".join(str(value or "").strip().lower().split())
@@ -5784,6 +6261,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # Each entry: (keywords_tuple, tools_set)
     # First matching entry wins; fallback stays empty (pure discovery mode).
     _INTENT_TOOL_MAP: list[tuple[tuple[str, ...], set[str]]] = [
+        # Explicit Plaid sync requests must expose the execution tool before
+        # the generic "sync" reconciliation route can win.
+        (
+            ("plaid sync", "sync plaid", "refresh plaid", "pull plaid", "update plaid"),
+            _CORE_READ_TOOLS | {
+                "sync_plaid_accounting",
+                "pull_live_financial_data",
+                "get_current_financial_position",
+            },
+        ),
         # Personal profile, memories, possessions, life facts, preferences
         (
             ("remember", "memory", "memories", "i have", "i own", "own", "owns", "prefer", "preference", "bought", "fyi", "note that", "keep in mind", "have had", "already have"),
@@ -5807,6 +6294,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 "run_python_sandbox",
                 "run_shell",
                 "list_workspace_files",
+                "read_workspace_file",
                 "send_workspace_file",
                 "install_python_package",
             },
@@ -5939,9 +6427,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
             dynamically_loaded_tools.update(tool_set)
             break
 
-    # Semantic tool-router shadow instrumentation (off by default). Counterfactual
-    # telemetry only: it never changes what is offered, executed, or authorized.
-    # Imported lazily so the flag-off path does no router work at all.
+    # Semantic tool-router instrumentation is imported lazily. Shadow mode is
+    # counterfactual; the separately promoted live mode can narrow the current
+    # schema, but never bypasses controller, grant, receipt, or claim gates.
     _shadow = None
     if TOOL_ROUTER_SHADOW:
         try:
@@ -5966,6 +6454,271 @@ CURRENT DATABASE FINANCIAL CONTEXT
             _shadow.schedule_index()
         except Exception:
             pass
+
+    # Stage-B promotion of the semantic router. This is deliberately separate
+    # from shadow sampling: operators can enable live narrowing for a canary
+    # without changing the telemetry sampling rate. The router can only narrow
+    # the controller's current schema and its dispatch decision is recorded in
+    # the same durable observability store as provider rounds and receipts.
+    _live_router = None
+    _live_router_allowed_names: set[str] | None = None
+    _live_router_round = 0
+    _kev_provider = None
+    _kev_round = 0
+    _kev_shadow = os.getenv("KEV_SHADOW", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    _kev_enforcing = os.getenv("KEV_ENFORCING", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if os.getenv("TOOL_ROUTER_LIVE", "0").strip().lower() not in {
+        "", "0", "false", "no", "off"
+    }:
+        try:
+            from src.services import tool_router as _live_router_mod
+            _live_router = _live_router_mod if _live_router_mod.live_enabled() else None
+        except Exception as _live_router_import_error:
+            print(
+                " [LIVE TOOL ROUTER] disabled after import failure: "
+                f"{type(_live_router_import_error).__name__}: {_live_router_import_error}"
+            )
+        if _live_router is not None:
+            try:
+                _live_router_turn = _live_router.begin_turn(
+                    prompt_text, intent_seed=set(dynamically_loaded_tools)
+                )
+                _live_router.schedule_index()
+            except Exception as _live_router_init_error:
+                print(
+                    " [LIVE TOOL ROUTER] disabled after initialization failure: "
+                    f"{type(_live_router_init_error).__name__}: {_live_router_init_error}"
+                )
+                _live_router = None
+
+    async def _apply_live_router(base_tools: list[dict]) -> list[dict]:
+        """Apply a live router proposal without bypassing controller policy."""
+        nonlocal _live_router_allowed_names, _live_router_round
+        if _live_router is None:
+            _live_router_allowed_names = None
+            return base_tools
+
+        # Audit, fresh-verification, and Gmail-isolated modes have more
+        # specific state-machine constraints than semantic retrieval. Their
+        # existing schema/dispatch gates remain authoritative.
+        restricted = bool(
+            require_fresh_verification
+            or _audit_is_active()
+            or context_policy.get("gmail_only")
+        )
+        offered = {
+            str((tool.get("function") or {}).get("name"))
+            for tool in base_tools
+            if (tool.get("function") or {}).get("name")
+        }
+        if restricted:
+            _live_router_allowed_names = set(offered)
+            decision = {
+                "decision": "controller_restricted",
+                "reason": "existing_controller_mode",
+                "allowed_names": offered,
+                "candidate_names": set(),
+            }
+        else:
+            _live_router_round += 1
+            mode = "ordinary"
+            try:
+                signature = _live_router.mode_signature(
+                    mode, _live_router.browser_gate(prompt_text)
+                )
+                proposal = await asyncio.wait_for(
+                    _live_router.propose(prompt_text, signature),
+                    timeout=_live_router.PROPOSE_TIMEOUT_S,
+                )
+                decision = _live_router.authorize_live_proposal(
+                    proposal,
+                    offered_names=offered,
+                    required_tools=set(required_tools or ()),
+                    always_allow={
+                        "end_turn", "load_tool_schemas", "enable_reasoning",
+                    },
+                )
+                decision["top1_score"] = proposal.get("top1_score")
+                decision["latency_ms"] = proposal.get("latency_ms")
+            except asyncio.TimeoutError:
+                decision = {
+                    "decision": "fail_open",
+                    "reason": "proposal_timeout",
+                    "allowed_names": offered,
+                    "candidate_names": set(),
+                }
+            except Exception as _live_router_error:
+                decision = {
+                    "decision": "fail_open",
+                    "reason": f"{type(_live_router_error).__name__}: {_live_router_error}"[:200],
+                    "allowed_names": offered,
+                    "candidate_names": set(),
+                }
+        _live_router_allowed_names = set(decision.get("allowed_names") or offered)
+        try:
+            receipt_store.record_router_decision(
+                {
+                    "turn_id": turn_id,
+                    "round_id": _live_router_round,
+                    "mode": "restricted" if restricted else "ordinary",
+                    **decision,
+                }
+            )
+        except Exception as _router_observability_error:
+            print(
+                " [LIVE TOOL ROUTER OBSERVABILITY FAILED] "
+                f"{type(_router_observability_error).__name__}: {_router_observability_error}"
+            )
+        allowed = _live_router_allowed_names
+        return [
+            tool for tool in base_tools
+            if (tool.get("function") or {}).get("name") in allowed
+        ]
+
+    async def _apply_kev_decision(base_tools: list[dict]) -> list[dict]:
+        """Score current tool candidates with Kev without granting authority."""
+        nonlocal _kev_provider, _kev_round
+        if not (_kev_shadow or _kev_enforcing):
+            return base_tools
+
+        if require_fresh_verification or _audit_is_active() or context_policy.get("gmail_only"):
+            return base_tools
+
+        try:
+            from src.services.kev_decision import (
+                DecisionProvider,
+                accepted_answer,
+                threshold_for,
+                tool_choice_request,
+            )
+
+            if _kev_provider is None:
+                _kev_provider = DecisionProvider()
+            _kev_round += 1
+
+            offered_names = [
+                str((tool.get("function") or {}).get("name"))
+                for tool in base_tools
+                if (tool.get("function") or {}).get("name")
+            ]
+            if not offered_names:
+                return base_tools
+
+            candidates = offered_names[:]
+            if _live_router_allowed_names:
+                candidates = [
+                    name for name in candidates
+                    if name in _live_router_allowed_names
+                ] or candidates
+            # Kev can handle a closed option set, but an enforcement decision
+            # is unsafe if the model was not shown every currently offered
+            # capability. Shadow mode may sample a bounded set; enforcement
+            # fails open rather than silently hiding a valid tool.
+            candidate_set_complete = len(candidates) <= 128
+            if not candidate_set_complete:
+                candidates = candidates[:128]
+            candidate_descriptions = {}
+            for tool in base_tools:
+                function = tool.get("function") or {}
+                name = str(function.get("name") or "")
+                if name in candidates:
+                    candidate_descriptions[name] = str(function.get("description") or "")
+
+            request = tool_choice_request(
+                state=(
+                    f"User task:\n{str(prompt_text or '')[:5000]}\n\n"
+                    "Available candidate capabilities (name: description):\n"
+                    + "\n".join(
+                        f"- {name}: {candidate_descriptions.get(name, name)}"
+                        for name in candidates
+                    )
+                ),
+                candidates=candidates,
+                turn_id=turn_id,
+                round_id=_kev_round,
+                descriptions=candidate_descriptions,
+            )
+            response = await _kev_provider.decide(request)
+            answer = response.answers.get("tool")
+            allowed_choices = set(candidates) | {"none", "clarify"}
+            accepted = bool(
+                answer
+                and accepted_answer(
+                    answer,
+                    decision_kind="tool_routing",
+                    allowed=allowed_choices,
+                )
+            )
+            if not candidate_set_complete:
+                # A bounded shadow sample is useful for telemetry, but it is
+                # not a safe basis for schema enforcement.
+                accepted = False
+            selected = str(answer.selected) if answer and answer.selected is not None else None
+            minimum, _margin = threshold_for("tool_routing")
+            receipt_store.record_decision(
+                {
+                    "decision_id": response.request_id,
+                    "turn_id": turn_id,
+                    "round_id": _kev_round,
+                    "decision_kind": "tool_routing",
+                    "provider": response.provider,
+                    "mode": response.mode,
+                    "requested_model": _kev_provider.model,
+                    "actual_model": response.model,
+                    "endpoint_profile": _kev_provider.request_profile,
+                    "candidates": sorted(allowed_choices),
+                    "selected": selected,
+                    "probabilities": dict(answer.probabilities) if answer else {},
+                    "confidence": answer.confidence if answer else None,
+                    "threshold": minimum,
+                    "accepted": accepted,
+                    "abstained": not accepted,
+                    "fallback_reason": (
+                        "candidate_set_truncated" if not candidate_set_complete else ""
+                    ),
+                    "latency_ms": response.latency_ms,
+                }
+            )
+
+            if not _kev_enforcing or not accepted or not candidate_set_complete:
+                return base_tools
+            if selected in {"none", "clarify"}:
+                keep = {"end_turn", "load_tool_schemas", "enable_reasoning"}
+            else:
+                keep = {selected, "end_turn", "load_tool_schemas", "enable_reasoning"}
+            # A required action cannot be hidden by a secondary router.
+            keep.update(required_tools or ())
+            return [
+                tool for tool in base_tools
+                if (tool.get("function") or {}).get("name") in keep
+            ]
+        except Exception as exc:
+            try:
+                receipt_store.record_decision(
+                    {
+                        "decision_id": f"kev_error_{uuid.uuid4().hex}",
+                        "turn_id": turn_id,
+                        "round_id": _kev_round,
+                        "decision_kind": "tool_routing",
+                        "provider": "kev",
+                        "mode": os.getenv("KEV_MODE", "local"),
+                        "requested_model": os.getenv("KEV_MODEL", "kev-latest"),
+                        "endpoint_profile": f"kev-{os.getenv('KEV_MODE', 'local')}",
+                        "candidates": [],
+                        "accepted": False,
+                        "abstained": True,
+                        "fallback_reason": type(exc).__name__,
+                        "error": str(exc)[:1000],
+                    }
+                )
+            except Exception:
+                pass
+            print(f" [KEV DECISION] unavailable; preserving existing offering: {exc}")
+            return base_tools
 
     # Audit mode is a runtime contract, not merely a prompt suggestion.
 
@@ -6051,6 +6804,12 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
     recent_tool_signatures: list[str] = []
     consecutive_repetitive_rounds = 0
+    progress_policy = ProgressPolicy(
+        unknown_threshold=max(
+            1,
+            int(os.getenv("ADVISOR_MAX_UNKNOWN_EFFECTS", "2")),
+        )
+    )
     artifact_stall_rounds = 0
     artifact_stall_nudged = False
     empty_response_retries = 0
@@ -6091,6 +6850,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
             or audit_batch_mode
         )
         tools = _tool_schema_for_mode()
+        tools = await _apply_live_router(tools)
+        tools = await _apply_kev_decision(tools)
 
         # Optional total tool-call guard. 0 = unlimited.
         total_calls_so_far = sum(tool_call_counts.values()) if isinstance(tool_call_counts, dict) else 0
@@ -6150,7 +6911,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 print(
                     f" [FALLBACK TOOL CALLS]: {[tc['function']['name'] for tc in fallback_calls]}"
                 )
-                tool_calls = [{"function": c["function"]} for c in fallback_calls]
+                tool_calls = [
+                    {
+                        "type": "function",
+                        "function": c["function"],
+                        "_delilah_origin": "fallback",
+                    }
+                    for c in fallback_calls
+                ]
                 content = _strip_fallback_tool_json(content, fallback_calls)
             else:
                 # Legacy sentinel-block fallback: convert into real tool calls.
@@ -6169,38 +6937,75 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         if b.get("timeout"):
                             call_args["timeout"] = b["timeout"]
                         tool_calls.append(
-                            {"function": {"name": name, "arguments": call_args}}
+                            {
+                                "type": "function",
+                                "function": {"name": name, "arguments": call_args},
+                                "_delilah_origin": "fallback",
+                            }
                         )
                     content = _strip_sandbox_blocks(content, sandbox_blocks)
                 else:
                     print(" [NO TOOLS - PLAIN TEXT RESPONSE]")
 
+        # Every call entering the execution loop has a Delilah-owned
+        # correlation ID, including textual/sentinel fallbacks and providers
+        # that emit malformed native calls without an ID.
+        tool_calls = _normalize_round_tool_calls(
+            tool_calls,
+            default_origin="native",
+        )
+
         # Research mode is never allowed to make progress through narration alone.
         # If the controller still has work/inflight state, immediately re-prompt with
         # the exact native action required instead of accumulating no-tool rounds.
-        if False:
+        if _audit_is_active() and not tool_calls:
+            # Narration is not progress in an audit. Turn every non-terminal
+            # no-tool round into one precise next action; otherwise a model can
+            # repeatedly say that work is ready while leaving the queue stuck.
             audit_state = AUDIT_SESSION_STATE.get(uid, {})
             inflight = list(audit_state.get("research_inflight") or [])
             pending = list(audit_state.get("research_pending") or [])
-            if inflight:
+            pending_lock_ids = list(audit_state.get("pending_lock_ids") or [])
+            remaining = audit_state.get("remaining_count")
+            unresolved_ids = set(audit_state.get("unresolved_ids") or [])
+            partial_ok = bool(
+                remaining not in (None, 0)
+                and unresolved_ids
+                and len(unresolved_ids) == int(remaining)
+            )
+            terminal = remaining in (None, 0) or partial_ok
+            if not terminal or inflight or pending or pending_lock_ids:
+                if require_fresh_verification:
+                    next_action = (
+                        "get_locked_transactions"
+                        if audit_scope == "locked"
+                        else "get_unlocked_transactions"
+                    )
+                    instruction = f"Call `{next_action}` for a fresh verification before doing anything else."
+                elif pending_lock_ids:
+                    instruction = (
+                        "Call `batch_lock_transactions` now for exactly these corrected transaction IDs: "
+                        + ", ".join(str(raw_id) for raw_id in pending_lock_ids)
+                    )
+                elif inflight:
+                    instruction = (
+                        "Call `save_known_merchant` now for exactly one researched in-flight merchant: "
+                        + ", ".join(inflight[:5])
+                    )
+                elif pending:
+                    active = list(audit_state.get("active_research_batch") or pending[:5])
+                    instruction = (
+                        "Call `search_web` for exactly one controller-selected merchant now: "
+                        + ", ".join(active[:5])
+                    )
+                else:
+                    instruction = (
+                        "Call `batch_correct_transactions` for the verified rows, then the controller will require "
+                        "`batch_lock_transactions`; do not claim completion without both receipts."
+                    )
                 messages.append({
                     "role": "user",
-                    "content": (
-                        "AUDIT CONTROLLER: research evidence has been gathered but persistence is still pending. "
-                        "Call save_known_merchant for the exact inflight merchant now. "
-                        f"In-flight merchants: {', '.join(inflight[:5])}"
-                    ),
-                })
-                attempts += 1
-                continue
-            if pending and audit_batch_mode:
-                active = list(audit_state.get("active_research_batch") or pending[:5])
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "AUDIT CONTROLLER: narration is not progress. Research exactly one of the following "
-                        "controller-selected merchants with search_web now: " + ", ".join(active[:5])
-                    ),
+                    "content": "AUDIT CONTROLLER: narration is not progress. " + instruction,
                 })
                 attempts += 1
                 continue
@@ -6361,6 +7166,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     })
                     attempts += 1
                     continue
+            actual_names = [
+                tc.get("function", {}).get("name")
+                for tc in tool_calls
+                if isinstance(tc, dict)
+            ]
             if _audit_is_active():
                 audit_state = AUDIT_SESSION_STATE.get(uid, {})
                 pending_research = set(audit_state.get("research_pending") or [])
@@ -6506,6 +7316,29 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     })
                     attempts += 1
                     continue
+
+                if _live_router_allowed_names is not None:
+                    router_blocked = [
+                        name for name in actual_names
+                        if name not in _live_router_allowed_names
+                    ]
+                    if router_blocked:
+                        print(
+                            " [LIVE TOOL ROUTER BLOCK] rejected tools outside the "
+                            f"authorized proposal: {router_blocked}"
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "SYSTEM ENFORCEMENT: the semantic router did not authorize "
+                                f"{', '.join(sorted(set(router_blocked)))} for this round. "
+                                "Do not narrate that the tool ran. Use an authorized tool, "
+                                "call load_tool_schemas for a missing capability, or answer "
+                                "without claiming an action occurred."
+                            ),
+                        })
+                        attempts += 1
+                        continue
             if MAX_TOOL_CALLS_PER_ROUND > 0:
                 tool_batches = [
                     tool_calls[i : i + MAX_TOOL_CALLS_PER_ROUND]
@@ -6520,34 +7353,47 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
         # If end_turn was the ONLY call, there is nothing left to execute.
         if end_turn_this_round and not tool_calls:
-            if False:
+            if _audit_is_active():
                 audit_state = AUDIT_SESSION_STATE.get(uid, {})
                 remaining_count = audit_state.get("remaining_count")
                 verified = bool(audit_state.get("verified_this_turn"))
                 dirty = bool(audit_state.get("dirty"))
                 unresolved_ids = set(audit_state.get("unresolved_ids") or [])
+                pending = set(audit_state.get("research_pending") or [])
+                inflight = set(audit_state.get("research_inflight") or [])
+                pending_lock_ids = set(audit_state.get("pending_lock_ids") or [])
                 partial_ok = bool(
                     remaining_count is not None
                     and remaining_count > 0
-                    and verified
-                    and not dirty
                     and unresolved_ids
                     and len(unresolved_ids) == int(remaining_count)
                 )
-                if (remaining_count not in (0, None) or not verified or dirty) and not partial_ok:
-                    expected = "get_locked_transactions" if audit_scope == "locked" else "get_unlocked_transactions"
+                if (
+                    (remaining_count not in (0, None) and not partial_ok)
+                    or not verified
+                    or pending
+                    or inflight
+                    or pending_lock_ids
+                    or (dirty and not partial_ok)
+                ):
+                    if pending_lock_ids:
+                        instruction = (
+                            "Call `batch_lock_transactions` for exactly these corrected IDs: "
+                            + ", ".join(str(raw_id) for raw_id in sorted(pending_lock_ids))
+                        )
+                    elif pending or inflight:
+                        instruction = "Finish the pending merchant research/save phase before ending the audit."
+                    else:
+                        expected = "get_locked_transactions" if audit_scope == "locked" else "get_unlocked_transactions"
+                        instruction = f"Call `{expected}` now for fresh deterministic verification."
                     print(
                         f" [AUDIT END GATE] rejected end_turn: remaining={remaining_count} verified={verified} dirty={dirty} unresolved={len(unresolved_ids)}"
                     )
                     messages.append({
                         "role": "user",
-                        "content": (
-                            f"AUDIT END GATE: you are not permitted to finish yet. "
-                            f"Call `{expected}` now for fresh deterministic verification. "
-                            "If the only remaining items are genuinely unresolved after research, mark those exact transaction IDs with `mark_audit_unresolved` first."
-                        ),
+                        "content": "AUDIT END GATE: you are not permitted to finish yet. " + instruction,
                     })
-                    require_fresh_verification = True
+                    require_fresh_verification = not bool(pending or inflight or pending_lock_ids)
                     attempts += 1
                     continue
 
@@ -6562,9 +7408,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"SYSTEM ENFORCEMENT: This scheduled task requires calling {', '.join(missing)} "
-                        f"to deliver a push notification to the user's phone. You have not called {', '.join(missing)} yet. "
-                        f"You must call {', '.join(missing)} now with the completed message before ending the turn."
+                        f"SYSTEM ENFORCEMENT: This request requires calling {', '.join(missing)}. "
+                        f"You have not successfully called {', '.join(missing)} yet. "
+                        f"Emit the native tool call now and wait for its result before ending the turn."
                     ),
                 })
                 attempts += 1
@@ -6637,6 +7483,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             # before a planning paragraph can be accepted as the answer.
             artifact_tool_names = {
                 "list_workspace_files",
+                "read_workspace_file",
                 "run_python_sandbox",
                 "run_shell",
                 "send_workspace_file",
@@ -6984,8 +7831,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
             print(
                 f" [EXECUTING TOOL BATCH {batch_index}/{len(tool_batches)}] {len(tool_batch)} call(s): {batch_names}"
             )
+            history_tool_batch = [
+                {
+                    key: value
+                    for key, value in tool_call.items()
+                    if not str(key).startswith("_delilah_")
+                }
+                if isinstance(tool_call, dict)
+                else tool_call
+                for tool_call in tool_batch
+            ]
             messages.append(
-                {"role": "assistant", "content": "", "tool_calls": tool_batch}
+                {"role": "assistant", "content": "", "tool_calls": history_tool_batch}
             )
 
             # Prefetch only an all-Gmail read batch in ordinary mode. The
@@ -7003,6 +7860,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 args = {}
                 db_result = None
                 tool_succeeded = False
+                call_id = (
+                    str(tool_call.get("id") or "").strip()
+                    if isinstance(tool_call, dict)
+                    else ""
+                )
+                call_origin = (
+                    str(tool_call.get("_delilah_origin") or "native").casefold()
+                    if isinstance(tool_call, dict)
+                    else "native"
+                )
+                receipt_id = f"receipt_{uuid.uuid4().hex}"
+                receipt_status = "started"
+                receipt_started = False
+                grant_id = None
                 try:
                     await _set_advisor_status(
                         uid,
@@ -7038,6 +7909,31 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                     func_name = func_name.strip()
 
+                    # Replaying an already executed provider call ID is not a
+                    # fresh request. Reject it before preparing a second
+                    # receipt or invoking a side effect a second time.
+                    if any(
+                        entry.get("call_id") == call_id
+                        for entry in turn_tool_trace
+                    ):
+                        raise ValueError(
+                            "DUPLICATE_TOOL_CALL_ID: this provider call was already "
+                            "executed in the current turn; use its existing result."
+                        )
+
+                    if not call_id:
+                        # This is defensive for callers that construct a
+                        # batch outside the normal round normalizer.
+                        normalized_call = ensure_tool_call_id(
+                            tool_call,
+                            origin=call_origin,
+                            turn_id=str(uid),
+                            round_id=attempts,
+                            ordinal=tool_index,
+                        )
+                        call_id = str(normalized_call["id"])
+                        tool_call["id"] = call_id
+
                     if func_name not in KNOWN_TOOLS:
                         resolved = _resolve_tool_alias(func_name)
                         if resolved != func_name:
@@ -7048,6 +7944,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             func_name = resolved
                         else:
                             raise ValueError(f"unknown tool '{func_name}'")
+
+                    if call_origin == "fallback" and func_name in FALLBACK_BLOCKED_TOOLS:
+                        raise PermissionError(
+                            "NATIVE_ONLY_MUTATION: textual fallback calls cannot "
+                            f"execute side-effecting tool '{func_name}'. "
+                            "Emit the native structured tool call instead."
+                        )
 
                     # Qwen-style validate-before-execute boundary: the model's
                     # arguments are untrusted input. Do not let a malformed
@@ -7155,6 +8058,62 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             f"inflight={len(inflight)} "
                             f"active_batch={len(active_batch)}"
                         )
+
+                    target_arguments = {
+                        key: value
+                        for key, value in args.items()
+                        if key.endswith("_id")
+                        or key in {
+                            "account",
+                            "email",
+                            "message_id",
+                            "thread_id",
+                            "url",
+                        }
+                    }
+                    grant_target = target_arguments or args
+                    execution_grant = issue_grant(
+                        turn_id=turn_id,
+                        tool_name=func_name,
+                        target=grant_target,
+                        operation=contract_for(func_name).side_effect,
+                        allowed_arguments=target_arguments or args,
+                        risk=contract_for(func_name).side_effect,
+                        approval_required=False,
+                    )
+                    consume_grant(
+                        execution_grant,
+                        turn_id=turn_id,
+                        tool_name=func_name,
+                        target=grant_target,
+                        arguments=args,
+                        approved=True,
+                    )
+                    grant_id = execution_grant.grant_id
+
+                    # Persist the lifecycle before dispatch. If this write
+                    # fails, the surrounding error path prevents the tool
+                    # implementation from running, so no side effect can
+                    # become untracked.
+                    receipt_store.prepare(
+                        receipt_id=receipt_id,
+                        call_id=call_id,
+                        user_id=uid,
+                        turn_id=turn_id,
+                        round_id=attempts,
+                        tool_name=func_name,
+                        origin=call_origin,
+                        arguments=args,
+                    )
+                    receipt_store.start(receipt_id)
+                    receipt_started = True
+                    _record_durable_tool_call(
+                        user_id=uid,
+                        tool_name=func_name or "unknown_tool",
+                        arguments=args,
+                        call_id=call_id,
+                        status="running",
+                    )
 
                     tool_call_counts[func_name] = tool_call_counts.get(func_name, 0) + 1
 
@@ -7380,13 +8339,43 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             batch_items,
                             user_id=uid,
                         )
+                        if _audit_is_active() and not _tool_result_indicates_failure(db_result):
+                            state = AUDIT_SESSION_STATE.setdefault(
+                                uid, {"active": True, "scope": audit_scope}
+                            )
+                            mark_batch_corrected(
+                                state,
+                                [item.get("transaction_row_id") for item in batch_items if isinstance(item, dict)],
+                            )
                     elif func_name == "batch_lock_transactions":
                         if str(args.get("locked", True)).lower() in ["false", "0", "no", "f"]:
                             raise ValueError(" PERMISSION DENIED: You do not have authorization to unlock transactions. Tell the user to use the !override command.")
+                        requested_lock_ids = []
+                        for raw_id in args.get("transaction_row_ids") or []:
+                            try:
+                                requested_lock_ids.append(int(raw_id))
+                            except (TypeError, ValueError):
+                                continue
+                        if _audit_is_active():
+                            validate_lock_ids(
+                                AUDIT_SESSION_STATE.get(uid, {}),
+                                requested_lock_ids,
+                            )
                         db_result = batch_lock_transactions(
                             transaction_row_ids=args.get("transaction_row_ids"),
                             locked=True,
                          user_id=uid)
+                        if _audit_is_active() and not _tool_result_indicates_failure(db_result):
+                            state = AUDIT_SESSION_STATE.setdefault(
+                                uid, {"active": True, "scope": audit_scope}
+                            )
+                            mark_batch_locked(state)
+                            # Locking is a side effect. Require a fresh getter
+                            # before the controller can claim completion or
+                            # begin another audit batch.
+                            require_fresh_verification = not (
+                                state.get("research_pending") or state.get("research_inflight")
+                            )
                     elif func_name == "delete_transaction":
                         db_result = delete_transaction(
                             transaction_row_id=args.get("transaction_row_id"),
@@ -7500,6 +8489,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 "unresolved_ids": [],
                                 "unresolved_reasons": {},
                                 "unresolved_merchant_keys": [],
+                                "pending_lock_ids": [],
+                                "phase": "research",
                                 "days": 30,
                                 "limit": 50,
                                 "status": "all",
@@ -7552,6 +8543,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 f"active_batch={state['active_research_batch']}"
                             )
                     elif func_name == "save_known_merchant":
+                        # Research receipts survive across turns in the audit
+                        # controller. The merchant service also has a legacy
+                        # per-turn research guard; seed that guard from the
+                        # exact controller-owned in-flight item so an
+                        # autonomous wakeup cannot reject valid prior research.
+                        audit_save_state = AUDIT_SESSION_STATE.get(uid, {})
+                        audit_save_key = _merchant_key(str(args.get("merchant", "")))
+                        if _audit_is_active() and audit_save_key in set(audit_save_state.get("research_inflight") or []):
+                            _research_set().add(audit_save_key)
                         db_result = save_known_merchant(
                             merchant=str(args.get("merchant", "")),
                             canonical_name=str(args.get("canonical_name", "")),
@@ -7561,7 +8561,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             evidence_url=str(args.get("evidence_url", "")),
                             source=str(args.get("source", "research")),
                         )
-                        if False:
+                        if not _tool_result_indicates_failure(db_result):
                             saved_key = _merchant_key(str(args.get("merchant", "")))
                             state = AUDIT_SESSION_STATE.setdefault(uid, {"active": True, "scope": audit_scope})
                             pending = set(state.get("research_pending") or [])
@@ -7590,6 +8590,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             ]
                             _advance_merchant_batch(state)
                             state["dirty"] = True
+                            state["phase"] = "research" if (
+                                state.get("research_pending") or state.get("research_inflight")
+                            ) else "needs_fresh_verification"
+                            # Do not apply corrections against rows fetched in
+                            # an earlier turn. The next model round is limited
+                            # to a fresh getter before mutation tools return.
+                            require_fresh_verification = not (
+                                state.get("research_pending") or state.get("research_inflight")
+                            )
                             # Deterministic persistence verification.
                             c.execute(
                                 "SELECT id, merchant_key, canonical_name, category FROM known_merchants WHERE merchant_key = ? LIMIT 1",
@@ -7749,6 +8758,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 "unresolved_ids": list(audit_state.get("unresolved_ids") or []),
                                 "unresolved_reasons": dict(audit_state.get("unresolved_reasons") or {}),
                                 "unresolved_merchant_keys": list(audit_state.get("unresolved_merchant_keys") or []),
+                                "pending_lock_ids": list(audit_state.get("pending_lock_ids") or []),
+                                "phase": audit_state.get("phase", "research"),
                                 "days": audit_days,
                                 "limit": audit_limit,
                                 "status": audit_status,
@@ -7756,6 +8767,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             require_fresh_verification = False
                             audit_scope = "unlocked"
                             _advance_merchant_batch(audit_state)
+                            if not audit_state.get("research_pending") and not audit_state.get("research_inflight"):
+                                audit_state["phase"] = "ready_to_classify"
                             tools = _tool_schema_for_mode()
                             print(f" [AUDIT VERIFY] unlocked remaining={remaining_count} research_pending={len(audit_state.get('research_pending') or [])} active_batch={audit_state.get('active_research_batch')}")
 
@@ -7800,6 +8813,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 "unresolved_ids": list(audit_state.get("unresolved_ids") or []),
                                 "unresolved_reasons": dict(audit_state.get("unresolved_reasons") or {}),
                                 "unresolved_merchant_keys": list(audit_state.get("unresolved_merchant_keys") or []),
+                                "pending_lock_ids": list(audit_state.get("pending_lock_ids") or []),
+                                "phase": audit_state.get("phase", "research"),
                                 "days": audit_days,
                                 "limit": audit_limit,
                                 "status": audit_status,
@@ -7807,6 +8822,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             require_fresh_verification = False
                             audit_scope = "locked"
                             _advance_merchant_batch(audit_state)
+                            if not audit_state.get("research_pending") and not audit_state.get("research_inflight"):
+                                audit_state["phase"] = "ready_to_classify"
                             tools = _tool_schema_for_mode()
                             print(f" [AUDIT VERIFY] locked remaining={remaining_count} research_pending={len(audit_state.get('research_pending') or [])} active_batch={audit_state.get('active_research_batch')}")
 
@@ -8035,8 +9052,19 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     elif func_name == "get_upcoming_cash_flow":
                         db_result = get_upcoming_cash_flow(days=args.get("days", 30), user_id=uid)
                     elif func_name == "sync_plaid_accounting":
-                        if tool_call_counts[func_name] > 1:
-                            db_result = " Plaid accounting sync already ran once this turn. Reuse the first result."
+                        prior_sync_confirmed = any(
+                            entry.get("name") == func_name
+                            and entry.get("ok")
+                            and entry.get("status") == "confirmed"
+                            for entry in turn_tool_trace
+                        )
+                        if tool_call_counts[func_name] > 1 and prior_sync_confirmed:
+                            db_result = "Plaid accounting sync already completed successfully this turn."
+                        elif tool_call_counts[func_name] > 1:
+                            db_result = (
+                                "ERROR: Plaid accounting sync was already attempted this turn "
+                                "but has no confirmed result; do not claim completion."
+                            )
                         else:
                             db_result = await sync_plaid_accounting(
                                 force_refresh=bool(args.get("force_refresh", True)),
@@ -8071,6 +9099,43 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 thread_id=args.get("thread_id"),
                                 user_id=uid,
                             )
+                    elif func_name == "research_topic":
+                        # Composite read-only research: search and fetch are
+                        # still performed by the existing guarded primitives,
+                        # while this tool returns a bounded source packet with
+                        # provenance instead of an untraceable model summary.
+                        from src.services.research_topic import build_research_packet
+
+                        async def _research_search(query_text: str, *, time_range=None, user_id=None):
+                            return await search_searxng(
+                                query_text,
+                                time_range=time_range,
+                                prior_queries=[],
+                                user_id=user_id or uid,
+                            )
+
+                        async def _research_fetch(url: str, *, max_chars: int = 5000):
+                            canonical = _canonical_url(url)
+                            allowed_fetch_urls.add(canonical)
+                            return await asyncio.wait_for(fetch_webpage(
+                                url,
+                                allowed_urls=allowed_fetch_urls,
+                                discover_links=True,
+                                user_id=user_id,
+                                max_chars=max_chars,
+                            ), timeout=30.0)
+
+                        packet = await build_research_packet(
+                            query=args.get("query"),
+                            queries=args.get("queries") if isinstance(args.get("queries"), list) else None,
+                            search_func=_research_search,
+                            fetch_func=_research_fetch,
+                            max_sources=int(args.get("max_sources", 6) or 6),
+                            fetch_top=int(args.get("fetch_top", 3) or 3),
+                            max_chars=int(args.get("max_chars", 5000) or 5000),
+                            time_range=args.get("time_range"),
+                        )
+                        db_result = json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
                     elif func_name == "search_web" and _web_query_is_mailbox(args):
                         # Never send the user's mailbox query to a third-party
                         # search engine: it cannot read their inbox, and the
@@ -8266,6 +9331,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         print(f" [FETCH WEBPAGE] Attempting to hit: {raw_url}")
                         if not raw_url:
                             raise ValueError("url is required")
+                        if (
+                            raw_url.lower().startswith("file://")
+                            or raw_url.startswith("/workspace/")
+                            or (
+                                not raw_url.lower().startswith(("http://", "https://"))
+                                and "/" not in raw_url
+                                and "." in raw_url
+                            )
+                        ):
+                            raise ValueError(
+                                "WORKSPACE_FILE_NOT_WEB_URL: use read_workspace_file "
+                                "for uploaded/saved workspace artifacts; fetch_webpage "
+                                "accepts only http:// or https:// URLs."
+                            )
                         _raw_url_canonical = _canonical_url(raw_url)
                         _direct_user_url = _raw_url_canonical in {
                             _canonical_url(u) for u in user_provided_urls
@@ -8312,6 +9391,31 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     elif func_name == "list_workspace_files":
                         files = await sandbox_client.list_workspace_files(uid)
                         db_result = json.dumps(files, ensure_ascii=False)
+
+                    elif func_name == "read_workspace_file":
+                        workspace_path = str(args.get("path", "")).strip()
+                        if not workspace_path:
+                            raise ValueError("Workspace file path is required.")
+                        file_result = await sandbox_client.read_workspace_file(
+                            uid,
+                            workspace_path,
+                        )
+                        if not file_result:
+                            raise FileNotFoundError(
+                                f"Workspace file could not be read: {workspace_path}"
+                            )
+                        filename, raw_bytes = file_result
+                        max_chars = max(
+                            1,
+                            min(int(args.get("max_chars", 12000) or 12000), 200000),
+                        )
+                        text_content = raw_bytes.decode("utf-8", errors="replace")
+                        truncated = len(text_content) > max_chars
+                        db_result = (
+                            f"[workspace file: {filename}]\n"
+                            f"[read status: {'TRUNCATED' if truncated else 'COMPLETE'}]\n"
+                            + text_content[:max_chars]
+                        )
 
                     elif func_name == "send_workspace_file":
                         path = str(args.get("path", "")).strip()
@@ -8915,12 +10019,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         ))
                     elif func_name in ADVISOR_TOOLS_DISPATCH:
                         try:
-                            tool_fn = ADVISOR_TOOLS_DISPATCH[func_name]
-                            res = tool_fn(uid, args, conn)
-                            if isinstance(res, (dict, list)):
-                                db_result = json.dumps(res, separators=(',', ':'))
+                            envelope = await ADVISOR_TOOL_REGISTRY.dispatch_async(
+                                func_name,
+                                args,
+                                call_id=call_id,
+                                receipt_id=receipt_id,
+                            )
+                            if not envelope.ok:
+                                db_result = envelope.error or envelope.summary
                             else:
-                                db_result = str(res)
+                                res = envelope.raw_result
+                                if isinstance(res, (dict, list)):
+                                    db_result = json.dumps(res, separators=(',', ':'))
+                                else:
+                                    db_result = str(res)
                         except Exception as e:
                             db_result = f"Error executing {func_name}: {type(e).__name__}: {e}"
                     else:
@@ -8963,6 +10075,40 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 if db_result is None:
                     db_result = (
                         f"Error: tool '{func_name or 'unknown'}' produced no result."
+                    )
+
+                if receipt_started:
+                    receipt_status = "confirmed" if tool_succeeded else "failed"
+                    try:
+                        receipt_store.finish(
+                            receipt_id,
+                            status=receipt_status,
+                            ok=bool(tool_succeeded),
+                            complete=bool(tool_succeeded),
+                            result_summary=str(db_result),
+                            error="" if tool_succeeded else str(db_result),
+                        )
+                    except ReceiptLifecycleError as receipt_err:
+                        # The external call already happened, but its terminal
+                        # receipt could not be persisted. Treat the outcome as
+                        # unknown and prohibit a success claim.
+                        tool_succeeded = False
+                        receipt_status = "unknown"
+                        db_result = (
+                            "UNKNOWN: tool execution completed but its terminal "
+                            f"receipt could not be persisted: {receipt_err}"
+                        )
+                        print(f" [RECEIPT UNKNOWN] {func_name}: {receipt_err}")
+
+                if receipt_started:
+                    _record_durable_tool_call(
+                        user_id=uid,
+                        tool_name=func_name or "unknown_tool",
+                        arguments=args,
+                        call_id=call_id,
+                        status="succeeded" if receipt_status == "confirmed" else "failed",
+                        result=db_result if receipt_status == "confirmed" else None,
+                        error="" if receipt_status == "confirmed" else str(db_result),
                     )
 
                 # Keep terminal/runtime logging verbose, but make model-facing tool results compact.
@@ -9018,6 +10164,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 else:
                     tagged_content = result_text
 
+                result_envelope = ToolResultEnvelope.from_runtime(
+                    tool_name=str(func_name or "unknown_tool"),
+                    call_id=call_id,
+                    receipt_id=receipt_id if receipt_started else None,
+                    ok=bool(tool_succeeded),
+                    complete=bool(tool_succeeded),
+                    status=receipt_status,
+                    summary=tagged_content,
+                    error="" if tool_succeeded else tagged_content,
+                    facts=extract_facts(func_name or "unknown_tool", db_result),
+                    side_effect=contract_for(func_name or "unknown_tool").side_effect,
+                )
+                tagged_content = result_envelope.model_content()
+
                 
                 try:
                     c.execute("CREATE TABLE IF NOT EXISTS tool_execution_log (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, tool_name TEXT, arguments TEXT, result TEXT, created_at TEXT)")
@@ -9026,20 +10186,13 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 except Exception as log_e:
                     print(f" Failed to log tool: {log_e}")
                     
-                # OpenAI-compatible requires every tool result to reference the exact
-                # tool-call ID emitted by the preceding assistant message.
-                _tool_call_id = (
-                    tool_call.get("id")
-                    if isinstance(tool_call, dict)
-                    else None
-                )
-
-                if not _tool_call_id:
-                    raise RuntimeError(
-                        f"Tool call {func_name or 'unknown_tool'} has no "
-                        "tool-call ID; refusing to send an invalid OpenAI-compatible "
-                        "conversation."
-                    )
+                # OpenAI-compatible requires every tool result to reference
+                # the exact assistant call ID. The round normalizer assigns a
+                # Delilah-owned ID for fallbacks and malformed providers, so a
+                # missing provider ID can never make the execution untracked.
+                _tool_call_id = call_id or f"delilah_native_{uuid.uuid4().hex}"
+                if isinstance(tool_call, dict) and not tool_call.get("id"):
+                    tool_call["id"] = _tool_call_id
 
                 messages.append(
                     {
@@ -9053,10 +10206,19 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 # Record the ACTUAL tool execution for future-turn context.
                 # This deliberately stores only compact metadata, not the full
                 # tool result, to avoid exploding the conversational context.
+                if receipt_status == "started":
+                    receipt_status = "confirmed" if tool_succeeded else "failed"
                 turn_tool_trace.append(
                     {
                         "name": func_name or "unknown_tool",
                         "ok": bool(tool_succeeded),
+                        "status": receipt_status,
+                        "complete": bool(tool_succeeded),
+                        "call_id": _tool_call_id,
+                        "receipt_id": receipt_id if receipt_started else None,
+                        "origin": call_origin,
+                        "grant_id": grant_id,
+                        **result_envelope.trace_fields(),
                     }
                 )
 
@@ -9290,13 +10452,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
             "run_python_sandbox",
             "run_shell",
             "list_workspace_files",
+            "read_workspace_file",
             "load_tool_schemas",
         }
 
         def _artifact_call_is_inspection_only(tc):
             fn = tc.get("function", {}) if isinstance(tc, dict) else {}
             name = str(fn.get("name") or "")
-            if name in {"list_workspace_files", "load_tool_schemas"}:
+            if name in {"list_workspace_files", "read_workspace_file", "load_tool_schemas"}:
                 return True
             if name not in {"run_python_sandbox", "run_shell"}:
                 return False
@@ -9357,6 +10520,28 @@ CURRENT DATABASE FINANCIAL CONTEXT
             artifact_stall_rounds = 0
             artifact_stall_nudged = False
 
+        if tool_calls and not _audit_is_active():
+            recent_receipts = turn_tool_trace[-len(tool_calls):]
+            unknown_outcome = any(
+                entry.get("status") == "unknown" for entry in recent_receipts
+            )
+            made_progress = any(
+                entry.get("ok") and entry.get("status") == "confirmed"
+                for entry in recent_receipts
+            )
+            progress_decision = progress_policy.observe(
+                fingerprint="|".join(names),
+                progressed=made_progress,
+                status="unknown" if unknown_outcome else "confirmed",
+            )
+            if progress_decision.action == "stop":
+                print(f" [PROGRESS POLICY] stopping: {progress_decision.reason}")
+                final_content = (
+                    "I stopped because an external tool outcome could not be "
+                    "confirmed safely. I will not repeat the operation blindly."
+                )
+                end_turn_called = True
+
         if end_turn_called:
             if _audit_is_active():
                 AUDIT_SESSION_STATE.pop(uid, None)
@@ -9377,9 +10562,77 @@ CURRENT DATABASE FINANCIAL CONTEXT
     final_content = re.sub(r"(?im)^\s*end_turn\s*$", "", final_content).strip()
 
 
+    # Final output is the last and authoritative claim boundary.  The model's
+    # prose is not evidence that a tool ran; only the execution trace can
+    # support a completed-action claim.  Give the model one tool-free repair
+    # opportunity, then use a deterministic fallback so an unsupported claim
+    # can never be published.
+    claim_decision = evaluate_claims(final_content, turn_tool_trace)
+    if not claim_decision.allowed:
+        print(
+            " [CLAIM EVIDENCE GUARD] unsupported action claim(s): "
+            + ", ".join(repr(claim.text) for claim in claim_decision.unsupported)
+        )
+        messages.append({
+            "role": "user",
+            "content": build_claim_repair_prompt(claim_decision),
+        })
+        try:
+            repaired_content, _ = await stream_generator(
+                messages,
+                force_no_tools=True,
+                num_predict=ADVISOR_FINAL_NUM_PREDICT,
+            )
+            repaired_content = re.sub(
+                r"<thought>.*?</thought>|<think>.*?</think>",
+                "",
+                repaired_content or "",
+                flags=re.DOTALL,
+            ).strip()
+            repaired_content = _strip_fallback_tool_json(repaired_content)
+            repaired_decision = evaluate_claims(repaired_content, turn_tool_trace)
+            if repaired_content and repaired_decision.allowed:
+                final_content = repaired_content
+                print(" [CLAIM EVIDENCE GUARD] repaired final response")
+            else:
+                final_content = safe_claim_fallback()
+                print(" [CLAIM EVIDENCE GUARD] repair rejected; using safe fallback")
+        except Exception as claim_repair_err:
+            final_content = safe_claim_fallback()
+            print(
+                " [CLAIM EVIDENCE GUARD] repair failed; using safe fallback: "
+                f"{type(claim_repair_err).__name__}: {claim_repair_err}"
+            )
+
+    final_claim_decision = evaluate_claims(final_content, turn_tool_trace)
+    try:
+        receipt_store.record_claim_decision(
+            turn_id=turn_id,
+            allowed=final_claim_decision.allowed,
+            claims=[claim.text for claim in final_claim_decision.claims],
+            unsupported=[claim.text for claim in final_claim_decision.unsupported],
+        )
+    except Exception as observability_err:
+        print(
+            " [CLAIM OBSERVABILITY FAILED] "
+            f"{type(observability_err).__name__}: {observability_err}"
+        )
+
 
     # Inline Memory Extraction (Zero Tool Calls):
-    memory_matches = re.findall(r"<memory>(.*?)</memory>", final_content, flags=re.DOTALL | re.IGNORECASE)
+    inline_memory_enabled = os.getenv(
+        "DELILAH_INLINE_MEMORY",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    memory_matches = (
+        re.findall(
+            r"<memory>(.*?)</memory>",
+            final_content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if inline_memory_enabled
+        else []
+    )
     for mem_text in memory_matches:
         mem_text = mem_text.strip()
         try:
@@ -9473,6 +10726,21 @@ CURRENT DATABASE FINANCIAL CONTEXT
     #
     # Keep this deliberately small: counts are complete, while the ordered trace
     # is capped so long research/audit runs cannot bloat conversational history.
+    provider_round_text = "; ".join(
+        (
+            f"{record.get('provider')}:{record.get('requested_model')} "
+            f"finish={record.get('finish_reason') or 'unspecified'} "
+            f"native_calls={record.get('native_tool_calls', 0)}"
+        )
+        for record in provider_round_records[-20:]
+    ) or "none"
+    claim_audit_text = (
+        "allowed"
+        if final_claim_decision.allowed
+        else "blocked:" + ",".join(
+            claim.text for claim in final_claim_decision.unsupported
+        )
+    )
     if turn_tool_trace:
         tool_counts = {}
         for entry in turn_tool_trace:
@@ -9502,12 +10770,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
             "than guessing or reconstructing the activity from memory. "
             f"Total tool calls: {len(turn_tool_trace)}. "
             f"Counts: {count_text}. "
-            f"Execution order: {trace_text}"
+            f"Execution order: {trace_text}. "
+            f"Provider rounds: {provider_round_text}. "
+            f"Final claim decision: {claim_audit_text}"
         )
     else:
         tool_history_content = (
             "AUTHORITATIVE TOOL ACTIVITY FROM THE IMMEDIATELY PRECEDING TURN. "
-            "No tools were executed during that turn."
+            "No tools were executed during that turn. "
+            f"Provider rounds: {provider_round_text}. "
+            f"Final claim decision: {claim_audit_text}"
         )
 
     SESSION_HISTORY[uid].append({"role": "user", "content": prompt_text})
@@ -9539,14 +10811,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # If the user disclosed personal facts or possessions and the model did not execute assert_world_model_claim,
     # extract and persist claims in the background so no ground truth is lost.
     executed_tool_names = {entry.get("name") for entry in (turn_tool_trace or [])}
-    if "assert_world_model_claim" not in executed_tool_names:
+    background_memory_enabled = os.getenv(
+        "DELILAH_BACKGROUND_MEMORY",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if background_memory_enabled and "assert_world_model_claim" not in executed_tool_names:
         asyncio.create_task(auto_extract_and_persist_claims(prompt_text, uid))
 
     # Memory-first measurement: how many research tools actually ran vs. how
     # much injected context was present. research_tools=0 with context present
     # means the store replaced tool calls — the whole point of the memory RAG.
     _research_tool_names = {
-        "search_web", "fetch_webpage", "scrape_rendered_page", "crawl_deeper",
+        "search_web", "research_topic", "fetch_webpage", "scrape_rendered_page", "crawl_deeper",
     }
     _research_calls = sum(
         1 for entry in (turn_tool_trace or [])
@@ -9593,7 +10869,7 @@ async def auto_extract_and_persist_claims(prompt_text: str, user_id: str):
 
         if provider == "openai":
             openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
-            openai_model = os.getenv("OPENAI_MODEL", "openrouter/auto-beta")
+            openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
             api_key = os.getenv("OPENAI_API_KEY", "")
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
             payload = {
@@ -9743,7 +11019,7 @@ async def _summarize_history_block(block_text: str) -> str:
         provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
         if provider == "openai":
             openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
-            openai_model = os.getenv("OPENAI_MODEL", "openrouter/auto-beta")
+            openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
             api_key = os.getenv("OPENAI_API_KEY", "")
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
             payload = {
@@ -9860,9 +11136,120 @@ async def chat_with_delilah(
         uid, phase="starting", started_at=started, cancelled=False
     )
     print(f" [ADVISOR START] uid={uid} prompt_chars={len(prompt_text or '')}")
+
+    def _session_scope(request: TurnRequest) -> dict[str, str | None]:
+        return {
+            "user_id": str(request.message.user_id),
+            "session_id": request.resolved_session_key(),
+            "channel_id": request.message.channel_id,
+            "thread_id": request.message.thread_id,
+        }
+
+    def _safe_session_begin(request: TurnRequest, turn_id: str) -> None:
+        store = _durable_session_store()
+        if store is None:
+            return
+        scope = _session_scope(request)
+        try:
+            store.begin_turn(
+                scope["user_id"],
+                scope["session_id"],
+                turn_id=turn_id,
+                idempotency_key=request.request_id,
+                channel_id=scope["channel_id"],
+                thread_id=scope["thread_id"],
+                metadata={"platform": request.message.platform},
+            )
+            store.add_message(
+                scope["user_id"],
+                scope["session_id"],
+                role="user",
+                content=_redact_inline_credentials(request.message.text),
+                message_id=request.request_id,
+                turn_id=turn_id,
+                channel_id=scope["channel_id"],
+                thread_id=scope["thread_id"],
+            )
+        except Exception as exc:
+            print(f" [SESSION STORE] begin failed uid={uid}: {type(exc).__name__}: {exc}")
+
+    def _safe_session_finish(
+        request: TurnRequest, turn_id: str, result: str, duration: float
+    ) -> None:
+        store = _durable_session_store()
+        if store is None:
+            return
+        scope = _session_scope(request)
+        try:
+            store.add_message(
+                scope["user_id"],
+                scope["session_id"],
+                role="assistant",
+                content=str(result or ""),
+                message_id=f"{request.request_id}:assistant",
+                turn_id=turn_id,
+                channel_id=scope["channel_id"],
+                thread_id=scope["thread_id"],
+                metadata={"duration_seconds": round(duration, 3)},
+            )
+            store.finish_turn(
+                scope["user_id"],
+                scope["session_id"],
+                turn_id,
+                status="completed",
+                channel_id=scope["channel_id"],
+                thread_id=scope["thread_id"],
+            )
+        except Exception as exc:
+            print(f" [SESSION STORE] finish failed uid={uid}: {type(exc).__name__}: {exc}")
+
+    def _safe_session_error(
+        request: TurnRequest, turn_id: str, error: BaseException, duration: float
+    ) -> None:
+        store = _durable_session_store()
+        if store is None:
+            return
+        scope = _session_scope(request)
+        try:
+            store.finish_turn(
+                scope["user_id"],
+                scope["session_id"],
+                turn_id,
+                status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed",
+                error=f"{type(error).__name__}: {error}"[:1000],
+                channel_id=scope["channel_id"],
+                thread_id=scope["thread_id"],
+            )
+        except Exception as exc:
+            print(f" [SESSION STORE] error update failed uid={uid}: {type(exc).__name__}: {exc}")
+
     try:
-        result = await _chat_with_delilah_impl(
-            prompt_text, uid, reply_msg, image_b64_list=image_b64_list, required_tools=required_tools
+        channel = getattr(reply_msg, "channel", None)
+        channel_id = getattr(channel, "id", None)
+        request = TurnRequest(
+            MessageEvent(
+                user_id=uid,
+                text=prompt_text or "",
+                platform="discord",
+                channel_id=str(channel_id) if channel_id is not None else None,
+            ),
+            required_tools=frozenset(required_tools or ()),
+        )
+        # The runtime facade is deliberately injected around the legacy loop
+        # during migration. This gives every entry point normalized request and
+        # lifecycle semantics without changing the finance controller in one
+        # risky rewrite.
+        result = await AgentRuntime(
+            _chat_with_delilah_impl,
+            RuntimeHooks(
+                before_run=_safe_session_begin,
+                after_run=_safe_session_finish,
+                on_error=_safe_session_error,
+            ),
+        ).run(
+            request,
+            reply_msg=reply_msg,
+            image_b64_list=image_b64_list,
         )
         duration = round(time.monotonic() - started, 2)
         await _set_advisor_status(
@@ -10163,7 +11550,17 @@ async def advisor_status(ctx: commands.Context):
     )
 
 
-__all__ = ['reminder_watchdog_loop', 'send_push_alert', 'classify_transaction_batch', 'MUTATION_TOOLS', 'refresh_knowledge_base', 'advisor_status', 'maybe_flag_spending_concern', 'EXPECTED_TOOL_NAMES', 'pull_live_financial_data', 'cancel_advisor', 'sync_plaid_accounting', 'process_transaction_batch', 'build_advisor_context', 'chat_with_delilah', '_search_payload_to_web_context', 'BOT_TOOLS_SCHEMA', 'pause_advisor', 'peek_advisor', 'audit_status_cmd', 'toollog_cmd', '_chat_with_delilah_impl', 'SCHEMA_TOOL_NAMES', 'monitor_list_rules', 'monitor_add_rule', 'monitor_run_pass', 'monitor_list_alerts', 'monitor_ack_alert', 'monitor_delete_rule']
+def advisor_turn_observability(turn_id: str) -> dict[str, list[dict[str, object]]]:
+    """Return the durable evidence chain for one advisor turn.
+
+    The result joins router decisions, provider rounds, execution receipts, and
+    final claim decisions by ``turn_id``. It is intentionally read-only so
+    diagnostics cannot alter the authority used by the claim gate.
+    """
+    return ReceiptStore(conn).observability_for_turn(str(turn_id))
+
+
+__all__ = ['reminder_watchdog_loop', 'send_push_alert', 'classify_transaction_batch', 'MUTATION_TOOLS', 'refresh_knowledge_base', 'advisor_status', 'maybe_flag_spending_concern', 'EXPECTED_TOOL_NAMES', 'pull_live_financial_data', 'cancel_advisor', 'sync_plaid_accounting', 'process_transaction_batch', 'build_advisor_context', 'chat_with_delilah', '_search_payload_to_web_context', 'BOT_TOOLS_SCHEMA', 'pause_advisor', 'peek_advisor', 'audit_status_cmd', 'toollog_cmd', '_chat_with_delilah_impl', 'SCHEMA_TOOL_NAMES', 'monitor_list_rules', 'monitor_add_rule', 'monitor_run_pass', 'monitor_list_alerts', 'monitor_ack_alert', 'monitor_delete_rule', 'advisor_turn_observability']
 
 
 @bot.command(name="peek")

@@ -700,7 +700,15 @@ def _eval_category_budget_overpacing(conn: sqlite3.Connection, cfg: dict, user_i
     min_spent = float(cfg.get("min_spent", 25.0))
 
     from src.services.budgeting import calculate_spending_pace_and_forecast
-    pace_data = calculate_spending_pace_and_forecast(user_id=uid, conn=conn)
+    # Take one clock snapshot for the evaluator and pass it through. Besides
+    # avoiding a midnight/month-boundary split, this keeps monitor decisions
+    # deterministic for callers that provide a controlled clock in tests or a
+    # scheduled worker.
+    pace_data = calculate_spending_pace_and_forecast(
+        user_id=uid,
+        conn=conn,
+        now=datetime.now(),
+    )
     budgets = pace_data.get("category_budgets", [])
     if not budgets:
         return None

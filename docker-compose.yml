@@ -40,6 +40,7 @@ volumes:
   sandbox-workspace:
   qdrant_data:
   omniroute-data:
+  kev_model_cache:
 
 services:
   # ============================================================
@@ -69,7 +70,19 @@ services:
       - BROWSERLESS_URL=http://browserless:3000
       - OPENROUTER_FREE_MODELS=poolside/laguna-s-2.1:free,qwen/qwen3.8-27b:free,nvidia/nemotron-3-super-120b-a12b:free
       - OPENROUTER_FREE_VISION_MODELS=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
-      - OPENROUTER_PAID_MODEL=openrouter/auto
+      - OPENROUTER_PAID_MODEL=${OPENROUTER_PAID_MODEL:-qwen/qwen3.8-27b:free}
+      # Do not inherit a host-side 127.0.0.1 setting into the container.
+      # Override explicitly with KEV_DOCKER_LOCAL_URL when needed.
+      - KEV_LOCAL_URL=${KEV_DOCKER_LOCAL_URL:-http://kev:8009/v1/systemone}
+      - DELILAH_ROUTE_PROFILES=${DELILAH_ROUTE_PROFILES:-primary=openrouter|qwen/qwen3.8-27b:free}
+      - DELILAH_ROUTE_PROFILE=${DELILAH_ROUTE_PROFILE:-primary}
+      - DELILAH_INLINE_MEMORY=${DELILAH_INLINE_MEMORY:-0}
+      - DELILAH_BACKGROUND_MEMORY=${DELILAH_BACKGROUND_MEMORY:-0}
+      - ADVISOR_LIVE_PREVIEW=${ADVISOR_LIVE_PREVIEW:-0}
+      - TOOL_ROUTER_SHADOW=${TOOL_ROUTER_SHADOW:-0}
+      - TOOL_ROUTER_SHADOW_SAMPLE=${TOOL_ROUTER_SHADOW_SAMPLE:-1}
+      - TOOL_ROUTER_LIVE=${TOOL_ROUTER_LIVE:-0}
+      - TOOL_ROUTER_LIVE_MIN_SCORE=${TOOL_ROUTER_LIVE_MIN_SCORE:-0}
       - MCP_WEB_BROWSER_URL=http://mcp-web-browser:3000/sse
       - PYTHONUNBUFFERED=1
     volumes:
@@ -90,6 +103,48 @@ services:
       - browserless
       - mcp-web-browser
       - omniroute
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ============================================================
+  # Optional Kev typed-decision sidecar
+  # ============================================================
+  kev:
+    profiles: ["kev"]
+    build:
+      context: ./kev
+      dockerfile: Dockerfile
+      args:
+        KEV_REF: ${KEV_REF:-90990a5fac2995b9faa3190f7d437e84f2067768}
+    container_name: financebot-kev
+    restart: unless-stopped
+    environment:
+      KEV_RUN: ${KEV_RUN:-jaredpalmer/kev-4b}
+      # This host's 8 GiB GPU cannot hold Kev-4B; override with cuda on a
+      # machine with sufficient VRAM.
+      KEV_DEVICE: ${KEV_DEVICE:-cpu}
+    networks:
+      - financebot-internal
+      - egress
+    expose:
+      - "8009"
+    # Allows a host-run Delilah process to use KEV_LOCAL_URL=127.0.0.1:8009.
+    # The API has no authentication, so keep this bound to loopback.
+    ports:
+      - "127.0.0.1:8009:8009"
+    volumes:
+      - kev_model_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8009/v1/models', timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
     deploy:
       resources:
         reservations:
