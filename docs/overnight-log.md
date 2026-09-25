@@ -2,6 +2,13 @@
 
 ## Progress
 
+### Step 2 — resumable task execution — in progress; acceptance gate blocked
+
+- Added task-controller operations and runtime integration for the scoped Gmail and monitor workflows: durable turn/task correlation, call/receipt-linked steps, restart projection, exact-question reply matching, explicit resume, monitor read-back enforcement, reconciliation status, and once-per-task notice claims. Ambiguous side effects are never replayed. Pending approval decisions are stored with the exact action fingerprint, but affirmative approvals intentionally remain blocked because the dispatcher does not yet consume a persisted action-bound authorization grant.
+- Fresh critic blockers: (1) approved tasks do not resume through a matching grant/receipt path; (2) no production flow currently creates durable task questions, so controller-only reply tests do not prove an end-to-end waiting workflow; (3) claiming a reconciliation notice before external delivery prevents duplicate alerts but can permanently lose a notice if send/crash outcome is ambiguous. The delivery guarantee is unresolved because Discord send has no exactly-once transaction with SQLite. Do not weaken the claim-before-send behavior or auto-retry an ambiguous delivery without a reviewed policy.
+- Verification: task/session/receipt/auth/runtime/action-contract focused suite passed (43 tests before the final crash-boundary regression); full suite after final code: 579 passed, 1 skipped, 10 failed. Failures are the same clean-database/legacy seeded-data expectations and pre-existing `test_discord_budget_commands` failure; tests ran in isolated temporary working directories with placeholder Discord credentials. `py_compile` and `git diff --check` passed.
+- Deferred critic suggestions: add full Discord restart-to-resume routing and unrelated-message integration tests; exercise competing CAS in parallel; exercise an ambiguous monitor receipt followed by an alternate-insert retry across restart; decide whether to model notification claim/delivery separately; consider CAS-atomic pending-step preparation. No Step 2 `[gate]` commit was made. Steps 3–6 remain dependency-blocked; session recall may proceed independently because `SessionStore.search_messages` already exists.
+
 ### Step 0 — workflow action contracts — passed
 
 - Documented owner/effect, authorization, retry, evidence, and reconciliation contracts for Gmail search/read and monitor create/list.
