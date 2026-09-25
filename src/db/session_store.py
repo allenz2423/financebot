@@ -70,6 +70,8 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "actionfingerprint", "toolcallid", "receiptid", "resultref", "evidenceref",
     "sourcemessageid", "steeredstepid", "correction", "type", "format",
     "enum", "required",
+    "toolname", "operation", "risk", "summary", "approvalexpiresat",
+    "approvalstatus", "approvedby", "decidedat",
 }
 _UNSET = object()
 
@@ -407,6 +409,26 @@ class SessionStore:
             self._prune(conn, session_pk)
             return self._row(conn.execute("SELECT * FROM messages WHERE session_id=? AND message_key=?", (session_pk, key)).fetchone())  # type: ignore[return-value]
 
+    def get_message(
+        self,
+        user_id: str,
+        session_id: str,
+        message_id: str,
+        *,
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        scope = self._scope(user_id, session_id, channel_id, thread_id)
+        with self._lock:
+            session_pk = self._resolve_session_id(self.connection, scope)
+            row = self.connection.execute(
+                "SELECT * FROM messages WHERE session_id=? AND message_key=?",
+                (session_pk, _required(message_id, "message_id")),
+            ).fetchone()
+            if row is None:
+                raise SessionNotFound("message is not present in the requested owner scope")
+            return self._row(row)  # type: ignore[return-value]
+
     def record_tool_call(
         self, user_id: str, session_id: str, *, tool_name: str, arguments: Any = None,
         call_id: str | None = None, turn_id: str | None = None, status: str = "pending",
@@ -662,6 +684,147 @@ class SessionStore:
                 conn.execute("SELECT * FROM task_steps WHERE step_id=?", (step_key,)).fetchone()
             )  # type: ignore[return-value]
 
+    def start_task_step(
+        self,
+        user_id: str,
+        task_id: str,
+        step_order: int,
+        *,
+        expected_task_status: str,
+        expected_task_version: int,
+        tool_call_id: int,
+        receipt_id: str,
+        next_action: str,
+        step_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically create a running step and claim its task before dispatch."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        order = int(step_order)
+        if order < 0:
+            raise ValueError("step_order must be non-negative")
+        before = self._validate_task_status(expected_task_status)
+        if before not in {"queued", "running"}:
+            raise ValueError("only queued or running tasks may claim a dispatch step")
+        version = int(expected_task_version)
+        if version < 0:
+            raise ValueError("expected_task_version must be non-negative")
+        step_key = _required(step_id or f"step_{uuid.uuid4().hex}", "step_id")
+        action = _required(next_action, "next_action")
+        now = _now()
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            next_order = int(conn.execute(
+                "SELECT COALESCE(MAX(step_order), -1) + 1 FROM task_steps WHERE task_id=?",
+                (task_key,),
+            ).fetchone()[0])
+            if order != next_order:
+                raise ValueError("dispatch step order must be the next contiguous task step")
+            if task["status"] != before or int(task["version"]) != version:
+                raise ConcurrentTaskUpdate("task status/version changed before dispatch claim")
+            call_pk, receipt_key = self._validate_task_links(
+                conn, owner, tool_call_id=tool_call_id, receipt_id=receipt_id
+            )
+            assert call_pk is not None and receipt_key is not None
+            step = conn.execute(
+                """INSERT INTO task_steps(
+                       step_id, task_id, step_order, dependency_ids_json, status,
+                       next_action, tool_call_id, receipt_id, created_at, updated_at
+                   ) VALUES (?, ?, ?, '[]', 'running', ?, ?, ?, ?, ?)""",
+                (step_key, task_key, order, action, call_pk, receipt_key, now, now),
+            )
+            cursor = conn.execute(
+                """UPDATE task_runs SET status='running', current_step_id=?,
+                       version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND status=? AND version=?""",
+                (step_key, now, task_key, owner, before, version),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task status/version changed before dispatch claim")
+            self._insert_task_event(
+                conn, task_id=task_key, step_id=step_key,
+                event_type="step.dispatch_claimed",
+                payload={
+                    "step_order": order, "status": "running", "next_action": action,
+                    "tool_call_id": call_pk, "receipt_id": receipt_key,
+                    "from": before, "to": "running", "version": version + 1,
+                    "expected_version": version,
+                },
+            )
+            return {
+                "task": self._row(conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id=?", (task_key,)
+                ).fetchone()),
+                "step": self._row(conn.execute(
+                    "SELECT * FROM task_steps WHERE step_id=?", (step_key,)
+                ).fetchone()),
+            }
+
+    def claim_task_step(
+        self,
+        user_id: str,
+        task_id: str,
+        step_id: str,
+        *,
+        expected_task_status: str,
+        expected_task_version: int,
+        expected_step_version: int,
+        receipt_id: str,
+    ) -> dict[str, Any]:
+        """Atomically link a prepared receipt and move a pending step to running."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        step_key = _required(step_id, "step_id")
+        before = self._validate_task_status(expected_task_status)
+        if before not in {"queued", "running"}:
+            raise ValueError("only queued or running tasks may claim a dispatch step")
+        task_version = int(expected_task_version)
+        now = _now()
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            step = conn.execute(
+                "SELECT * FROM task_steps WHERE task_id=? AND step_id=?",
+                (task_key, step_key),
+            ).fetchone()
+            if step is None:
+                raise TaskNotFound("task step is not present in the requested owner scope")
+            if task["status"] != before or int(task["version"]) != task_version:
+                raise ConcurrentTaskUpdate("task status/version changed before step claim")
+            if step["status"] != "pending":
+                raise ConcurrentTaskUpdate("only a pending step can be claimed")
+            _call_pk, receipt_key = self._validate_task_links(
+                conn, owner, tool_call_id=int(step["tool_call_id"]), receipt_id=receipt_id
+            )
+            assert receipt_key is not None
+            step_cursor = conn.execute(
+                """UPDATE task_steps SET status='running', receipt_id=?, version=version+1, updated_at=?
+                   WHERE task_id=? AND step_id=? AND status='pending' AND version=?""",
+                (receipt_key, now, task_key, step_key, int(expected_step_version)),
+            )
+            if step_cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task step changed before claim")
+            task_cursor = conn.execute(
+                """UPDATE task_runs SET status='running', current_step_id=?, version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND status=? AND version=?""",
+                (step_key, now, task_key, owner, before, task_version),
+            )
+            if task_cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task changed before step claim")
+            self._insert_task_event(
+                conn, task_id=task_key, step_id=step_key,
+                event_type="step.dispatch_claimed",
+                payload={"status": "running", "from": "pending", "to": "running",
+                         "receipt_id": receipt_key, "tool_call_id": int(step["tool_call_id"])},
+            )
+            return {
+                "task": self._row(conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id=?", (task_key,)
+                ).fetchone()),
+                "step": self._row(conn.execute(
+                    "SELECT * FROM task_steps WHERE step_id=?", (step_key,)
+                ).fetchone()),
+            }
+
     def transition_task_run(
         self,
         user_id: str,
@@ -674,6 +837,8 @@ class SessionStore:
         current_step_id: Any = _UNSET,
         cancellation_requested: Any = _UNSET,
         result_ref: Any = _UNSET,
+        event_type: str | None = None,
+        event_payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         owner = _required(user_id, "user_id")
         task_key = _required(task_id, "task_id")
@@ -718,6 +883,11 @@ class SessionStore:
                 conn, task_id=task_key, event_type="task.transitioned",
                 payload={"from": before, "to": after, "expected_version": version, "version": version + 1},
             )
+            if event_type:
+                self._insert_task_event(
+                    conn, task_id=task_key, event_type=event_type,
+                    payload=event_payload,
+                )
             return self._row(
                 conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()
             )  # type: ignore[return-value]
@@ -786,6 +956,75 @@ class SessionStore:
                 conn.execute("SELECT * FROM task_steps WHERE step_id=?", (step_key,)).fetchone()
             )  # type: ignore[return-value]
 
+    def transition_task_step_and_run(
+        self,
+        user_id: str,
+        task_id: str,
+        step_id: str,
+        *,
+        expected_step_status: str,
+        expected_step_version: int,
+        new_step_status: str,
+        expected_task_status: str,
+        expected_task_version: int,
+        new_task_status: str,
+        next_action: str | None = None,
+        wait_reason: str | None = None,
+        event_type: str | None = None,
+        event_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """CAS a step and its parent task in one SQLite transaction."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        step_key = _required(step_id, "step_id")
+        old_step = self._validate_task_status(expected_step_status, step=True)
+        new_step = self._validate_task_status(new_step_status, step=True)
+        old_task = self._validate_task_status(expected_task_status)
+        new_task = self._validate_task_status(new_task_status)
+        step_version = int(expected_step_version)
+        task_version = int(expected_task_version)
+        now = _now()
+        with self._write() as conn:
+            self._task_pk(conn, owner, task_key)
+            step_cursor = conn.execute(
+                """UPDATE task_steps SET status=?, next_action=?, version=version+1, updated_at=?
+                   WHERE step_id=? AND task_id=? AND status=? AND version=?""",
+                (new_step, next_action, now, step_key, task_key, old_step, step_version),
+            )
+            if step_cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task-step status/version changed before atomic transition")
+            task_cursor = conn.execute(
+                """UPDATE task_runs SET status=?, wait_reason=?, version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND status=? AND version=?""",
+                (new_task, wait_reason, now, task_key, owner, old_task, task_version),
+            )
+            if task_cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task status/version changed before atomic transition")
+            self._insert_task_event(
+                conn, task_id=task_key, step_id=step_key,
+                event_type="step.transitioned",
+                payload={"from": old_step, "to": new_step,
+                         "expected_version": step_version, "version": step_version + 1},
+            )
+            self._insert_task_event(
+                conn, task_id=task_key, event_type="task.transitioned",
+                payload={"from": old_task, "to": new_task,
+                         "expected_version": task_version, "version": task_version + 1},
+            )
+            if event_type:
+                self._insert_task_event(
+                    conn, task_id=task_key, step_id=step_key,
+                    event_type=event_type, payload=event_payload,
+                )
+            return {
+                "task": self._row(conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id=?", (task_key,)
+                ).fetchone()),
+                "step": self._row(conn.execute(
+                    "SELECT * FROM task_steps WHERE step_id=?", (step_key,)
+                ).fetchone()),
+            }
+
     def append_task_event(
         self,
         user_id: str,
@@ -826,6 +1065,108 @@ class SessionStore:
             if row is None:
                 raise TaskNotFound("task step is not present in the requested owner scope")
             return self._row(row)  # type: ignore[return-value]
+
+    def has_confirmed_task_call(
+        self, user_id: str, task_id: str, *, tool_name: str, arguments: Any
+    ) -> bool:
+        """Detect an exact action already confirmed within this task."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        args_json = _json(arguments, default={})
+        with self._lock:
+            self._task_pk(self.connection, owner, task_key)
+            if not self._has_table("tool_receipts"):
+                return False
+            row = self.connection.execute(
+                """SELECT 1 FROM task_steps ts
+                   JOIN tool_calls tc ON tc.id=ts.tool_call_id
+                   JOIN tool_receipts tr ON tr.receipt_id=ts.receipt_id
+                   WHERE ts.task_id=? AND ts.status='succeeded'
+                     AND tc.tool_name=? AND tc.arguments_json=?
+                     AND tr.user_id=? AND tr.status='confirmed'
+                   LIMIT 1""",
+                (task_key, _required(tool_name, "tool_name"), args_json, owner),
+            ).fetchone()
+            return row is not None
+
+    def get_tool_call(self, user_id: str, tool_call_id: int) -> dict[str, Any]:
+        owner = _required(user_id, "user_id")
+        with self._lock:
+            row = self.connection.execute(
+                """SELECT tc.* FROM tool_calls tc JOIN sessions s ON s.id=tc.session_id
+                   WHERE tc.id=? AND s.user_id=?""",
+                (int(tool_call_id), owner),
+            ).fetchone()
+            if row is None:
+                raise TaskNotFound("tool call is not present in the requested owner scope")
+            return self._row(row)  # type: ignore[return-value]
+
+    def task_requires_monitor_readback(self, user_id: str, task_id: str) -> bool:
+        """A confirmed monitor insert is incomplete until owner-scoped read-back."""
+        owner = _required(user_id, "user_id")
+        with self._lock:
+            self._task_pk(self.connection, owner, task_id)
+            if not self._has_table("tool_receipts"):
+                return False
+            creates = self.connection.execute(
+                """SELECT ts.step_order, tc.tool_name, tc.arguments_json, tr.result_summary
+                   FROM task_steps ts
+                   JOIN tool_calls tc ON tc.id=ts.tool_call_id
+                   JOIN tool_receipts tr ON tr.receipt_id=ts.receipt_id
+                   WHERE ts.task_id=? AND ts.status='succeeded'
+                     AND tc.tool_name IN ('monitor_create_natural_rule','monitor_add_rule')
+                     AND tr.user_id=? AND tr.status='confirmed'
+                   ORDER BY ts.step_order""",
+                (task_id, owner),
+            ).fetchall()
+            if not creates:
+                return False
+            reads = self.connection.execute(
+                """SELECT ts.step_order, tr.result_summary FROM task_steps ts
+                   JOIN tool_calls tc ON tc.id=ts.tool_call_id
+                   JOIN tool_receipts tr ON tr.receipt_id=ts.receipt_id
+                   WHERE ts.task_id=? AND ts.status='succeeded'
+                     AND tc.tool_name='monitor_list_rules'
+                     AND tr.user_id=? AND tr.status='confirmed'
+                   ORDER BY ts.step_order""",
+                (task_id, owner),
+            ).fetchall()
+            for created in creates:
+                match = re.search(r"#(\d+)", str(created["result_summary"] or ""))
+                if match is None:
+                    return True
+                rule_id = match.group(1)
+                if not self._has_table("monitor_rules"):
+                    return True
+                rule = self.connection.execute(
+                    """SELECT name, kind, config FROM monitor_rules
+                       WHERE id=? AND user_id=?""",
+                    (int(rule_id), owner),
+                ).fetchone()
+                if rule is None:
+                    return True
+                try:
+                    normalized_config = json.dumps(
+                        json.loads(rule["config"] or "{}"),
+                        ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+                    )
+                except (TypeError, ValueError):
+                    return True
+                expected_prefix = f"- #{rule_id} "
+                expected_identity = f"] {rule['name']} ({rule['kind']})"
+                expected_config = f"config={normalized_config}"
+                if not any(
+                    int(read["step_order"]) > int(created["step_order"])
+                    and any(
+                        line.startswith(expected_prefix)
+                        and expected_identity in line
+                        and expected_config in line
+                        for line in str(read["result_summary"] or "").splitlines()
+                    )
+                    for read in reads
+                ):
+                    return True
+            return False
 
     def get_task(
         self,

@@ -1,0 +1,543 @@
+"""Small orchestration operations over SessionStore and ReceiptStore.
+
+The receipt remains the source of truth for execution outcome. This module
+stores only task progression and links; it never invokes tools or retries them.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from typing import Any, Mapping
+from datetime import datetime, timezone
+
+from src.services.authorization import (
+    ApprovalRequest,
+    AuthorizationRequest,
+    HumanApproval,
+    approve_request,
+)
+from src.db.session_store import SessionStore
+
+
+class TaskController:
+    def __init__(self, store: SessionStore):
+        self.store = store
+
+    def create_turn(
+        self, user_id: str, session_id: str, turn_id: str, objective: str,
+        *, channel_id: str | None = None, thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        task_id = f"task_{turn_id}"
+        try:
+            return self.store.create_task_run(
+                user_id, session_id, objective[:2000], task_id=task_id,
+                channel_id=channel_id, thread_id=thread_id,
+            )
+        except Exception:
+            # Idempotent runtime-hook re-entry may encounter a task already
+            # created for this stable turn identifier. Do not mask other errors.
+            existing = self.store.get_task(user_id, task_id)
+            if existing.get("objective") == objective[:2000]:
+                return existing
+            raise
+
+    def start_step(
+        self, user_id: str, task_id: str, *, tool_call_id: int,
+        receipt_id: str, tool_name: str,
+    ) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        order = len(task["steps"])
+        return self.store.start_task_step(
+            user_id, task_id, order,
+            expected_task_status=task["status"],
+            expected_task_version=int(task["version"]),
+            tool_call_id=tool_call_id, receipt_id=receipt_id,
+            next_action=f"dispatch:{tool_name}",
+        )
+
+    def prepare_step(self, user_id: str, task_id: str, *, tool_name: str) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] not in {"queued", "running"}:
+            raise ValueError("task is not dispatchable")
+        pending = next((step for step in task["steps"] if step["status"] == "pending"), None)
+        if pending is not None:
+            if pending.get("next_action") != f"dispatch:{tool_name}":
+                raise ValueError("a different undispatched task step must be resumed first")
+            return pending
+        return self.store.add_task_step(
+            user_id, task_id, len(task["steps"]), status="pending",
+            next_action=f"dispatch:{tool_name}",
+        )
+
+    def link_call_to_step(
+        self, user_id: str, task_id: str, step_id: str, *, tool_call_id: int
+    ) -> dict[str, Any]:
+        step = self.store.get_task_step(user_id, task_id, step_id)
+        if step.get("tool_call_id") is not None:
+            previous = self.store.get_tool_call(user_id, int(step["tool_call_id"]))
+            current = self.store.get_tool_call(user_id, int(tool_call_id))
+            if (previous["tool_name"], previous["arguments"]) != (
+                current["tool_name"], current["arguments"]
+            ):
+                raise ValueError("resumed step must use the exact persisted tool and arguments")
+        return self.store.transition_task_step(
+            user_id, task_id, step_id,
+            expected_status="pending", expected_version=int(step["version"]),
+            new_status="pending", tool_call_id=tool_call_id,
+        )
+
+    def claim_step(
+        self, user_id: str, task_id: str, step_id: str, *, receipt_id: str
+    ) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        step = self.store.get_task_step(user_id, task_id, step_id)
+        return self.store.claim_task_step(
+            user_id, task_id, step_id,
+            expected_task_status=task["status"], expected_task_version=int(task["version"]),
+            expected_step_version=int(step["version"]), receipt_id=receipt_id,
+        )
+
+    def finish_step(
+        self, user_id: str, task_id: str, step_id: str, *, outcome: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Record receipt-derived terminal state; unknown is never retried."""
+        task = self.store.get_task(user_id, task_id)
+        step = next(item for item in task["steps"] if item["step_id"] == step_id)
+        step_status = "succeeded" if outcome == "confirmed" else "failed"
+        task_status = task["status"]
+        wait_reason = task.get("wait_reason")
+        next_action = None
+        event_type = None
+        if outcome == "confirmed":
+            pass
+        elif outcome == "failed":
+            pass
+        elif outcome == "unknown":
+            step_status = "needs_reconciliation"
+            task_status = "needs_reconciliation"
+            wait_reason = (reason or "side_effect_outcome_unknown")[:500]
+            next_action = "manual_reconciliation"
+            event_type = "task.reconciliation_required"
+        else:
+            raise ValueError("outcome must be confirmed, failed, or unknown")
+        self.store.transition_task_step_and_run(
+            user_id, task_id, step_id,
+            expected_step_status=step["status"], expected_step_version=int(step["version"]),
+            new_step_status=step_status,
+            expected_task_status=task["status"], expected_task_version=int(task["version"]),
+            new_task_status=task_status, next_action=next_action, wait_reason=wait_reason,
+            event_type=event_type,
+            event_payload={"reason_code": wait_reason or "unknown"} if event_type else None,
+        )
+        return self.store.get_task(user_id, task_id)
+
+    def recover_incomplete(self, user_id: str, receipt_store: Any) -> list[dict[str, Any]]:
+        """Project linked receipt outcomes after a process restart, never replay."""
+        recovered: list[dict[str, Any]] = []
+        for listed in self.store.list_tasks(user_id, statuses=["running", "queued"], limit=500):
+            task = self.store.get_task(user_id, listed["task_id"])
+            current_id = task.get("current_step_id")
+            step = next((s for s in task["steps"] if s["step_id"] == current_id), None)
+            if step is None or step["status"] not in {"pending", "running"}:
+                step = next((s for s in reversed(task["steps"])
+                             if s["status"] in {"pending", "running"}), None)
+            if step is None:
+                if task["status"] == "running" and task["steps"]:
+                    if any(s["status"] == "failed" for s in task["steps"]):
+                        self.store.transition_task_run(
+                            user_id, task["task_id"], expected_status="running",
+                            expected_version=int(task["version"]), new_status="failed",
+                            wait_reason="restart_after_confirmed_failure",
+                        )
+                        recovered.append({"task_id": task["task_id"], "status": "failed"})
+                    elif all(s["status"] == "succeeded" for s in task["steps"]):
+                        self.store.transition_task_run(
+                            user_id, task["task_id"], expected_status="running",
+                            expected_version=int(task["version"]), new_status="queued",
+                            wait_reason="restart_after_confirmed_step",
+                            event_type="task.resume_ready",
+                            event_payload={"status": "confirmed_steps_only"},
+                        )
+                        recovered.append({"task_id": task["task_id"], "status": "queued"})
+                continue
+            if task["status"] == "queued" and task.get("wait_reason") in {
+                "restart_after_confirmed_step", "restart_before_dispatch"
+            }:
+                continue
+            receipt = None
+            if step.get("receipt_id"):
+                try:
+                    receipt = receipt_store.get(step["receipt_id"])
+                except Exception:
+                    receipt = None
+                    receipt_missing = True
+                else:
+                    receipt_missing = False
+            elif step.get("tool_call_id"):
+                call = self.store.get_tool_call(user_id, int(step["tool_call_id"]))
+                candidates = receipt_store.list_for_call(call["call_key"], user_id=user_id)
+                if len(candidates) == 1:
+                    receipt = candidates[0]
+                elif len(candidates) > 1:
+                    receipt_missing = True
+                    receipt = None
+                else:
+                    receipt_missing = False
+            else:
+                receipt_missing = False
+
+            if receipt is None and not receipt_missing:
+                # No receipt or only prepared receipts means execution hasn't
+                # crossed ReceiptStore.start. Keep it resumable, but require an
+                # explicit user resume instead of binding the next message.
+                run = "queued"
+                reason = "restart_before_dispatch"
+                self.store.transition_task_step_and_run(
+                    user_id, task["task_id"], step["step_id"],
+                    expected_step_status=step["status"], expected_step_version=int(step["version"]),
+                    new_step_status="pending", next_action=step.get("next_action"),
+                    expected_task_status=task["status"], expected_task_version=int(task["version"]),
+                    new_task_status=run, wait_reason=reason,
+                    event_type="task.resume_ready",
+                    event_payload={"status": "not_dispatched"},
+                )
+                recovered.append({"task_id": task["task_id"], "status": run})
+                continue
+            if receipt is None:
+                self.finish_step(
+                    user_id, task["task_id"], step["step_id"], outcome="unknown",
+                    reason="linked_receipt_missing_after_restart",
+                )
+                recovered.append({"task_id": task["task_id"], "status": "needs_reconciliation"})
+                continue
+            if receipt.user_id != user_id:
+                self.finish_step(user_id, task["task_id"], step["step_id"],
+                                 outcome="unknown", reason="linked_receipt_owner_mismatch")
+                recovered.append({"task_id": task["task_id"], "status": "needs_reconciliation"})
+                continue
+            if receipt.status == "prepared":
+                # Restore the durable task to a resumable state first. If the
+                # process dies after that transaction, a later restart sees
+                # restart_before_dispatch and cannot mistake a finalized
+                # receipt for a dispatched/failed action.
+                self.store.transition_task_step_and_run(
+                    user_id, task["task_id"], step["step_id"],
+                    expected_step_status=step["status"], expected_step_version=int(step["version"]),
+                    new_step_status="pending", next_action=step.get("next_action"),
+                    expected_task_status=task["status"], expected_task_version=int(task["version"]),
+                    new_task_status="queued", wait_reason="restart_before_dispatch",
+                    event_type="task.resume_ready",
+                    event_payload={"receipt_id": receipt.receipt_id, "status": "not_dispatched"},
+                )
+                try:
+                    receipt_store.finish(
+                        receipt.receipt_id, status="failed", ok=False, complete=False,
+                        error="dispatch_not_started_recovered",
+                    )
+                except Exception as exc:
+                    # The receipt is still only prepared, so no tool crossed
+                    # the dispatch boundary. Keep the task resumable; its next
+                    # dispatch replaces this stale prepared evidence link.
+                    print(
+                        " [TASK RECOVERY] stale prepared receipt cleanup failed "
+                        f"receipt={receipt.receipt_id}: {type(exc).__name__}"
+                    )
+                recovered.append({"task_id": task["task_id"], "status": "queued"})
+                continue
+            if receipt.status == "confirmed":
+                self.store.transition_task_step_and_run(
+                    user_id, task["task_id"], step["step_id"],
+                    expected_step_status=step["status"], expected_step_version=int(step["version"]),
+                    new_step_status="succeeded", expected_task_status=task["status"],
+                    expected_task_version=int(task["version"]), new_task_status="queued",
+                    wait_reason="restart_after_confirmed_step",
+                    event_type="task.resume_ready",
+                    event_payload={"receipt_id": receipt.receipt_id, "status": receipt.status},
+                )
+                recovered.append({"task_id": task["task_id"], "status": "queued"})
+            elif receipt.status == "failed":
+                self.store.transition_task_step_and_run(
+                    user_id, task["task_id"], step["step_id"],
+                    expected_step_status=step["status"], expected_step_version=int(step["version"]),
+                    new_step_status="failed", expected_task_status=task["status"],
+                    expected_task_version=int(task["version"]), new_task_status="failed",
+                    wait_reason="restart_after_confirmed_failure",
+                )
+                recovered.append({"task_id": task["task_id"], "status": "failed"})
+            else:
+                # Started and unknown are ambiguous; neither is replayed.
+                self.finish_step(
+                    user_id, task["task_id"], step["step_id"], outcome="unknown",
+                    reason=f"receipt_{receipt.status}_after_restart",
+                )
+                recovered.append({"task_id": task["task_id"], "status": "needs_reconciliation"})
+        return recovered
+
+    def resume_ready_task(self, user_id: str, task_id: str) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        wait_reason = str(task.get("wait_reason") or "")
+        if task["status"] != "queued" or (
+            wait_reason not in {
+                "restart_after_confirmed_step", "restart_before_dispatch",
+                "monitor_readback_required",
+            }
+            and not wait_reason.startswith("resume_after_reply:")
+        ):
+            raise ValueError("task is not ready for a safe post-restart continuation")
+        return task
+
+    def finish_turn(self, user_id: str, task_id: str, *, failed: bool = False) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] in {"needs_reconciliation", "waiting_user", "waiting_approval"}:
+            return task
+        steps = task["steps"]
+        if self.store.task_requires_monitor_readback(user_id, task_id):
+            self.store.transition_task_run(
+                user_id, task_id, expected_status=task["status"],
+                expected_version=int(task["version"]), new_status="queued",
+                wait_reason="monitor_readback_required",
+                event_type="task.resume_ready",
+                event_payload={"status": "monitor_readback_required"},
+            )
+            return self.store.get_task(user_id, task_id)
+        active = [s for s in steps if s["status"] in {"running", "ready"}]
+        if active:
+            step = active[0]
+            self.store.transition_task_step_and_run(
+                user_id, task_id, step["step_id"],
+                expected_step_status=step["status"], expected_step_version=int(step["version"]),
+                new_step_status="needs_reconciliation", next_action="reconcile_linked_receipt",
+                expected_task_status=task["status"], expected_task_version=int(task["version"]),
+                new_task_status="needs_reconciliation", wait_reason="unfinished_step_at_turn_end",
+            )
+            return self.store.get_task(user_id, task_id)
+        pending = [s for s in steps if s["status"] == "pending"]
+        if pending:
+            self.store.transition_task_run(
+                user_id, task_id, expected_status=task["status"],
+                expected_version=int(task["version"]), new_status="queued",
+                wait_reason="restart_before_dispatch",
+                event_type="task.resume_ready",
+                event_payload={"status": "pending_step"},
+            )
+            return self.store.get_task(user_id, task_id)
+        terminal = "failed" if failed or any(s["status"] == "failed" for s in steps) else "succeeded"
+        self.store.transition_task_run(
+            user_id, task_id, expected_status=task["status"],
+            expected_version=int(task["version"]), new_status=terminal,
+            result_ref="turn_completed" if terminal == "succeeded" else None,
+        )
+        return self.store.get_task(user_id, task_id)
+
+    def request_user(
+        self, user_id: str, task_id: str, *, question_id: str, question: str,
+        allowed_answers: Mapping[str, Any], expires_at: str | None = None,
+        approval_request: ApprovalRequest | None = None,
+        authorization_request: AuthorizationRequest | None = None,
+    ) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] not in {"queued", "running"}:
+            raise ValueError("only active tasks can wait for a user decision")
+        payload: dict[str, Any] = {
+            "question_id": question_id, "question": question[:1000],
+            "allowed_answers": dict(allowed_answers),
+        }
+        if expires_at:
+            payload["expires_at"] = expires_at
+        if (approval_request is None) != (authorization_request is None):
+            raise ValueError("approval persistence requires both typed authorization objects")
+        if approval_request is not None and authorization_request is not None:
+            if approval_request.request_fingerprint != authorization_request.fingerprint:
+                raise ValueError("approval request is not bound to the exact task action")
+            if approval_request.tool_name != authorization_request.tool_name:
+                raise ValueError("approval tool does not match the authorization request")
+            if approval_request.operation != authorization_request.policy.operation:
+                raise ValueError("approval operation does not match the authorization request")
+            payload.update({
+                "approval_id": approval_request.approval_id,
+                "action_fingerprint": approval_request.request_fingerprint,
+                "tool_name": approval_request.tool_name,
+                "operation": approval_request.operation,
+                "risk": approval_request.risk.value,
+                "summary": approval_request.summary[:500],
+                "approval_expires_at": approval_request.expires_at,
+            })
+        waiting_status = "waiting_approval" if approval_request is not None else "waiting_user"
+        return self.store.transition_task_run(
+            user_id, task_id, expected_status=task["status"],
+            expected_version=int(task["version"]), new_status=waiting_status,
+            wait_reason=f"question:{question_id}",
+            event_type="task.question_issued", event_payload=payload,
+        )
+
+    def accept_reply(
+        self, user_id: str, task_id: str, *, question_id: str, answer: str,
+        source_message_id: str,
+    ) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] not in {"waiting_user", "waiting_approval"} or task["wait_reason"] != f"question:{question_id}":
+            raise ValueError("reply does not match a task waiting on this question")
+        events = task["events"]
+        question_events = [e for e in events if e["event_type"] == "task.question_issued"]
+        if not question_events:
+            raise ValueError("pending task question is missing")
+        question = question_events[-1]["payload"]
+        if question.get("question_id") != question_id:
+            raise ValueError("reply question ID does not match the latest pending question")
+        expires_at = question.get("expires_at")
+        if expires_at:
+            try:
+                expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("persisted task question has an invalid expiry") from exc
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if expiry <= datetime.now(timezone.utc):
+                changed = self.store.transition_task_run(
+                    user_id, task_id, expected_status=task["status"],
+                    expected_version=int(task["version"]), new_status="cancelled",
+                    wait_reason=None, event_type="task.question_expired",
+                    event_payload={"question_id": question_id},
+                )
+                return {"task": changed, "answer": "", "question": question, "approval": None}
+        if any(
+            e["event_type"] in {"task.reply_matched", "task.approval_recorded", "task.approval_reply_received"}
+            and e["payload"].get("question_id") == question_id
+            for e in events
+        ):
+            raise ValueError("task question has already been answered")
+        answer_text = str(answer).strip()
+        allowed = question.get("allowed_answers") or {}
+        answer_type = allowed.get("type")
+        if answer_type == "enum" and answer_text not in set(allowed.get("enum") or []):
+            raise ValueError("reply is outside the allowed answer choices")
+        approval: HumanApproval | None = None
+        if question.get("approval_id"):
+            from src.services.authorization import ApprovalStatus, RiskTier
+            approved = answer_text.casefold() in {"yes", "approve", "approved", "allow"}
+            approval_request = ApprovalRequest(
+                approval_id=question["approval_id"],
+                request_fingerprint=question["action_fingerprint"],
+                tool_name=question["tool_name"],
+                operation=question["operation"],
+                risk=RiskTier(question["risk"]),
+                summary=question.get("summary", ""),
+                expires_at=float(question["approval_expires_at"]),
+            )
+            approval = approve_request(
+                approval_request, approved=approved, approved_by=user_id
+            )
+        approval_pending_execution = bool(question.get("approval_id") and approval and approval.approved)
+        denied_approval = bool(question.get("approval_id") and approval and not approval.approved)
+        next_status = (
+            "waiting_approval" if approval_pending_execution
+            else "cancelled" if denied_approval
+            else "queued"
+        )
+        reply_payload: dict[str, Any] = {
+            "question_id": question_id, "source_message_id": source_message_id,
+        }
+        if approval is not None:
+            reply_payload.update({
+                "approval_id": approval.approval_id,
+                "action_fingerprint": approval.request_fingerprint,
+                "approval_status": approval.status.value,
+                "approved_by": approval.approved_by,
+                "decided_at": approval.decided_at,
+            })
+        changed = self.store.transition_task_run(
+            user_id, task_id, expected_status=task["status"],
+            expected_version=int(task["version"]), new_status=next_status,
+            wait_reason=f"resume_after_reply:{question_id}" if not approval else None,
+            event_type="task.approval_reply_received" if approval else "task.reply_matched",
+            event_payload=reply_payload,
+        )
+        return {"task": changed, "answer": answer_text, "question": question, "approval": approval}
+
+    def match_waiting_reply(
+        self, user_id: str, session_id: str, content: str
+    ) -> dict[str, str] | None:
+        """Find one exact, typed enum answer; ambiguous/free text stays a new turn."""
+        matches: list[dict[str, str]] = []
+        for listed in self.store.list_tasks(user_id, statuses=["waiting_user"], limit=100):
+            task = self.store.get_task(user_id, listed["task_id"])
+            if task["session_key"] != session_id:
+                continue
+            questions = [e for e in task["events"] if e["event_type"] == "task.question_issued"]
+            if not questions:
+                continue
+            question = questions[-1]["payload"]
+            allowed = question.get("allowed_answers") or {}
+            if allowed.get("type") != "enum":
+                continue
+            answer = next((str(item) for item in allowed.get("enum", [])
+                           if str(item).strip().casefold() == str(content).strip().casefold()), None)
+            if answer is not None:
+                matches.append({
+                    "task_id": task["task_id"],
+                    "question_id": str(question.get("question_id") or ""),
+                    "answer": answer,
+                    "question": str(question.get("question") or ""),
+                })
+        return matches[0] if len(matches) == 1 and matches[0]["question_id"] else None
+
+    def get_persisted_reply(self, user_id: str, task_id: str) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        replies = [e for e in task["events"] if e["event_type"] == "task.reply_matched"]
+        if not replies:
+            raise ValueError("task has no persisted user reply")
+        event = replies[-1]
+        message = self.store.get_message(
+            user_id, task["session_key"], event["payload"]["source_message_id"],
+            channel_id=task.get("channel_id"), thread_id=task.get("thread_id"),
+        )
+        question_id = event["payload"].get("question_id")
+        question = next((e["payload"] for e in reversed(task["events"])
+                         if e["event_type"] == "task.question_issued"
+                         and e["payload"].get("question_id") == question_id), {})
+        return {"answer": message["content"], "question": question, "message": message}
+
+    def surface_reconciliation_once(self, user_id: str, task_id: str) -> bool:
+        """Atomically claim the task's sole notice attempt before external delivery.
+
+        This provides at-most-once delivery attempts. A process crash or chat API
+        failure after the claim is intentionally not retried because that could
+        duplicate a notice whose delivery outcome is itself ambiguous.
+        """
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] != "needs_reconciliation":
+            return False
+        if any(e["event_type"] in {
+            "task.reconciliation_surfaced", "task.reconciliation_notice_claimed"
+        } for e in task["events"]):
+            return False
+        try:
+            self.store.append_task_event(
+                user_id, task_id, event_type="task.reconciliation_notice_claimed",
+                payload={"status": task["status"], "reason_code": task["wait_reason"] or "unknown"},
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def reconciliation_notice_pending(self, user_id: str, task_id: str) -> bool:
+        task = self.store.get_task(user_id, task_id)
+        return task["status"] == "needs_reconciliation" and not any(
+            e["event_type"] in {
+                "task.reconciliation_surfaced", "task.reconciliation_notice_claimed"
+            } for e in task["events"]
+        )
+
+    def cancel(self, user_id: str, task_id: str) -> dict[str, Any]:
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] in {"succeeded", "partial", "failed", "cancelled"}:
+            return task
+        return self.store.transition_task_run(
+            user_id, task_id, expected_status=task["status"],
+            expected_version=int(task["version"]), new_status="cancelled",
+            cancellation_requested=True,
+        )
+
+
+__all__ = ["TaskController"]

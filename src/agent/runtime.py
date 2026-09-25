@@ -24,6 +24,9 @@ EventSink = Callable[[AgentEvent], Awaitable[None] | None]
 CURRENT_TURN_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "delilah_current_turn_id", default=None
 )
+CURRENT_TASK_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "delilah_current_task_id", default=None
+)
 CURRENT_SESSION_KEY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "delilah_current_session_key", default=None
 )
@@ -70,11 +73,14 @@ class AgentRuntime:
         turn_id = f"turn_{uuid.uuid4().hex}"
         started = time.monotonic()
         turn_token = CURRENT_TURN_ID.set(turn_id)
+        task_token = CURRENT_TASK_ID.set(None)
         session_token = CURRENT_SESSION_KEY.set(request.resolved_session_key())
         channel_token = CURRENT_CHANNEL_ID.set(request.message.channel_id)
         thread_token = CURRENT_THREAD_ID.set(request.message.thread_id)
         try:
-            await _maybe_call(self.hooks.before_run, request, turn_id)
+            task_id = await _maybe_call(self.hooks.before_run, request, turn_id)
+            if task_id:
+                CURRENT_TASK_ID.set(str(task_id))
             await _maybe_call(
                 self.hooks.emit,
                 AgentEvent("turn_started", request.request_id, turn_id, {"session_key": request.resolved_session_key()}),
@@ -101,6 +107,7 @@ class AgentRuntime:
                 )
             finally:
                 CURRENT_TURN_ID.reset(turn_token)
+                CURRENT_TASK_ID.reset(task_token)
                 CURRENT_SESSION_KEY.reset(session_token)
                 CURRENT_CHANNEL_ID.reset(channel_token)
                 CURRENT_THREAD_ID.reset(thread_token)
@@ -125,6 +132,7 @@ class AgentRuntime:
                 )
             finally:
                 CURRENT_TURN_ID.reset(turn_token)
+                CURRENT_TASK_ID.reset(task_token)
                 CURRENT_SESSION_KEY.reset(session_token)
                 CURRENT_CHANNEL_ID.reset(channel_token)
                 CURRENT_THREAD_ID.reset(thread_token)
@@ -144,6 +152,7 @@ class AgentRuntime:
             return result
         finally:
             CURRENT_TURN_ID.reset(turn_token)
+            CURRENT_TASK_ID.reset(task_token)
             CURRENT_SESSION_KEY.reset(session_token)
             CURRENT_CHANNEL_ID.reset(channel_token)
             CURRENT_THREAD_ID.reset(thread_token)
@@ -155,5 +164,6 @@ __all__ = [
     "CURRENT_SESSION_KEY",
     "CURRENT_TURN_ID",
     "CURRENT_THREAD_ID",
+    "CURRENT_TASK_ID",
     "RuntimeHooks",
 ]

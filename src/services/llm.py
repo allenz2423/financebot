@@ -70,10 +70,12 @@ from src.agent.runtime import (
     CURRENT_CHANNEL_ID,
     CURRENT_SESSION_KEY,
     CURRENT_THREAD_ID,
+    CURRENT_TASK_ID,
     CURRENT_TURN_ID,
     RuntimeHooks,
 )
 from src.db.session_store import SessionStore
+from src.agent.task_controller import TaskController
 
 import os
 import re
@@ -98,6 +100,10 @@ from html import unescape
 # start of every advisor round.
 _OPENROUTER_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
 _DURABLE_SESSION_STORE: SessionStore | None = None
+_STEP2_MIGRATED_TOOLS = frozenset({
+    "search_gmail", "read_gmail_message", "monitor_create_natural_rule",
+    "monitor_add_rule", "monitor_list_rules",
+})
 
 
 def _durable_session_store() -> SessionStore | None:
@@ -128,17 +134,20 @@ def _record_durable_tool_call(
     status: str,
     result: object = None,
     error: str | None = None,
-) -> None:
+    required: bool = False,
+) -> dict | None:
     """Best-effort durable tool lifecycle recording for the active turn."""
 
     store = _durable_session_store()
     turn_id = CURRENT_TURN_ID.get()
     session_id = CURRENT_SESSION_KEY.get()
     if store is None or not turn_id or not session_id or not call_id:
-        return
+        if required:
+            raise RuntimeError("durable tool-call context is unavailable")
+        return None
     try:
         if status in {"pending", "running"}:
-            store.record_tool_call(
+            return store.record_tool_call(
                 user_id,
                 session_id,
                 tool_name=tool_name,
@@ -150,7 +159,7 @@ def _record_durable_tool_call(
                 thread_id=CURRENT_THREAD_ID.get(),
             )
         else:
-            store.finish_tool_call(
+            return store.finish_tool_call(
                 user_id,
                 session_id,
                 call_id,
@@ -168,6 +177,9 @@ def _record_durable_tool_call(
             f" [SESSION STORE] tool lifecycle failed tool={tool_name}: "
             f"{type(exc).__name__}: {exc}"
         )
+        if required:
+            raise
+        return None
 
 
 def _redact_inline_credentials(text: str) -> str:
@@ -4260,7 +4272,7 @@ async def _chat_with_delilah_impl(
     # optional model suggestion. Completion guards below require a successful
     # trace entry for each inferred tool before the turn may finish.
     required_tools = set(required_tools or ()) | set(infer_required_tools(prompt_text))
-    turn_id = f"turn_{uuid.uuid4().hex}"
+    turn_id = CURRENT_TURN_ID.get() or f"turn_{uuid.uuid4().hex}"
     # Raw credential text must never enter the model context or in-memory
     # conversation history, even if a user ignores the secure capture flow.
     prompt_text = _redact_inline_credentials(prompt_text)
@@ -7876,7 +7888,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 )
                 receipt_id = f"receipt_{uuid.uuid4().hex}"
                 receipt_status = "started"
+                receipt_prepared = False
                 receipt_started = False
+                task_step_id = None
                 ambiguous_side_effect = False
                 grant_id = None
                 try:
@@ -7979,6 +7993,33 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             "INVALID_TOOL_PARAMS: call was rejected before execution. "
                             f"Correct the arguments and retry. Reason: {schema_error}"
                         )
+
+                    active_task_id = CURRENT_TASK_ID.get()
+                    if active_task_id and func_name in _STEP2_MIGRATED_TOOLS:
+                        task_store = _durable_session_store()
+                        if task_store is None:
+                            raise RuntimeError("task store unavailable; refusing untracked dispatch")
+                        active_task = task_store.get_task(uid, active_task_id)
+                        if active_task["status"] not in {"queued", "running"}:
+                            raise PermissionError(
+                                "TASK_NOT_DISPATCHABLE: task is waiting, terminal, or needs reconciliation; "
+                                "no tool was invoked."
+                            )
+                        if (
+                            task_store.task_requires_monitor_readback(uid, active_task_id)
+                            and func_name != "monitor_list_rules"
+                        ):
+                            raise PermissionError(
+                                "MONITOR_READBACK_REQUIRED: the task's confirmed monitor insert "
+                                "must be verified with monitor_list_rules before another action."
+                            )
+                        if task_store.has_confirmed_task_call(
+                            uid, active_task_id, tool_name=func_name, arguments=args
+                        ):
+                            raise ValueError(
+                                "TASK_STEP_ALREADY_CONFIRMED: this exact tool action has "
+                                "confirmed evidence in the resumed task; do not repeat it."
+                            )
 
                     # Dynamic audit activation: a worklist/getter tool can activate
                     # the audit controller even when the original user prompt was
@@ -8100,6 +8141,27 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     # fails, the surrounding error path prevents the tool
                     # implementation from running, so no side effect can
                     # become untracked.
+                    task_id = CURRENT_TASK_ID.get()
+                    track_task_step = bool(task_id and func_name in _STEP2_MIGRATED_TOOLS)
+                    task_step_id = None
+                    task_controller = None
+                    if track_task_step:
+                        task_store = _durable_session_store()
+                        if task_store is None:
+                            raise RuntimeError("durable task store is unavailable before dispatch")
+                        task_controller = TaskController(task_store)
+                        pending_step = task_controller.prepare_step(
+                            uid, task_id, tool_name=func_name
+                        )
+                        task_step_id = pending_step["step_id"]
+                    durable_call = _record_durable_tool_call(
+                        user_id=uid,
+                        tool_name=func_name or "unknown_tool",
+                        arguments=args,
+                        call_id=call_id,
+                        status="running",
+                        required=track_task_step,
+                    )
                     receipt_store.prepare(
                         receipt_id=receipt_id,
                         call_id=call_id,
@@ -8110,15 +8172,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         origin=call_origin,
                         arguments=args,
                     )
+                    receipt_prepared = True
+                    if track_task_step:
+                        if durable_call is None:
+                            raise RuntimeError("durable task requires a persisted tool-call row")
+                        task_controller.link_call_to_step(
+                            uid, task_id, task_step_id, tool_call_id=int(durable_call["id"])
+                        )
+                        task_controller.claim_step(
+                            uid, task_id, task_step_id, receipt_id=receipt_id
+                        )
                     receipt_store.start(receipt_id)
                     receipt_started = True
-                    _record_durable_tool_call(
-                        user_id=uid,
-                        tool_name=func_name or "unknown_tool",
-                        arguments=args,
-                        call_id=call_id,
-                        status="running",
-                    )
 
                     tool_call_counts[func_name] = tool_call_counts.get(func_name, 0) + 1
 
@@ -10092,6 +10157,34 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     print(
                         f" [TOOL EXECUTION ERROR] {tool_label}: {type(tool_err).__name__}: {tool_err}"
                     )
+                    if receipt_prepared and not receipt_started:
+                        # The tool body is below the successful start boundary,
+                        # so this process knows no dispatch occurred. Close the
+                        # prepared lifecycle as failed instead of leaving a
+                        # phantom running task step for restart recovery.
+                        try:
+                            receipt_store.finish(
+                                receipt_id, status="failed", ok=False, complete=False,
+                                error=f"dispatch_not_started:{type(tool_err).__name__}",
+                            )
+                            receipt_status = "failed"
+                            _record_durable_tool_call(
+                                user_id=uid, tool_name=func_name or "unknown_tool",
+                                arguments=args, call_id=call_id, status="failed",
+                                error=f"dispatch_not_started:{type(tool_err).__name__}",
+                                required=bool(CURRENT_TASK_ID.get()),
+                            )
+                            if task_step_id and CURRENT_TASK_ID.get():
+                                task_store = _durable_session_store()
+                                if task_store is not None:
+                                    TaskController(task_store).finish_step(
+                                        uid, CURRENT_TASK_ID.get(), task_step_id,
+                                        outcome="failed",
+                                    )
+                        except Exception as cleanup_err:
+                            # A lost acknowledgement is treated as unknown by
+                            # the next receipt-based recovery sweep.
+                            print(f" [TASK STATE] pre-dispatch cleanup uncertain: {cleanup_err}")
                     try:
                         print(
                             f"   Tool payload: {json.dumps(tool_call, default=str)[:4000]}"
@@ -10163,6 +10256,30 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         result=db_result if receipt_status == "confirmed" else None,
                         error="" if receipt_status == "confirmed" else str(db_result),
                     )
+                    if CURRENT_TASK_ID.get() and task_step_id:
+                        try:
+                            TaskController(_durable_session_store()).finish_step(
+                                uid,
+                                CURRENT_TASK_ID.get(),
+                                task_step_id,
+                                outcome=(
+                                    "confirmed" if receipt_status == "confirmed"
+                                    else "unknown" if receipt_status == "unknown"
+                                    else "failed"
+                                ),
+                                reason=(
+                                    "receipt_outcome_unknown"
+                                    if receipt_status == "unknown" else None
+                                ),
+                            )
+                        except Exception as task_err:
+                            # The receipt is authoritative. If task projection
+                            # cannot be finalized, recovery will reconcile it
+                            # from this linked receipt on the next interaction.
+                            print(
+                                f" [TASK STATE] step finalization failed task={CURRENT_TASK_ID.get()}: "
+                                f"{type(task_err).__name__}: {task_err}"
+                            )
 
                 # Keep terminal/runtime logging verbose, but make model-facing tool results compact.
                 # SQLite remains the source of truth; detailed before/after state belongs in the audit log.
@@ -11161,6 +11278,9 @@ async def chat_with_delilah(
     reply_msg,
     image_b64_list: list[str] | None = None,
     required_tools: set[str] | None = None,
+    resume_task_id: str | None = None,
+    resume_question_id: str | None = None,
+    resume_answer: str | None = None,
 ) -> str:
     """Cancellable, observable wrapper. Turn timeout is a 2-hour safety net only."""
     print(
@@ -11198,10 +11318,10 @@ async def chat_with_delilah(
             "thread_id": request.message.thread_id,
         }
 
-    def _safe_session_begin(request: TurnRequest, turn_id: str) -> None:
+    async def _safe_session_begin(request: TurnRequest, turn_id: str) -> str | None:
         store = _durable_session_store()
         if store is None:
-            return
+            return None
         scope = _session_scope(request)
         try:
             store.begin_turn(
@@ -11217,14 +11337,91 @@ async def chat_with_delilah(
                 scope["user_id"],
                 scope["session_id"],
                 role="user",
-                content=_redact_inline_credentials(request.message.text),
+                content=_redact_inline_credentials(
+                    resume_answer if resume_task_id and resume_question_id and resume_answer is not None
+                    else request.message.text
+                ),
                 message_id=request.request_id,
                 turn_id=turn_id,
                 channel_id=scope["channel_id"],
                 thread_id=scope["thread_id"],
             )
+            controller = TaskController(store)
+            for pending in store.list_tasks(
+                scope["user_id"], statuses=["needs_reconciliation"], limit=100
+            ):
+                task_scope = store.get_task(scope["user_id"], pending["task_id"])
+                if task_scope["session_key"] != scope["session_id"]:
+                    continue
+                if controller.reconciliation_notice_pending(scope["user_id"], pending["task_id"]):
+                    channel = getattr(reply_msg, "channel", None)
+                    if channel is not None and controller.surface_reconciliation_once(
+                        scope["user_id"], pending["task_id"]
+                    ):
+                        try:
+                            await channel.send(
+                                "A previous task may have completed an action whose outcome "
+                                f"could not be confirmed (task `{pending['task_id']}`). "
+                                "I have not retried it. Please reconcile its linked receipt "
+                                "or monitor record before continuing that action."
+                            )
+                        except Exception as notify_err:
+                            print(f" [TASK NOTICE] delivery failed: {notify_err}")
+            recovered = controller.recover_incomplete(
+                scope["user_id"], ReceiptStore(store.connection)
+            )
+            for item in recovered:
+                if item["status"] == "needs_reconciliation":
+                    pending = store.get_task(scope["user_id"], item["task_id"])
+                    if pending["session_key"] != scope["session_id"]:
+                        continue
+                    if controller.reconciliation_notice_pending(
+                        scope["user_id"], pending["task_id"]
+                    ):
+                        channel = getattr(reply_msg, "channel", None)
+                        if channel is not None and controller.surface_reconciliation_once(
+                            scope["user_id"], pending["task_id"]
+                        ):
+                            try:
+                                await channel.send(
+                                    "A task was interrupted after an action began, so its "
+                                    f"outcome is uncertain (`{pending['task_id']}`). I did "
+                                    "not replay it. Please reconcile the linked receipt "
+                                    "before retrying."
+                                )
+                            except Exception as notify_err:
+                                print(f" [TASK NOTICE] delivery failed: {notify_err}")
+            if resume_task_id:
+                prior = store.get_task(scope["user_id"], resume_task_id)
+                if prior["session_key"] != scope["session_id"]:
+                    raise PermissionError("task belongs to a different conversation scope")
+                if resume_question_id:
+                    resumed = controller.accept_reply(
+                        scope["user_id"], resume_task_id,
+                        question_id=resume_question_id,
+                        answer=resume_answer if resume_answer is not None else prompt_text,
+                        source_message_id=request.request_id,
+                    )
+                    if resumed["approval"] is not None:
+                        raise PermissionError(
+                            "approval reply is not connected to an action-bound execution grant"
+                        )
+                    if resumed["task"]["status"] != "queued":
+                        raise ValueError("task question expired or did not authorize resumption")
+                else:
+                    controller.resume_ready_task(scope["user_id"], resume_task_id)
+                return str(resume_task_id)
+            task_record = controller.create_turn(
+                scope["user_id"], scope["session_id"], turn_id,
+                _redact_inline_credentials(request.message.text),
+                channel_id=scope["channel_id"], thread_id=scope["thread_id"],
+            )
+            return str(task_record["task_id"])
         except Exception as exc:
             print(f" [SESSION STORE] begin failed uid={uid}: {type(exc).__name__}: {exc}")
+            # A live store that rejected task creation must not silently drop
+            # the durable orchestration boundary. No tool has run yet.
+            raise
 
     def _safe_session_finish(
         request: TurnRequest, turn_id: str, result: str, duration: float
@@ -11253,6 +11450,9 @@ async def chat_with_delilah(
                 channel_id=scope["channel_id"],
                 thread_id=scope["thread_id"],
             )
+            task_id = CURRENT_TASK_ID.get()
+            if task_id:
+                TaskController(store).finish_turn(scope["user_id"], task_id)
         except Exception as exc:
             print(f" [SESSION STORE] finish failed uid={uid}: {type(exc).__name__}: {exc}")
 
@@ -11273,6 +11473,11 @@ async def chat_with_delilah(
                 channel_id=scope["channel_id"],
                 thread_id=scope["thread_id"],
             )
+            task_id = CURRENT_TASK_ID.get()
+            if task_id:
+                TaskController(store).finish_turn(
+                    scope["user_id"], task_id, failed=True
+                )
         except Exception as exc:
             print(f" [SESSION STORE] error update failed uid={uid}: {type(exc).__name__}: {exc}")
 

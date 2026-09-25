@@ -570,6 +570,16 @@ class ReceiptStore:
             error=row[12] or "",
         )
 
+    def list_for_call(self, call_id: str, *, user_id: str) -> list[ToolReceipt]:
+        """Owner-scoped receipt lookup for the pre-link crash window."""
+        self.ensure_schema()
+        rows = self.connection.execute(
+            """SELECT receipt_id FROM tool_receipts
+               WHERE call_id=? AND user_id=? ORDER BY created_at, receipt_id""",
+            (str(call_id), str(user_id)),
+        ).fetchall()
+        return [self.get(str(row[0])) for row in rows]
+
     def _transition(self, receipt_id: str, status: str, **fields: Any) -> ToolReceipt:
         current = self.get(receipt_id)
         if status not in ALLOWED_TRANSITIONS.get(current.status, frozenset()):

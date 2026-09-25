@@ -5308,6 +5308,19 @@ class _AdvisorReplyHandle:
         self.placeholder = placeholder
 
 
+def _match_waiting_task_reply(user_id: str, channel_id: str, content: str):
+    """Match only an unambiguous exact enum reply in this owner/channel."""
+    from src.db.session_store import SessionStore
+    from src.agent.task_controller import TaskController
+
+    session_key = f"discord:{user_id}:{channel_id}:thread:default"
+    store = SessionStore(src.core.state.DB_PATH)
+    try:
+        return TaskController(store).match_waiting_reply(user_id, session_key, content)
+    finally:
+        store.close()
+
+
 async def _send_thinking_placeholder(message: discord.Message, handle: _AdvisorReplyHandle):
     """Best-effort placeholder. It is never allowed to block advisor execution."""
     user_id = str(message.author.id)
@@ -5323,6 +5336,115 @@ async def _send_thinking_placeholder(message: discord.Message, handle: _AdvisorR
         raise
     except Exception as exc:
         print(f" [MESSAGE] Thinking placeholder failed: {type(exc).__name__}: {exc}")
+
+
+@bot.command(name="resume")
+async def resume_task_command(ctx: commands.Context, task_id: str, *, response: str = ""):
+    """Explicitly continue an interrupted task or answer its persisted question.
+
+    Awaiting a question: ``!resume TASK_ID QUESTION_ID | answer``.
+    Restart-recovered task: ``!resume TASK_ID``.
+    """
+    uid = str(ctx.author.id)
+    question_id = None
+    answer = ""
+    if response:
+        if "|" not in response:
+            await ctx.send("Use `!resume TASK_ID QUESTION_ID | your answer` for a pending question.")
+            return
+        question_id, answer = (part.strip() for part in response.split("|", 1))
+        if not question_id or not answer:
+            await ctx.send("Both the pending question ID and answer are required.")
+            return
+    try:
+        from src.db.session_store import SessionStore
+        from src.agent.task_controller import TaskController
+
+        store = SessionStore(src.core.state.DB_PATH)
+        try:
+            task_record = store.get_task(uid, task_id)
+            current_session = f"discord:{uid}:{ctx.channel.id}:thread:default"
+            if task_record["session_key"] != current_session:
+                raise PermissionError("task is not in this owner/channel conversation")
+            if question_id:
+                if task_record["status"] == "waiting_approval":
+                    decision = TaskController(store).accept_reply(
+                        uid, task_id, question_id=question_id, answer=answer,
+                        source_message_id=str(getattr(ctx.message, "id", "")),
+                    )
+                    if decision["approval"] and decision["approval"].approved:
+                        await ctx.send(
+                            "That approval is recorded against the exact action, but this "
+                            "runtime cannot yet bind it to execution. No tool was dispatched; "
+                            "the task remains safely blocked for operator review."
+                        )
+                    else:
+                        await ctx.send("The pending action was not approved and has been cancelled.")
+                    return
+                if task_record["status"] != "waiting_user":
+                    raise ValueError("task is not awaiting a user reply")
+                question = next(
+                    (event["payload"].get("question") for event in reversed(task_record["events"])
+                     if event["event_type"] == "task.question_issued"),
+                    "the pending decision",
+                )
+                resume_prompt = (
+                    f"The user answered the persisted task question {question_id!r}: {answer}\n"
+                    f"Question: {question}\nContinue the existing task from its pending step. "
+                    "Do not repeat completed steps; report only outcomes supported by receipts."
+                )
+            else:
+                task_record = TaskController(store).resume_ready_task(uid, task_id)
+                statuses = ", ".join(
+                    f"{step['step_order']}:{step['status']}"
+                    for step in task_record["steps"]
+                ) or "no dispatched steps"
+                persisted_reply = None
+                if str(task_record.get("wait_reason") or "").startswith("resume_after_reply:"):
+                    persisted_reply = TaskController(store).get_persisted_reply(uid, task_id)
+                resume_prompt = (
+                    "Continue this explicitly resumed task after process recovery.\n"
+                    f"Objective: {task_record['objective']}\n"
+                    f"Previously persisted step states: {statuses}\n"
+                )
+                if persisted_reply:
+                    resume_prompt += (
+                        f"The user's persisted answer to the pending question was: "
+                        f"{persisted_reply['answer']}\nQuestion: "
+                        f"{persisted_reply['question'].get('question', '')}\n"
+                    )
+                resume_prompt += (
+                    "Never repeat a step marked succeeded. Do not retry any started/unknown "
+                    "side effect; stop for reconciliation if its receipt is ambiguous."
+                )
+        finally:
+            store.close()
+    except Exception as exc:
+        await ctx.send(f"I can't resume that task: {type(exc).__name__}: {exc}")
+        return
+
+    handle = _AdvisorReplyHandle(ctx.channel, source_message_id=getattr(ctx.message, "id", None))
+    async with ADVISOR_TASK_REGISTRATION_LOCK:
+        existing = ACTIVE_ADVISOR_TASKS.get(uid)
+        if existing is not None and not existing.done():
+            await ctx.send("Your current request is still running; resume it after that turn finishes.")
+            return
+        task = asyncio.create_task(
+            chat_with_delilah(
+                resume_prompt, ctx.author.id, handle,
+                resume_task_id=task_id, resume_question_id=question_id,
+                resume_answer=answer if question_id else None,
+            ),
+            name=f"advisor:resume:{uid}:{task_id}",
+        )
+        ACTIVE_ADVISOR_TASKS[uid] = task
+    try:
+        await task
+    except Exception as exc:
+        await ctx.send(f"Task resume failed safely: `{type(exc).__name__}: {exc}`")
+    finally:
+        if ACTIVE_ADVISOR_TASKS.get(uid) is task:
+            ACTIVE_ADVISOR_TASKS.pop(uid, None)
 
 
 async def _run_queued_advisor_item(uid: str, item: dict) -> None:
@@ -5689,11 +5811,34 @@ async def on_message(message: discord.Message):
                     print(f" [MESSAGE] busy response failed: {type(exc).__name__}: {exc}")
                 return
 
+            resume_match = None
+            try:
+                resume_match = _match_waiting_task_reply(
+                    str(uid), str(message.channel.id), prompt
+                ) if prompt else None
+            except Exception as match_err:
+                print(f" [TASK REPLY] matching failed safely: {type(match_err).__name__}: {match_err}")
+            advisor_prompt = prompt
+            resume_options = {}
+            if resume_match:
+                advisor_prompt = (
+                    f"The user answered the pending task question: {resume_match['answer']}\n"
+                    f"Question: {resume_match['question']}\n"
+                    "Continue that task from its pending step. Do not repeat completed steps; "
+                    "report only outcomes supported by receipts."
+                )
+                resume_options = {
+                    "resume_task_id": resume_match["task_id"],
+                    "resume_question_id": resume_match["question_id"],
+                    "resume_answer": resume_match["answer"],
+                }
+
             # Register/create the advisor BEFORE any Discord reply API call.
             # A stalled message.reply() must never prevent the actual request from running.
             task = asyncio.create_task(
                 chat_with_delilah(
-                    prompt, message.author.id, handle, image_b64_list=images
+                    advisor_prompt, message.author.id, handle,
+                    image_b64_list=images, **resume_options,
                 ),
                 name=f"advisor:{message.author.id}:{message_id}",
             )

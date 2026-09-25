@@ -1,0 +1,453 @@
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from src.agent.task_controller import TaskController
+from src.db.session_store import SessionStore
+from src.services.authorization import (
+    AuthorizationRequest,
+    RiskTier,
+    ToolPolicy,
+    build_approval_request,
+    evaluate_policy,
+)
+from src.services.tool_receipts import ReceiptStore
+
+
+@pytest.fixture
+def task_env():
+    conn = sqlite3.connect(":memory:", check_same_thread=False, isolation_level=None)
+    store = SessionStore(connection=conn)
+    receipts = ReceiptStore(conn)
+    receipts.ensure_schema()
+    conn.execute(
+        "INSERT INTO monitor_rules(id,user_id,name,kind,config) VALUES (1,'owner','x','large_deposit','{}')"
+    )
+    controller = TaskController(store)
+    store.begin_turn("owner", "session", turn_id="turn-1")
+    controller.create_turn("owner", "session", "turn-1", "Create a monitor")
+    call = store.record_tool_call(
+        "owner", "session", tool_name="monitor_add_rule", arguments={"name": "x"},
+        call_id="call-1", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="receipt-1", call_id="call-1", user_id="owner", turn_id="turn-1",
+        round_id=1, tool_name="monitor_add_rule", origin="native", arguments={"name": "x"},
+    )
+    return store, receipts, controller, call
+
+
+def test_task_step_is_linked_before_dispatch_and_confirmed_completion(task_env):
+    store, receipts, controller, call = task_env
+    claimed = controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="monitor_add_rule",
+    )
+    assert claimed["task"]["status"] == "running"
+    assert claimed["step"]["status"] == "running"
+    assert claimed["step"]["receipt_id"] == "receipt-1"
+    receipts.start("receipt-1")
+    receipts.finish(
+        "receipt-1", status="confirmed", ok=True, complete=True,
+        result_summary="Created monitor rule #1: x.",
+    )
+    task = controller.finish_step(
+        "owner", "task_turn-1", claimed["step"]["step_id"], outcome="confirmed"
+    )
+    assert task["steps"][0]["status"] == "succeeded"
+    assert store.task_requires_monitor_readback("owner", "task_turn-1")
+    assert store.has_confirmed_task_call(
+        "owner", "task_turn-1", tool_name="monitor_add_rule", arguments={"name": "x"}
+    )
+    queued = controller.finish_turn("owner", "task_turn-1")
+    assert queued["status"] == "queued"
+    assert queued["wait_reason"] == "monitor_readback_required"
+    list_call = store.record_tool_call(
+        "owner", "session", tool_name="monitor_list_rules", arguments={},
+        call_id="list-call", turn_id="turn-1", status="running",
+    )
+    step = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_list_rules")
+    controller.link_call_to_step(
+        "owner", "task_turn-1", step["step_id"], tool_call_id=list_call["id"]
+    )
+    receipts.prepare(
+        receipt_id="list-receipt", call_id="list-call", user_id="owner", turn_id="turn-1",
+        round_id=2, tool_name="monitor_list_rules", origin="native", arguments={},
+    )
+    controller.claim_step("owner", "task_turn-1", step["step_id"], receipt_id="list-receipt")
+    receipts.start("list-receipt")
+    receipts.finish(
+        "list-receipt", status="confirmed", ok=True, complete=True,
+        result_summary="Monitor rules (1):\n- #1 [on] x (large_deposit) config={}",
+    )
+    controller.finish_step("owner", "task_turn-1", step["step_id"], outcome="confirmed")
+    assert not store.task_requires_monitor_readback("owner", "task_turn-1")
+    assert controller.finish_turn("owner", "task_turn-1")["status"] == "succeeded"
+
+
+def test_monitor_readback_must_match_owner_scoped_rule_details(task_env):
+    store, receipts, controller, call = task_env
+    created = controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="monitor_add_rule",
+    )
+    receipts.start("receipt-1")
+    receipts.finish(
+        "receipt-1", status="confirmed", ok=True, complete=True,
+        result_summary="Created monitor rule #1: x.",
+    )
+    controller.finish_step("owner", "task_turn-1", created["step"]["step_id"], outcome="confirmed")
+    listed = store.record_tool_call(
+        "owner", "session", tool_name="monitor_list_rules", arguments={},
+        call_id="bad-list-call", turn_id="turn-1", status="running",
+    )
+    list_step = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_list_rules")
+    controller.link_call_to_step("owner", "task_turn-1", list_step["step_id"], tool_call_id=listed["id"])
+    receipts.prepare(
+        receipt_id="bad-list-receipt", call_id="bad-list-call", user_id="owner", turn_id="turn-1",
+        round_id=2, tool_name="monitor_list_rules", origin="native", arguments={},
+    )
+    controller.claim_step("owner", "task_turn-1", list_step["step_id"], receipt_id="bad-list-receipt")
+    receipts.start("bad-list-receipt")
+    receipts.finish(
+        "bad-list-receipt", status="confirmed", ok=True, complete=True,
+        result_summary="Monitor rules (1):\n- #1 [on] different-name (large_deposit) config={}",
+    )
+    controller.finish_step("owner", "task_turn-1", list_step["step_id"], outcome="confirmed")
+    assert store.task_requires_monitor_readback("owner", "task_turn-1")
+    assert controller.finish_turn("owner", "task_turn-1")["status"] == "queued"
+
+
+def test_unknown_outcome_is_not_retried_and_is_surfaced_once(task_env):
+    store, receipts, controller, call = task_env
+    claimed = controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="monitor_add_rule",
+    )
+    receipts.start("receipt-1")
+    receipts.finish("receipt-1", status="unknown", ok=False, complete=False)
+    task = controller.finish_step(
+        "owner", "task_turn-1", claimed["step"]["step_id"], outcome="unknown"
+    )
+    assert task["status"] == "needs_reconciliation"
+    assert task["steps"][0]["status"] == "needs_reconciliation"
+    assert controller.surface_reconciliation_once("owner", task["task_id"])
+    assert not controller.surface_reconciliation_once("owner", task["task_id"])
+    with pytest.raises(ValueError, match="not dispatchable"):
+        controller.prepare_step("owner", task["task_id"], tool_name="monitor_add_rule")
+    with pytest.raises(ValueError, match="not dispatchable"):
+        controller.prepare_step("owner", task["task_id"], tool_name="monitor_add_rule")
+    with pytest.raises(ValueError, match="not dispatchable"):
+        controller.prepare_step("owner", task["task_id"], tool_name="monitor_add_rule")
+    assert controller.finish_turn("owner", task["task_id"])["status"] == "needs_reconciliation"
+
+
+def test_restart_projects_confirmed_receipt_and_only_allows_explicit_resume(task_env):
+    store, receipts, controller, call = task_env
+    claimed = controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="search_gmail",
+    )
+    receipts.start("receipt-1")
+    receipts.finish("receipt-1", status="confirmed", ok=True, complete=True)
+    restarted = TaskController(SessionStore(connection=store.connection))
+    result = restarted.recover_incomplete("owner", receipts)
+    assert result == [{"task_id": "task_turn-1", "status": "queued"}]
+    assert restarted.resume_ready_task("owner", "task_turn-1")["wait_reason"] == "restart_after_confirmed_step"
+    assert store.get_task("owner", "task_turn-1")["steps"][0]["status"] == "succeeded"
+
+
+def test_prepared_receipt_is_resumable_but_started_receipt_is_not(task_env):
+    store, receipts, controller, call = task_env
+    claimed = controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="monitor_add_rule",
+    )
+    result = controller.recover_incomplete("owner", receipts)
+    assert result == [{"task_id": "task_turn-1", "status": "queued"}]
+    assert store.get_task("owner", "task_turn-1")["steps"][0]["status"] == "pending"
+    assert controller.resume_ready_task("owner", "task_turn-1")["wait_reason"] == "restart_before_dispatch"
+
+
+def test_restart_recovers_crash_before_step_receipt_link(task_env):
+    store, receipts, controller, call = task_env
+    step = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_add_rule")
+    controller.link_call_to_step(
+        "owner", "task_turn-1", step["step_id"], tool_call_id=call["id"]
+    )
+    recovered = TaskController(SessionStore(connection=store.connection)).recover_incomplete(
+        "owner", receipts
+    )
+    assert recovered == [{"task_id": "task_turn-1", "status": "queued"}]
+    task = store.get_task("owner", "task_turn-1")
+    assert task["steps"][0]["status"] == "pending"
+    assert receipts.get("receipt-1").status == "failed"
+
+
+def test_prepared_receipt_cleanup_failure_cannot_fail_resumable_task(task_env, monkeypatch):
+    store, receipts, controller, call = task_env
+    controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="monitor_add_rule",
+    )
+    original_finish = receipts.finish
+
+    def fail_cleanup(receipt_id, **kwargs):
+        if kwargs.get("error") == "dispatch_not_started_recovered":
+            raise OSError("simulated crash-window cleanup failure")
+        return original_finish(receipt_id, **kwargs)
+
+    monkeypatch.setattr(receipts, "finish", fail_cleanup)
+    recovered = TaskController(SessionStore(connection=store.connection)).recover_incomplete(
+        "owner", receipts
+    )
+    assert recovered == [{"task_id": "task_turn-1", "status": "queued"}]
+    task = store.get_task("owner", "task_turn-1")
+    assert task["status"] == "queued"
+    assert task["steps"][0]["status"] == "pending"
+    assert receipts.get("receipt-1").status == "prepared"
+    assert TaskController(store).resume_ready_task("owner", "task_turn-1")["status"] == "queued"
+
+
+def test_resume_reuses_pending_step_and_finishes_it_before_success(task_env):
+    store, receipts, controller, old_call = task_env
+    pending = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_add_rule")
+    controller.link_call_to_step(
+        "owner", "task_turn-1", pending["step_id"], tool_call_id=old_call["id"]
+    )
+    TaskController(store).recover_incomplete("owner", receipts)
+    assert controller.resume_ready_task("owner", "task_turn-1")["status"] == "queued"
+
+    new_call = store.record_tool_call(
+        "owner", "session", tool_name="monitor_add_rule", arguments={"name": "x"},
+        call_id="call-2", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="receipt-2", call_id="call-2", user_id="owner", turn_id="turn-1",
+        round_id=3, tool_name="monitor_add_rule", origin="native", arguments={"name": "x"},
+    )
+    reused = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_add_rule")
+    assert reused["step_id"] == pending["step_id"]
+    controller.link_call_to_step(
+        "owner", "task_turn-1", reused["step_id"], tool_call_id=new_call["id"]
+    )
+    controller.claim_step(
+        "owner", "task_turn-1", reused["step_id"], receipt_id="receipt-2"
+    )
+    receipts.start("receipt-2")
+    receipts.finish(
+        "receipt-2", status="confirmed", ok=True, complete=True,
+        result_summary="Created monitor rule #2: x.",
+    )
+    store.connection.execute(
+        "INSERT INTO monitor_rules(id,user_id,name,kind,config) VALUES (2,'owner','x','large_deposit','{}')"
+    )
+    controller.finish_step(
+        "owner", "task_turn-1", reused["step_id"], outcome="confirmed"
+    )
+    assert controller.finish_turn("owner", "task_turn-1")["status"] == "queued"
+    list_call = store.record_tool_call(
+        "owner", "session", tool_name="monitor_list_rules", arguments={},
+        call_id="list-call-resume", turn_id="turn-1", status="running",
+    )
+    list_step = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_list_rules")
+    controller.link_call_to_step(
+        "owner", "task_turn-1", list_step["step_id"], tool_call_id=list_call["id"]
+    )
+    receipts.prepare(
+        receipt_id="list-receipt-resume", call_id="list-call-resume", user_id="owner",
+        turn_id="turn-1", round_id=4, tool_name="monitor_list_rules", origin="native", arguments={},
+    )
+    controller.claim_step(
+        "owner", "task_turn-1", list_step["step_id"], receipt_id="list-receipt-resume"
+    )
+    receipts.start("list-receipt-resume")
+    receipts.finish(
+        "list-receipt-resume", status="confirmed", ok=True, complete=True,
+        result_summary="Monitor rules (1):\n- #2 [on] x (large_deposit) config={}",
+    )
+    controller.finish_step("owner", "task_turn-1", list_step["step_id"], outcome="confirmed")
+    assert controller.finish_turn("owner", "task_turn-1")["status"] == "succeeded"
+
+
+def test_started_receipt_after_restart_requires_reconciliation(task_env):
+    _store, receipts, controller, call = task_env
+    controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="monitor_add_rule",
+    )
+    receipts.start("receipt-1")
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": "task_turn-1", "status": "needs_reconciliation"}]
+    task = controller.store.get_task("owner", "task_turn-1")
+    assert task["status"] == "needs_reconciliation"
+    assert task["steps"][0]["status"] == "needs_reconciliation"
+    assert controller.surface_reconciliation_once("owner", task["task_id"])
+    assert not controller.surface_reconciliation_once("owner", task["task_id"])
+
+
+def test_reply_requires_owner_matching_question_and_single_cas(task_env):
+    store, receipts, controller, _call = task_env
+    waiting = controller.request_user(
+        "owner", "task_turn-1", question_id="q-1", question="Create this rule?",
+        allowed_answers={"type": "enum", "enum": ["yes", "no"]},
+    )
+    assert waiting["status"] == "waiting_user"
+    with pytest.raises(ValueError, match="does not match"):
+        controller.accept_reply(
+            "owner", "task_turn-1", question_id="other", answer="yes", source_message_id="m1"
+        )
+    with pytest.raises(ValueError, match="outside"):
+        controller.accept_reply(
+            "owner", "task_turn-1", question_id="q-1", answer="maybe", source_message_id="m1"
+        )
+    resumed = controller.accept_reply(
+        "owner", "task_turn-1", question_id="q-1", answer="yes", source_message_id="m2"
+    )
+    assert resumed["task"]["status"] == "queued"
+    assert resumed["answer"] == "yes"
+    with pytest.raises(ValueError, match="does not match"):
+        controller.accept_reply(
+            "owner", "task_turn-1", question_id="q-1", answer="no", source_message_id="m3"
+        )
+    assert store.get_task("owner", "task_turn-1")["events"][-1]["event_type"] == "task.reply_matched"
+
+
+def test_sequential_replies_are_question_scoped_and_persisted(task_env):
+    store, _receipts, controller, _call = task_env
+    controller.request_user(
+        "owner", "task_turn-1", question_id="q-first", question="Choose a category",
+        allowed_answers={"type": "enum", "enum": ["food", "travel"]},
+    )
+    first = controller.accept_reply(
+        "owner", "task_turn-1", question_id="q-first", answer="food",
+        source_message_id="reply-first",
+    )
+    assert first["task"]["status"] == "queued"
+    store.add_message(
+        "owner", "session", role="user", content="food", message_id="reply-first",
+    )
+    controller.request_user(
+        "owner", "task_turn-1", question_id="q-second", question="Confirm the date",
+        allowed_answers={"type": "enum", "enum": ["today", "tomorrow"]},
+    )
+    second = controller.accept_reply(
+        "owner", "task_turn-1", question_id="q-second", answer="tomorrow",
+        source_message_id="reply-second",
+    )
+    assert second["task"]["status"] == "queued"
+    store.add_message(
+        "owner", "session", role="user", content="tomorrow", message_id="reply-second",
+    )
+    persisted = controller.get_persisted_reply("owner", "task_turn-1")
+    assert persisted["answer"] == "tomorrow"
+    assert persisted["question"]["question"] == "Confirm the date"
+
+
+def test_ordinary_reply_matching_is_exact_and_conversation_scoped(task_env):
+    _store, _receipts, controller, _call = task_env
+    controller.request_user(
+        "owner", "task_turn-1", question_id="q-match", question="Proceed?",
+        allowed_answers={"type": "enum", "enum": ["yes", "no"]},
+    )
+    match = controller.match_waiting_reply("owner", "session", "YES")
+    assert match == {
+        "task_id": "task_turn-1", "question_id": "q-match",
+        "answer": "yes", "question": "Proceed?",
+    }
+    assert controller.match_waiting_reply("owner", "session", "what's my balance?") is None
+    assert controller.match_waiting_reply("owner", "another-channel", "yes") is None
+
+
+def test_pending_approval_link_is_fingerprint_bound(task_env):
+    _store, _receipts, controller, _call = task_env
+    action = AuthorizationRequest(
+        turn_id="turn-1", user_id="owner", tool_name="monitor_add_rule",
+        arguments={"name": "x"}, target={"name": "x"},
+        policy=ToolPolicy(
+            tool_name="monitor_add_rule", risk=RiskTier.HIGH,
+            operation="create_monitor", approval_required=True,
+        ),
+    )
+    approval_request = build_approval_request(
+        action, evaluate_policy(action), approval_id="approval-1",
+        summary="Create monitor x", expires_at=9999999999,
+    )
+    controller.request_user(
+        "owner", "task_turn-1", question_id="approval-q",
+        question="Create monitor x?", allowed_answers={"type": "enum", "enum": ["yes", "no"]},
+        approval_request=approval_request, authorization_request=action,
+    )
+    resumed = controller.accept_reply(
+        "owner", "task_turn-1", question_id="approval-q", answer="yes",
+        source_message_id="m4",
+    )
+    assert resumed["approval"].approved
+    assert resumed["approval"].request_fingerprint == action.fingerprint
+    assert resumed["task"]["status"] == "waiting_approval"
+    approval_event = controller.store.get_task(
+        "owner", "task_turn-1"
+    )["events"][-1]
+    assert approval_event["event_type"] == "task.approval_reply_received"
+    assert approval_event["payload"]["approval_status"] == "approved"
+    assert approval_event["payload"]["action_fingerprint"] == action.fingerprint
+
+
+def test_mismatched_typed_approval_is_rejected(task_env):
+    _store, _receipts, controller, _call = task_env
+    action = AuthorizationRequest(
+        turn_id="turn-1", user_id="owner", tool_name="monitor_add_rule",
+        arguments={"name": "x"}, target={"name": "x"},
+        policy=ToolPolicy(tool_name="monitor_add_rule", risk=RiskTier.HIGH, approval_required=True),
+    )
+    other = AuthorizationRequest(
+        turn_id="turn-1", user_id="owner", tool_name="monitor_add_rule",
+        arguments={"name": "y"}, target={"name": "y"},
+        policy=action.policy,
+    )
+    approval_request = build_approval_request(
+        other, evaluate_policy(other), approval_id="approval-other",
+        summary="Create monitor y", expires_at=9999999999,
+    )
+    with pytest.raises(ValueError, match="exact task action"):
+        controller.request_user(
+            "owner", "task_turn-1", question_id="q-mismatch", question="Create?",
+            allowed_answers={"type": "enum", "enum": ["yes", "no"]},
+            approval_request=approval_request, authorization_request=action,
+        )
+
+
+def test_denied_approval_cancels_task_without_queueing_dispatch(task_env):
+    _store, _receipts, controller, _call = task_env
+    action = AuthorizationRequest(
+        turn_id="turn-1", user_id="owner", tool_name="monitor_add_rule",
+        arguments={"name": "x"}, target={"name": "x"},
+        policy=ToolPolicy(tool_name="monitor_add_rule", risk=RiskTier.HIGH, approval_required=True),
+    )
+    approval_request = build_approval_request(
+        action, evaluate_policy(action), approval_id="approval-deny",
+        summary="Create monitor x", expires_at=9999999999,
+    )
+    controller.request_user(
+        "owner", "task_turn-1", question_id="approval-q", question="Create?",
+        allowed_answers={"type": "enum", "enum": ["yes", "no"]},
+        approval_request=approval_request, authorization_request=action,
+    )
+    denied = controller.accept_reply(
+        "owner", "task_turn-1", question_id="approval-q", answer="no",
+        source_message_id="m-deny",
+    )
+    assert not denied["approval"].approved
+    assert denied["task"]["status"] == "cancelled"
+
+
+def test_task_and_step_reads_remain_owner_scoped(task_env):
+    store, _receipts, controller, call = task_env
+    controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="search_gmail",
+    )
+    with pytest.raises(Exception):
+        store.get_task("another-owner", "task_turn-1")
