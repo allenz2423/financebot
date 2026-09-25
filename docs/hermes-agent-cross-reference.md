@@ -3,6 +3,8 @@
 Date: 2026-09-25
 Scope: the current `/root/financebot` working tree, including uncommitted files, compared with the current `main` branch of [NousResearch/hermes-agent](https://github.com/nousresearch/hermes-agent).
 
+For a focused review of why Delilah still feels less agentic than Hermes, see [`hermes-agentic-gap-review.md`](hermes-agentic-gap-review.md).
+
 ## Executive summary
 
 Delilah should not be rewritten as Hermes Agent. The finance-specific parts of Delilah are the differentiator: deterministic SQLite-backed calculations, Plaid synchronization, transaction identity checks, audit workflows, evidence/provenance, the Active World Model, and financial-domain isolation. Hermes is useful as an architectural reference for the runtime around that domain.
