@@ -105,6 +105,45 @@ class TaskController:
     def has_plan(self, user_id: str, task_id: str) -> bool:
         return self.store.task_has_plan(user_id, task_id)
 
+    def validate_tool_dispatch(
+        self,
+        user_id: str,
+        task_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate that a tool dispatch is allowed by the task's state.
+
+        Raises:
+            PermissionError: If task is not dispatchable or requires monitor readback.
+            ValueError: If the exact tool action was already confirmed for this task.
+        """
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] not in {"queued", "running"}:
+            raise PermissionError(
+                "TASK_NOT_DISPATCHABLE: task is waiting, terminal, or needs reconciliation; "
+                "no tool was invoked."
+            )
+        if (
+            self.store.task_requires_monitor_readback(user_id, task_id)
+            and tool_name != "monitor_list_rules"
+        ):
+            raise PermissionError(
+                "MONITOR_READBACK_REQUIRED: the task's confirmed monitor insert "
+                "must be verified with monitor_list_rules before another action."
+            )
+        is_required_readback = (
+            self.store.task_requires_monitor_readback(user_id, task_id)
+            and tool_name == "monitor_list_rules"
+        )
+        if not is_required_readback and arguments is not None and self.store.has_confirmed_task_call(
+            user_id, task_id, tool_name=tool_name, arguments=arguments
+        ):
+            raise ValueError(
+                "TASK_STEP_ALREADY_CONFIRMED: this exact tool action has "
+                "confirmed evidence in the resumed task; do not repeat it."
+            )
+
     def prepare_step(self, user_id: str, task_id: str, *, tool_name: str) -> dict[str, Any]:
         task = self.store.get_task(user_id, task_id)
         if task["status"] not in {"queued", "running"}:
@@ -300,34 +339,43 @@ class TaskController:
                     )
                     recovered.append({"task_id": task["task_id"], "status": updated["status"]})
                     continue
-                if task.get("phase") == "executing":
+                if task.get("phase") in {"executing", "planning", "verifying"}:
+                    has_ready_plan_step = any(
+                        s["status"] == "ready" and s.get("description") is not None
+                        for s in task["steps"]
+                    )
+                    new_status = "queued"
+                    phase_next_action = "resume_recovered_task"
+                    target_phase = "planning"
+                    if any(s["status"] == "failed" for s in task["steps"]):
+                        wait_reason = "restart_after_confirmed_failure"
+                        event_payload = {"status": "confirmed_failure"}
+                        new_status = "failed"
+                        target_phase = "failed"
+                        phase_next_action = "report_turn_failure"
+                    elif self.store.task_requires_monitor_readback(user_id, task["task_id"]):
+                        wait_reason = "monitor_readback_required"
+                        event_payload = {"status": "monitor_readback_required"}
+                    elif has_ready_plan_step:
+                        wait_reason = "plan_pending"
+                        event_payload = {"status": "planned_steps_pending"}
+                    elif task["steps"] and all(s["status"] == "succeeded" for s in task["steps"]):
+                        wait_reason = "restart_after_confirmed_step"
+                        event_payload = {"status": "confirmed_steps_only"}
+                    else:
+                        wait_reason = "restart_before_dispatch"
+                        event_payload = {"status": "restart_before_dispatch"}
+                    event_type = "task.failure_recovered" if new_status == "failed" else "task.resume_ready"
                     updated = self.store.transition_task_run(
                         user_id, task["task_id"], expected_status=task["status"],
-                        expected_version=int(task["version"]), new_status="queued",
-                        wait_reason="restart_before_dispatch",
-                        event_type="task.resume_ready",
-                        event_payload={"status": "restart_before_dispatch"},
+                        expected_version=int(task["version"]), new_status=new_status,
+                        wait_reason=wait_reason,
+                        event_type=event_type,
+                        event_payload=event_payload,
                     )
                     self.transition_phase(
-                        user_id, task["task_id"], "planning",
-                        next_action="resume_recovered_task",
-                    )
-                    recovered.append({"task_id": task["task_id"], "status": updated["status"]})
-                    continue
-                if task.get("phase") in {"planning", "verifying"} and not any(
-                    item["status"] == "ready" and item.get("description") is not None
-                    for item in task["steps"]
-                ):
-                    updated = self.store.transition_task_run(
-                        user_id, task["task_id"], expected_status=task["status"],
-                        expected_version=int(task["version"]), new_status="queued",
-                        wait_reason="restart_before_dispatch",
-                        event_type="task.resume_ready",
-                        event_payload={"status": "restart_before_dispatch"},
-                    )
-                    self.transition_phase(
-                        user_id, task["task_id"], "planning",
-                        next_action="resume_recovered_task",
+                        user_id, task["task_id"], target_phase,
+                        next_action=phase_next_action,
                     )
                     recovered.append({"task_id": task["task_id"], "status": updated["status"]})
                     continue

@@ -8700,27 +8700,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 "ordered task_plan with observable completion criteria first."
                             )
                     if active_task_id and func_name in _STEP2_MIGRATED_TOOLS:
-                        active_task = task_store.get_task(uid, active_task_id)
-                        if active_task["status"] not in {"queued", "running"}:
-                            raise PermissionError(
-                                "TASK_NOT_DISPATCHABLE: task is waiting, terminal, or needs reconciliation; "
-                                "no tool was invoked."
-                            )
-                        if (
-                            task_store.task_requires_monitor_readback(uid, active_task_id)
-                            and func_name != "monitor_list_rules"
-                        ):
-                            raise PermissionError(
-                                "MONITOR_READBACK_REQUIRED: the task's confirmed monitor insert "
-                                "must be verified with monitor_list_rules before another action."
-                            )
-                        if task_store.has_confirmed_task_call(
+                        task_controller.validate_tool_dispatch(
                             uid, active_task_id, tool_name=func_name, arguments=args
-                        ):
-                            raise ValueError(
-                                "TASK_STEP_ALREADY_CONFIRMED: this exact tool action has "
-                                "confirmed evidence in the resumed task; do not repeat it."
-                            )
+                        )
 
                     # Dynamic audit activation: a worklist/getter tool can activate
                     # the audit controller even when the original user prompt was

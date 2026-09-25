@@ -1118,3 +1118,354 @@ def test_task_and_step_reads_remain_owner_scoped(task_env):
     )
     with pytest.raises(Exception):
         store.get_task("another-owner", "task_turn-1")
+
+
+def test_step2_resumable_execution_full_gate(task_env):
+    """End-to-end acceptance gate verification for Step 2.
+
+    Criteria verified:
+    1. Restart at each transition resumes the right step without repeating confirmed work:
+       - Read-only workflow: search_gmail -> restart -> read_gmail_message -> success.
+       - Monitor workflow: monitor_add_rule -> restart -> monitor_list_rules readback -> success.
+       - Pre-dispatch restart (pending/prepared step) recovers cleanly without repeating or losing state.
+    2. An unknown side effect is visibly needs_reconciliation, proactively surfaced once (with atomic unique-index race prevention), and not replayed:
+       - Task is marked needs_reconciliation on restart.
+       - surface_reconciliation_once claims notice once; duplicate claim returns False; DB enforces unique constraint.
+       - Cross-turn replay prevention: unresolved receipt blocks future monitor mutations for that owner.
+    3. A matching user reply resumes a waiting task; an unrelated reply does not:
+       - Unrelated messages return None and do not affect the waiting task.
+       - Matching reply calls accept_reply, updates status/event, resumes via resume_ready_task into planning phase.
+    """
+    store, receipts, controller, _call = task_env
+
+    # 1a. Read-only workflow: search_gmail -> restart -> read_gmail_message
+    store.begin_turn("owner", "session", turn_id="turn-gmail")
+    controller.create_turn("owner", "session", "turn-gmail", "Search and read Gmail")
+    gmail_task_id = "task_turn-gmail"
+
+    call1 = store.record_tool_call(
+        "owner", "session", tool_name="search_gmail", arguments={"query": "invoice"},
+        call_id="call-g1", turn_id="turn-gmail", status="running",
+    )
+    receipts.prepare(
+        receipt_id="rcpt-g1", call_id="call-g1", user_id="owner", turn_id="turn-gmail",
+        round_id=1, tool_name="search_gmail", origin="native", arguments={"query": "invoice"},
+    )
+    step1 = controller.prepare_step("owner", gmail_task_id, tool_name="search_gmail")
+    controller.link_call_to_step("owner", gmail_task_id, step1["step_id"], tool_call_id=call1["id"])
+    controller.claim_step("owner", gmail_task_id, step1["step_id"], receipt_id="rcpt-g1")
+    receipts.start("rcpt-g1")
+    receipts.finish("rcpt-g1", status="confirmed", ok=True, complete=True, result_summary="Found msg-101")
+    controller.finish_step("owner", gmail_task_id, step1["step_id"], outcome="confirmed")
+
+    # Restart after step 1 confirmation
+    restarted_controller = TaskController(SessionStore(connection=store.connection))
+    recovered = restarted_controller.recover_incomplete("owner", receipts)
+    assert any(item["task_id"] == gmail_task_id and item["status"] == "queued" for item in recovered)
+    task_after_restart = store.get_task("owner", gmail_task_id)
+    assert task_after_restart["steps"][0]["status"] == "succeeded"
+    assert task_after_restart["wait_reason"] == "restart_after_confirmed_step"
+
+    # Confirmed work cannot be repeated:
+    assert store.has_confirmed_task_call("owner", gmail_task_id, tool_name="search_gmail", arguments={"query": "invoice"}) is True
+    with pytest.raises(ValueError, match="TASK_STEP_ALREADY_CONFIRMED"):
+        restarted_controller.validate_tool_dispatch(
+            "owner", gmail_task_id, tool_name="search_gmail", arguments={"query": "invoice"}
+        )
+
+    # Resume ready task explicitly
+    resumed_task = restarted_controller.resume_ready_task("owner", gmail_task_id)
+    assert resumed_task["phase"] == "planning"
+
+    # Step 2: read_gmail_message (resumes next step without repeating step 1)
+    call2 = store.record_tool_call(
+        "owner", "session", tool_name="read_gmail_message", arguments={"message_id": "msg-101"},
+        call_id="call-g2", turn_id="turn-gmail", status="running",
+    )
+    receipts.prepare(
+        receipt_id="rcpt-g2", call_id="call-g2", user_id="owner", turn_id="turn-gmail",
+        round_id=2, tool_name="read_gmail_message", origin="native", arguments={"message_id": "msg-101"},
+    )
+    step2 = restarted_controller.prepare_step("owner", gmail_task_id, tool_name="read_gmail_message")
+    restarted_controller.link_call_to_step("owner", gmail_task_id, step2["step_id"], tool_call_id=call2["id"])
+    restarted_controller.claim_step("owner", gmail_task_id, step2["step_id"], receipt_id="rcpt-g2")
+    receipts.start("rcpt-g2")
+    receipts.finish("rcpt-g2", status="confirmed", ok=True, complete=True, result_summary="Invoice body")
+    restarted_controller.finish_step("owner", gmail_task_id, step2["step_id"], outcome="confirmed")
+    final_gmail_task = restarted_controller.finish_turn("owner", gmail_task_id)
+    assert final_gmail_task["status"] == "succeeded"
+    assert len(final_gmail_task["steps"]) == 2
+    assert final_gmail_task["steps"][0]["status"] == "succeeded" and final_gmail_task["steps"][0]["receipt_id"] == "rcpt-g1"
+    assert final_gmail_task["steps"][1]["status"] == "succeeded" and final_gmail_task["steps"][1]["receipt_id"] == "rcpt-g2"
+
+    # 1b. Monitor workflow: monitor_add_rule -> restart -> monitor_list_rules readback
+    store.begin_turn("owner", "session", turn_id="turn-mon")
+    controller.create_turn("owner", "session", "turn-mon", "Create and verify monitor")
+    mon_task_id = "task_turn-mon"
+
+    call_mon = store.record_tool_call(
+        "owner", "session", tool_name="monitor_add_rule", arguments={"name": "x"},
+        call_id="call-m1", turn_id="turn-mon", status="running",
+    )
+    receipts.prepare(
+        receipt_id="rcpt-m1", call_id="call-m1", user_id="owner", turn_id="turn-mon",
+        round_id=1, tool_name="monitor_add_rule", origin="native", arguments={"name": "x"},
+    )
+    step_m1 = controller.prepare_step("owner", mon_task_id, tool_name="monitor_add_rule")
+    controller.link_call_to_step("owner", mon_task_id, step_m1["step_id"], tool_call_id=call_mon["id"])
+    controller.claim_step("owner", mon_task_id, step_m1["step_id"], receipt_id="rcpt-m1")
+    receipts.start("rcpt-m1")
+    receipts.finish("rcpt-m1", status="confirmed", ok=True, complete=True, result_summary="Created monitor rule #1: x.")
+    controller.finish_step("owner", mon_task_id, step_m1["step_id"], outcome="confirmed")
+    assert store.task_requires_monitor_readback("owner", mon_task_id) is True
+    assert store.has_confirmed_task_call("owner", mon_task_id, tool_name="monitor_add_rule", arguments={"name": "x"}) is True
+
+    # Restart occurs with monitor readback pending
+    restarted_mon_controller = TaskController(SessionStore(connection=store.connection))
+    restarted_mon_controller.recover_incomplete("owner", receipts)
+    assert store.task_requires_monitor_readback("owner", mon_task_id) is True
+
+    # Exact expected wait reason after restart is monitor_readback_required:
+    resumed_mon_task = restarted_mon_controller.resume_ready_task("owner", mon_task_id)
+    assert resumed_mon_task["wait_reason"] == "monitor_readback_required"
+
+    # Confirmed tool replay is blocked and monitor readback is required:
+    with pytest.raises(PermissionError, match="MONITOR_READBACK_REQUIRED"):
+        restarted_mon_controller.validate_tool_dispatch(
+            "owner", mon_task_id, tool_name="search_gmail", arguments={}
+        )
+    with pytest.raises(PermissionError, match="MONITOR_READBACK_REQUIRED"):
+        restarted_mon_controller.validate_tool_dispatch(
+            "owner", mon_task_id, tool_name="monitor_add_rule", arguments={"name": "x"}
+        )
+
+    call_list = store.record_tool_call(
+        "owner", "session", tool_name="monitor_list_rules", arguments={},
+        call_id="call-list-1", turn_id="turn-mon", status="running",
+    )
+    receipts.prepare(
+        receipt_id="rcpt-list-1", call_id="call-list-1", user_id="owner", turn_id="turn-mon",
+        round_id=2, tool_name="monitor_list_rules", origin="native", arguments={},
+    )
+    step_list = restarted_mon_controller.prepare_step("owner", mon_task_id, tool_name="monitor_list_rules")
+    restarted_mon_controller.link_call_to_step("owner", mon_task_id, step_list["step_id"], tool_call_id=call_list["id"])
+    restarted_mon_controller.claim_step("owner", mon_task_id, step_list["step_id"], receipt_id="rcpt-list-1")
+    receipts.start("rcpt-list-1")
+    receipts.finish(
+        "rcpt-list-1", status="confirmed", ok=True, complete=True,
+        result_summary="Monitor rules (1):\n- #1 [on] x (large_deposit) config={}",
+    )
+    restarted_mon_controller.finish_step("owner", mon_task_id, step_list["step_id"], outcome="confirmed")
+    assert store.task_requires_monitor_readback("owner", mon_task_id) is False
+    with pytest.raises(ValueError, match="TASK_STEP_ALREADY_CONFIRMED"):
+        restarted_mon_controller.validate_tool_dispatch(
+            "owner", mon_task_id, tool_name="monitor_add_rule", arguments={"name": "x"}
+        )
+    final_mon_task = restarted_mon_controller.finish_turn("owner", mon_task_id)
+    assert final_mon_task["status"] == "succeeded"
+
+    # 1c. Restart at pending/prepared step transition (before start)
+    store.begin_turn("owner", "session", turn_id="turn-prestart")
+    controller.create_turn("owner", "session", "turn-prestart", "Pending step crash")
+    prestart_task_id = "task_turn-prestart"
+    call_pre = store.record_tool_call(
+        "owner", "session", tool_name="search_gmail", arguments={"query": "pending"},
+        call_id="call-pre", turn_id="turn-prestart", status="running",
+    )
+    receipts.prepare(
+        receipt_id="rcpt-pre", call_id="call-pre", user_id="owner", turn_id="turn-prestart",
+        round_id=1, tool_name="search_gmail", origin="native", arguments={"query": "pending"},
+    )
+    step_pre = controller.prepare_step("owner", prestart_task_id, tool_name="search_gmail")
+    controller.link_call_to_step("owner", prestart_task_id, step_pre["step_id"], tool_call_id=call_pre["id"])
+    controller.claim_step("owner", prestart_task_id, step_pre["step_id"], receipt_id="rcpt-pre")
+    # Crash before receipts.start
+    restarted_pre = TaskController(SessionStore(connection=store.connection))
+    recovered_pre = restarted_pre.recover_incomplete("owner", receipts)
+    assert any(item["task_id"] == prestart_task_id and item["status"] == "queued" for item in recovered_pre)
+    task_pre = store.get_task("owner", prestart_task_id)
+    assert task_pre["wait_reason"] == "restart_before_dispatch"
+    # Stale prepared receipt was cleaned up
+    assert receipts.get("rcpt-pre").status == "failed"
+
+    # Resumes cleanly: prepare new receipt for the undispatched call, claim, and complete without dropping state
+    resumed_pre = restarted_pre.resume_ready_task("owner", prestart_task_id)
+    assert resumed_pre["phase"] == "planning"
+    receipts.prepare(
+        receipt_id="rcpt-pre-resumed", call_id="call-pre", user_id="owner", turn_id="turn-prestart",
+        round_id=2, tool_name="search_gmail", origin="native", arguments={"query": "pending"},
+    )
+    restarted_pre.claim_step("owner", prestart_task_id, step_pre["step_id"], receipt_id="rcpt-pre-resumed")
+    receipts.start("rcpt-pre-resumed")
+    receipts.finish("rcpt-pre-resumed", status="confirmed", ok=True, complete=True, result_summary="Found pending email")
+    restarted_pre.finish_step("owner", prestart_task_id, step_pre["step_id"], outcome="confirmed")
+    final_pre = restarted_pre.finish_turn("owner", prestart_task_id)
+    assert final_pre["status"] == "succeeded"
+
+    # 2. Side effect unknown outcome: visibly needs_reconciliation, surfaced once, not replayed
+    store.begin_turn("owner", "session", turn_id="turn-ambig")
+    controller.create_turn("owner", "session", "turn-ambig", "Create ambiguous monitor")
+    ambig_task_id = "task_turn-ambig"
+    call_ambig = store.record_tool_call(
+        "owner", "session", tool_name="monitor_add_rule", arguments={"name": "ambig_rule"},
+        call_id="call-ambig", turn_id="turn-ambig", status="running",
+    )
+    receipts.prepare(
+        receipt_id="rcpt-ambig", call_id="call-ambig", user_id="owner", turn_id="turn-ambig",
+        round_id=1, tool_name="monitor_add_rule", origin="native", arguments={"name": "ambig_rule"},
+    )
+    step_ambig = controller.prepare_step("owner", ambig_task_id, tool_name="monitor_add_rule")
+    controller.link_call_to_step("owner", ambig_task_id, step_ambig["step_id"], tool_call_id=call_ambig["id"])
+    controller.claim_step("owner", ambig_task_id, step_ambig["step_id"], receipt_id="rcpt-ambig")
+    receipts.start("rcpt-ambig")
+    # Simulate crash/unknown outcome while started
+    restarted_controller2 = TaskController(SessionStore(connection=store.connection))
+    recovered2 = restarted_controller2.recover_incomplete("owner", receipts)
+    assert any(item["task_id"] == ambig_task_id and item["status"] == "needs_reconciliation" for item in recovered2)
+    ambig_task = store.get_task("owner", ambig_task_id)
+    assert ambig_task["status"] == "needs_reconciliation"
+    assert "started" in ambig_task["wait_reason"] or "unknown" in ambig_task["wait_reason"]
+
+    # Proactively surfaced once:
+    assert restarted_controller2.surface_reconciliation_once("owner", ambig_task_id) is True
+    assert restarted_controller2.surface_reconciliation_once("owner", ambig_task_id) is False
+
+    # Unique index migration 008 race protection: direct insert throws IntegrityError
+    with pytest.raises(sqlite3.IntegrityError):
+        store.append_task_event(
+            "owner", ambig_task_id, event_type="task.reconciliation_notice_claimed",
+            payload={"reason_code": "duplicate_race"},
+        )
+
+    # Not replayed on the same task:
+    with pytest.raises(ValueError, match="not dispatchable"):
+        restarted_controller2.prepare_step("owner", ambig_task_id, tool_name="monitor_add_rule")
+    with pytest.raises(PermissionError, match="TASK_NOT_DISPATCHABLE"):
+        restarted_controller2.validate_tool_dispatch(
+            "owner", ambig_task_id, tool_name="monitor_add_rule", arguments={"name": "ambig_rule"}
+        )
+
+    # Cross-turn / cross-task replay prevention for ambiguous side effects:
+    # An unresolved started/unknown receipt for monitor_add_rule blocks both monitor-insert tools
+    store.begin_turn("owner", "session", turn_id="turn-next-attempt")
+    receipts.prepare(
+        receipt_id="rcpt-blocked-1", call_id="call-blocked-1", user_id="owner",
+        turn_id="turn-next-attempt", round_id=1, tool_name="monitor_add_rule",
+        origin="native", arguments={"name": "another_rule"},
+    )
+    with pytest.raises(Exception, match="Blocked monitor creation"):
+        receipts.start("rcpt-blocked-1")
+
+    receipts.prepare(
+        receipt_id="rcpt-blocked-2", call_id="call-blocked-2", user_id="owner",
+        turn_id="turn-next-attempt", round_id=2, tool_name="monitor_create_natural_rule",
+        origin="native", arguments={"prompt": "alert when balance < 100"},
+    )
+    with pytest.raises(Exception, match="Blocked monitor creation"):
+        receipts.start("rcpt-blocked-2")
+
+    # 3. Matching user reply resumes waiting task; unrelated reply does not
+    store.begin_turn("owner", "session", turn_id="turn-reply")
+    controller.create_turn("owner", "session", "turn-reply", "Wait for user confirmation")
+    reply_task_id = "task_turn-reply"
+    controller.request_user_choice(
+        "owner", reply_task_id, question="Which account?", choices=["checking", "savings"]
+    )
+
+    # Restart during waiting_user transition survives cleanly:
+    restarted_waiting = TaskController(SessionStore(connection=store.connection))
+    restarted_waiting.recover_incomplete("owner", receipts)
+    waiting_task_after_restart = store.get_task("owner", reply_task_id)
+    assert waiting_task_after_restart["status"] == "waiting_user"
+    assert waiting_task_after_restart["phase"] == "awaiting_user"
+
+    # Unrelated message does NOT match
+    assert restarted_waiting.match_waiting_reply("owner", "session", "how much is in my checking?") is None
+    assert restarted_waiting.match_waiting_reply("owner", "session", "hello delilah") is None
+
+    # Unrelated message starting a turn does not affect the waiting task
+    store.begin_turn("owner", "session", turn_id="turn-unrelated-msg")
+    assert store.get_task("owner", reply_task_id)["status"] == "waiting_user"
+
+    # Matching exact choice DOES match
+    match = restarted_waiting.match_waiting_reply("owner", "session", "checking")
+    assert match is not None
+    assert match["task_id"] == reply_task_id
+    assert match["answer"] == "checking"
+
+    # Invalid / out-of-range choice is rejected by accept_reply
+    with pytest.raises(ValueError, match="outside the allowed answer choices"):
+        restarted_waiting.accept_reply(
+            "owner", reply_task_id, question_id=match["question_id"], answer="bitcoin",
+            source_message_id="msg-invalid-choice",
+        )
+
+    # Complete resumption path: accept reply, verify transition and resume_ready_task
+    store.add_message("owner", "session", role="user", content="checking", message_id="msg-choice-1")
+    accepted = restarted_waiting.accept_reply(
+        "owner", reply_task_id, question_id=match["question_id"], answer="checking",
+        source_message_id="msg-choice-1",
+    )
+    assert accepted["task"]["status"] == "queued"
+    assert accepted["task"]["wait_reason"] == f"resume_after_reply:{match['question_id']}"
+    assert restarted_waiting.reply_is_input_only("owner", reply_task_id) is True
+
+    # Resuming task advances to planning phase
+    resumed_reply_task = restarted_waiting.resume_ready_task("owner", reply_task_id)
+    assert resumed_reply_task["phase"] == "planning"
+    persisted_reply = restarted_waiting.get_persisted_reply("owner", reply_task_id)
+    assert persisted_reply["answer"] == "checking"
+    assert persisted_reply["question"]["question"] == "Which account?"
+
+    # 4. Confirmed step failure survives restart as failed (never erroneously queued or replayed)
+    store.begin_turn("owner", "session", turn_id="turn-fail")
+    controller.create_turn("owner", "session", "turn-fail", "Failing task")
+    fail_task_id = "task_turn-fail"
+    call_f = store.record_tool_call(
+        "owner", "session", tool_name="search_gmail", arguments={"query": "broken"},
+        call_id="call-f", turn_id="turn-fail", status="running",
+    )
+    receipts.prepare(
+        receipt_id="rcpt-f", call_id="call-f", user_id="owner", turn_id="turn-fail",
+        round_id=1, tool_name="search_gmail", origin="native", arguments={"query": "broken"},
+    )
+    step_f = controller.prepare_step("owner", fail_task_id, tool_name="search_gmail")
+    controller.link_call_to_step("owner", fail_task_id, step_f["step_id"], tool_call_id=call_f["id"])
+    controller.claim_step("owner", fail_task_id, step_f["step_id"], receipt_id="rcpt-f")
+    receipts.start("rcpt-f")
+    receipts.finish("rcpt-f", status="failed", ok=False, complete=False, error="Auth expired")
+    controller.finish_step("owner", fail_task_id, step_f["step_id"], outcome="failed", reason="Auth expired")
+
+    restarted_fail = TaskController(SessionStore(connection=store.connection))
+    recovered_fail = restarted_fail.recover_incomplete("owner", receipts)
+    assert any(item["task_id"] == fail_task_id and item["status"] == "failed" for item in recovered_fail)
+    task_fail = store.get_task("owner", fail_task_id)
+    assert task_fail["status"] == "failed"
+    assert task_fail["wait_reason"] == "restart_after_confirmed_failure"
+    assert task_fail["phase"] == "failed"
+
+    # 5. Planned task with ready steps recovers with plan_pending and preserves it across subsequent restart
+    store.begin_turn("owner", "session", turn_id="turn-plan")
+    controller.create_turn("owner", "session", "turn-plan", "Multi-step plan")
+    plan_task_id = "task_turn-plan"
+    controller.create_plan(
+        "owner", plan_task_id, [
+            {"description": "Step 1", "tool_name": "search_gmail", "completion_criteria": "found emails"},
+            {"description": "Step 2", "tool_name": "read_gmail_message", "completion_criteria": "read email body"},
+        ],
+    )
+    restarted_plan = TaskController(SessionStore(connection=store.connection))
+    recovered_plan = restarted_plan.recover_incomplete("owner", receipts)
+    task_planned = store.get_task("owner", plan_task_id)
+    assert task_planned["wait_reason"] == "plan_pending"
+    assert task_planned["status"] == "queued"
+
+    # Second restart does NOT corrupt or overwrite plan_pending with restart_before_dispatch:
+    restarted_plan2 = TaskController(SessionStore(connection=store.connection))
+    restarted_plan2.recover_incomplete("owner", receipts)
+    task_planned_after = store.get_task("owner", plan_task_id)
+    assert task_planned_after["wait_reason"] == "plan_pending"
+    assert task_planned_after["status"] == "queued"
+
+
+
