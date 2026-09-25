@@ -1,5 +1,16 @@
 # Overnight implementation log
 
+## Current stopping summary
+
+- **Passed:** Step 0 (workflow action contracts), Step 1 (durable task/step/event records), and roadmap item 4 (bounded durable session recall). Commits are pushed on `agentic-roadmap/full-run`; no changes were made to `main`.
+- **In progress / blocked:** Step 2 resumable task execution and roadmap continuity items 1, 7, and 9. The task schema/controller and parts of runtime recovery/reply matching exist, but Step 2's acceptance gate is not met. No `[gate]` commit exists for Step 2.
+- **Remaining roadmap items:** 1 — in progress (task records exist; model-facing plan tool and ≥3-action plan policy remain); 2 — blocked (Steps 1–3 not complete); 3 — blocked (Step 2 dependency); 4 — passed; 5 — blocked (recommended-order group 4 not reached); 6 — blocked (group 4 not reached); 7 — in progress (recovery pieces exist; durable phase controller incomplete); 8 — blocked (group 5 not reached); 9 — in progress (controller supports persisted questions/enum reply matching, but no end-to-end question-creation/resume workflow passes the gate); 10 — blocked (group 6 not reached); 11 — blocked (group 4 not reached); 12 — blocked (group 5 not reached); 13 — blocked (group 6 not reached); 14 — blocked (browser worker prerequisite not implemented); 15 — blocked (group 6 not reached).
+- **Human decisions needed before Step 2 can pass:** (1) define how an affirmative persisted approval becomes the exact action-bound grant consumed by dispatch and linked receipt, without a second approval/authorization ledger; (2) decide reconciliation-notice delivery semantics across SQLite and Discord, which cannot be exactly-once, while preserving no-duplicate/no-ambiguous-retry guarantees; (3) decide/implement the production flow that creates a durable question and resumes its exact pending step. Until these are resolved, do not dispatch approved or ambiguous side effects.
+- **Dependency-blocked:** Steps 3–6; roadmap item 3 (background jobs), item 2 (delegation/capacity routing), then items 11/5/6, 8/12, and 10/13/14/15 in the documented recommended order. Their required continuity/scheduler dependencies have not passed. No scheduler, delegation, background-job, browser, or reviewer-model work was started.
+- **Deferred item 4 suggestions:** full Gmail-dispatcher integration test; model-level prompt-injection evaluation; many-intervening-calls retention test; explicit test/documentation for stale unlinked Gmail records suppressing recall; review mixed email/financial intent classification.
+- **Verification baseline:** item 4 focused suite: 25 passed. Full suite in an isolated temporary directory: 590 passed, 1 skipped, 10 failed. The failures are the known clean-DB/seed-data expectations and pre-existing Discord budget-dashboard failure; no live finance database or account credentials were used. `py_compile` and `git diff --check` passed.
+- **Review first:** resolve the Step 2 approval/grant and notice-delivery contract, then complete end-to-end question creation/resume tests before authorizing Steps 3+.
+
 ## Progress
 
 ### Item 4 — durable session recall — passed
