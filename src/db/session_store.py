@@ -24,7 +24,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 from src.db.migrations import apply_all
 
@@ -365,6 +365,97 @@ class SessionStore:
             return self._row(conn.execute("SELECT * FROM turns WHERE id=?", (row["id"],)).fetchone())  # type: ignore[return-value]
 
     complete_turn = finish_turn
+
+    def mark_turn_recall_excluded(
+        self,
+        user_id: str,
+        session_id: str,
+        turn_id: str,
+        *,
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist that this turn contains data excluded from later recall."""
+        scope = self._scope(user_id, session_id, channel_id, thread_id)
+        key = _required(turn_id, "turn_id")
+        now = _now()
+        with self._write() as conn:
+            session_pk = self._resolve_session_id(conn, scope)
+            row = conn.execute(
+                "SELECT * FROM turns WHERE session_id=? AND turn_key=?",
+                (session_pk, key),
+            ).fetchone()
+            if row is None:
+                raise SessionNotFound("turn is not present in the requested scope")
+            metadata = _decode(row["metadata_json"], {})
+            metadata["session_recall_excluded"] = True
+            conn.execute(
+                "UPDATE turns SET metadata_json=?, updated_at=? WHERE id=?",
+                (_json(metadata, default={}), now, row["id"]),
+            )
+            return self._row(conn.execute(
+                "SELECT * FROM turns WHERE id=?", (row["id"],)
+            ).fetchone())  # type: ignore[return-value]
+
+    def list_turns(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        scope = self._scope(user_id, session_id, channel_id, thread_id)
+        bounded = max(1, min(int(limit), self.max_turns_per_session))
+        with self._lock:
+            session_pk = self._resolve_session_id(self.connection, scope)
+            rows = self.connection.execute(
+                """SELECT * FROM turns WHERE session_id=?
+                   ORDER BY sequence_no DESC LIMIT ?""",
+                (session_pk, bounded),
+            ).fetchall()
+            return [self._row(row) for row in reversed(rows)]  # type: ignore[misc]
+
+    def tool_call_turn_keys_for_retained_messages(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        tool_names: Sequence[str],
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> tuple[list[str], bool]:
+        """Return matching call turn keys relevant to retained messages.
+
+        The boolean reports a matching call with no turn link. Its associated
+        message cannot be identified safely, so callers should fail closed.
+        """
+        scope = self._scope(user_id, session_id, channel_id, thread_id)
+        names = tuple(dict.fromkeys(_required(name, "tool_name") for name in tool_names))
+        if not names:
+            return [], False
+        placeholders = ",".join("?" for _ in names)
+        with self._lock:
+            session_pk = self._resolve_session_id(self.connection, scope)
+            unlinked = self.connection.execute(
+                f"""SELECT 1 FROM tool_calls
+                    WHERE session_id=? AND turn_id IS NULL
+                      AND tool_name IN ({placeholders}) LIMIT 1""",
+                (session_pk, *names),
+            ).fetchone() is not None
+            rows = self.connection.execute(
+                f"""SELECT DISTINCT t.turn_key, t.sequence_no
+                    FROM tool_calls tc JOIN turns t ON t.id=tc.turn_id
+                    WHERE tc.session_id=? AND tc.tool_name IN ({placeholders})
+                      AND EXISTS (
+                          SELECT 1 FROM messages m
+                          WHERE m.session_id=tc.session_id AND m.turn_id=tc.turn_id
+                      )
+                    ORDER BY t.sequence_no DESC LIMIT ?""",
+                (session_pk, *names, self.max_messages_per_session),
+            ).fetchall()
+            return [str(row["turn_key"]) for row in rows], unlinked
 
     def add_message(
         self, user_id: str, session_id: str, *, role: str, content: str, message_id: str | None = None,
@@ -1273,12 +1364,18 @@ class SessionStore:
         with self._lock:
             session_pk = self._resolve_session_id(self.connection, scope)
             params: list[Any] = [session_pk]
-            where = "session_id=?"
+            where = "m.session_id=?"
             if before_id is not None:
-                where += " AND id < ?"
+                where += " AND m.id < ?"
                 params.append(int(before_id))
             params.append(limit)
-            rows = self.connection.execute(f"SELECT * FROM messages WHERE {where} ORDER BY id DESC LIMIT ?", params).fetchall()
+            rows = self.connection.execute(
+                f"""SELECT m.*, t.turn_key FROM messages m
+                    LEFT JOIN turns t ON t.id=m.turn_id
+                    WHERE {where}
+                    ORDER BY m.id DESC LIMIT ?""",
+                params,
+            ).fetchall()
             return [self._row(row) for row in reversed(rows)]  # type: ignore[misc]
 
     @staticmethod
@@ -1314,8 +1411,9 @@ class SessionStore:
             if self._fts_enabled:
                 try:
                     rows = self.connection.execute(
-                        f"""SELECT m.*, s.user_id, s.session_key, s.channel_id, s.thread_id
+                        f"""SELECT m.*, t.turn_key, s.user_id, s.session_key, s.channel_id, s.thread_id
                             FROM messages_fts f JOIN messages m ON m.id=f.rowid
+                            LEFT JOIN turns t ON t.id=m.turn_id
                             JOIN sessions s ON s.id=m.session_id
                             WHERE f.messages_fts MATCH ? AND {' AND '.join(where)}
                             ORDER BY m.id DESC LIMIT ?""",
@@ -1328,8 +1426,9 @@ class SessionStore:
                     self._fts_enabled = False
             literal = _escape_like(str(query or "")[:512])
             rows = self.connection.execute(
-                f"""SELECT m.*, s.user_id, s.session_key, s.channel_id, s.thread_id
+                f"""SELECT m.*, t.turn_key, s.user_id, s.session_key, s.channel_id, s.thread_id
                     FROM messages m JOIN sessions s ON s.id=m.session_id
+                    LEFT JOIN turns t ON t.id=m.turn_id
                     WHERE {' AND '.join(where)} AND m.content LIKE ? ESCAPE '\\'
                     ORDER BY m.id DESC LIMIT ?""",
                 [*params, f"%{literal}%", limit],

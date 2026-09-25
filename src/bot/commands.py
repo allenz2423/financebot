@@ -4164,7 +4164,13 @@ async def audit_categories(ctx: commands.Context, days: int = 30):
 
     if uid not in SESSION_HISTORY:
         SESSION_HISTORY[uid] = []
-    SESSION_HISTORY[uid].append({"role": "assistant", "content": audit_summary})
+    SESSION_HISTORY[uid].append({
+        "role": "assistant",
+        "content": audit_summary,
+        "session_id": f"discord:{uid}:{ctx.channel.id}:thread:default",
+        "channel_id": str(ctx.channel.id),
+        "thread_id": None,
+    })
     SESSION_HISTORY[uid] = SESSION_HISTORY[uid][-SESSION_HISTORY_MAX_TURNS:]
 
     try:
