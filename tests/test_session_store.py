@@ -48,6 +48,94 @@ def test_message_and_tool_call_writes_are_idempotent_and_conflicts_are_rejected(
         assert store.finish_tool_call("u", "s", "c", result={"ok": True})["status"] == "succeeded"
 
 
+def test_pre_persisted_tool_call_block_advances_pending_call_at_dispatch():
+    with make_store() as store:
+        store.begin_turn("u", "s", turn_id="t")
+        pending = store.record_tool_call(
+            "u", "s", tool_name="read_ledger", arguments={"account": "checking"},
+            call_id="provider-call", turn_id="t", status="pending",
+        )
+        started = store.record_tool_call(
+            "u", "s", tool_name="read_ledger", arguments={"account": "checking"},
+            call_id="provider-call", turn_id="t", status="running",
+        )
+        assert started["id"] == pending["id"]
+        assert started["status"] == "running"
+
+
+def test_assistant_tool_call_block_persists_calls_and_ordered_manifest_atomically():
+    with make_store() as store:
+        store.begin_turn("u", "s", turn_id="t")
+        task = store.create_task_run("u", "s", "objective", task_id="task-t")
+        calls = store.persist_assistant_tool_call_block(
+            "u", "s", task["task_id"], "t",
+            [
+                {"tool_name": "read_one", "arguments": {"n": 1}, "call_id": "call-1"},
+                {"tool_name": "read_two", "arguments": {"n": 2}, "call_id": "call-2"},
+            ],
+        )
+        assert [row["call_key"] for row in calls] == ["call-1", "call-2"]
+        assert [row["arguments"] for row in calls] == [{"n": 1}, {"n": 2}]
+        assert [row["status"] for row in calls] == ["pending", "pending"]
+        event = store.get_task("u", task["task_id"])["events"][-1]
+        assert event["event_type"] == "assistant.tool_call_block_persisted"
+        assert event["payload"]["provider_call_ids"] == ["call-1", "call-2"]
+        assert event["payload"]["tool_names"] == ["read_one", "read_two"]
+        assert store.list_assistant_tool_call_blocks("u", task["task_id"]) == [{
+            "event_id": event["event_id"],
+            "calls": [
+                {"call_id": "call-1", "tool_name": "read_one", "arguments": {"n": 1}, "status": "pending", "turn_id": "t"},
+                {"call_id": "call-2", "tool_name": "read_two", "arguments": {"n": 2}, "status": "pending", "turn_id": "t"},
+            ],
+        }]
+
+        with pytest.raises(IdempotencyConflict):
+            store.persist_assistant_tool_call_block(
+                "u", "s", task["task_id"], "t",
+                [
+                    {"tool_name": "new_call", "arguments": {"n": 3}, "call_id": "call-3"},
+                    {"tool_name": "different", "arguments": {"n": 2}, "call_id": "call-2"},
+                ],
+            )
+        assert store.get_task("u", task["task_id"])["events"][-1] == event
+        assert store.connection.execute(
+            "SELECT 1 FROM tool_calls WHERE call_key='call-3'"
+        ).fetchone() is None
+
+
+def test_task_phase_migration_backfills_existing_lifecycle_state():
+    with make_store() as store:
+        queued = store.create_task_run("u", "s", "queued", task_id="queued-task")
+        running = store.create_task_run("u", "s", "running", task_id="running-task")
+        running = store.transition_task_run(
+            "u", running["task_id"], expected_status="queued",
+            expected_version=int(running["version"]), new_status="running",
+        )
+        store.connection.execute(
+            "UPDATE task_runs SET phase='received' WHERE task_id IN (?, ?)",
+            (queued["task_id"], running["task_id"]),
+        )
+        from importlib import import_module
+        import_module("src.db.migrations.010_durable_task_phases").apply(store.connection)
+        assert store.get_task("u", queued["task_id"])["phase"] == "planning"
+        assert store.get_task("u", running["task_id"])["phase"] == "executing"
+
+
+def test_tool_call_block_rows_survive_ordinary_retention_cap():
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    store = SessionStore(connection=connection, max_tool_calls_per_session=1)
+    store.begin_turn("u", "s", turn_id="t")
+    task = store.create_task_run("u", "s", "objective", task_id="task-t")
+    store.persist_assistant_tool_call_block(
+        "u", "s", task["task_id"], "t",
+        [
+            {"tool_name": "read_one", "arguments": {}, "call_id": "call-1"},
+            {"tool_name": "read_two", "arguments": {}, "call_id": "call-2"},
+        ],
+    )
+    assert len(store.list_assistant_tool_call_blocks("u", task["task_id"])[0]["calls"]) == 2
+
+
 def test_bounded_retention_and_safe_fts_search_with_like_fallback():
     with make_store() as store:
         for index in range(5):

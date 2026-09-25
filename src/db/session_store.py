@@ -74,6 +74,7 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "toolname", "operation", "risk", "summary", "approvalexpiresat",
     "approvalstatus", "approvedby", "decidedat",
     "plannedstepids", "stepcount",
+    "phase", "callcount", "toolnames", "providercallids",
 }
 _UNSET = object()
 
@@ -546,6 +547,14 @@ class SessionStore:
             if existing is not None:
                 if existing["tool_name"] != name or existing["arguments_json"] != args_json:
                     raise IdempotencyConflict("tool-call idempotency key is already used for different arguments")
+                if status == "running" and existing["status"] == "pending":
+                    conn.execute(
+                        "UPDATE tool_calls SET status='running', updated_at=? WHERE id=? AND status='pending'",
+                        ( _now(), int(existing["id"])),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM tool_calls WHERE id=?", (int(existing["id"]),)
+                    ).fetchone()
                 return self._row(existing)  # type: ignore[return-value]
             now = _now()
             completed = now if status in _TOOL_TERMINAL else None
@@ -566,6 +575,93 @@ class SessionStore:
             conn.execute("UPDATE sessions SET updated_at=?, last_activity_at=? WHERE id=?", (now, now, session_pk))
             self._prune(conn, session_pk)
             return self._row(conn.execute("SELECT * FROM tool_calls WHERE session_id=? AND call_key=?", (session_pk, key)).fetchone())  # type: ignore[return-value]
+
+    def persist_assistant_tool_call_block(
+        self,
+        user_id: str,
+        session_id: str,
+        task_id: str,
+        turn_id: str,
+        calls: list[Mapping[str, Any]],
+        *,
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Atomically persist an ordered provider tool block and its task event."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        turn_key = _required(turn_id, "turn_id")
+        scope = self._scope(owner, session_id, channel_id, thread_id)
+        if not isinstance(calls, list) or not calls:
+            raise ValueError("tool-call block must contain at least one call")
+        names: list[str] = []
+        call_ids: list[str] = []
+        arguments_json: list[str] = []
+        for call in calls:
+            if not isinstance(call, Mapping):
+                raise TypeError("tool-call block entries must be mappings")
+            names.append(_required(call.get("tool_name"), "tool_name"))
+            call_ids.append(_required(call.get("call_id"), "call_id"))
+            arguments_json.append(_json(call.get("arguments"), default={}))
+        if len(set(call_ids)) != len(call_ids):
+            raise ValueError("tool-call block contains duplicate provider call IDs")
+
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            session = self._ensure_session(conn, scope, None)
+            session_pk = int(session["id"])
+            if int(task["session_id"]) != session_pk:
+                raise TaskNotFound("task and tool-call block belong to different session scopes")
+            turn = conn.execute(
+                "SELECT id FROM turns WHERE session_id=? AND turn_key=?",
+                (session_pk, turn_key),
+            ).fetchone()
+            if turn is None:
+                raise SessionNotFound("turn is not present in the requested scope")
+
+            rows: list[dict[str, Any]] = []
+            now = _now()
+            for name, call_key, args_json in zip(names, call_ids, arguments_json):
+                existing = conn.execute(
+                    "SELECT * FROM tool_calls WHERE session_id=? AND call_key=?",
+                    (session_pk, call_key),
+                ).fetchone()
+                if existing is not None:
+                    if existing["tool_name"] != name or existing["arguments_json"] != args_json:
+                        raise IdempotencyConflict(
+                            "tool-call idempotency key is already used for different arguments"
+                        )
+                    if int(existing["turn_id"] or -1) != int(turn["id"]):
+                        raise IdempotencyConflict(
+                            "provider tool-call ID is already bound to a different turn"
+                        )
+                    row = existing
+                else:
+                    conn.execute(
+                        """INSERT INTO tool_calls(
+                               session_id, turn_id, call_key, tool_name, arguments_json,
+                               status, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                        (session_pk, int(turn["id"]), call_key, name, args_json, now, now),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM tool_calls WHERE session_id=? AND call_key=?",
+                        (session_pk, call_key),
+                    ).fetchone()
+                rows.append(self._row(row))  # type: ignore[arg-type]
+            conn.execute(
+                "UPDATE sessions SET updated_at=?, last_activity_at=? WHERE id=?",
+                (now, now, session_pk),
+            )
+            self._insert_task_event(
+                conn, task_id=task_key, event_type="assistant.tool_call_block_persisted",
+                payload={
+                    "call_count": len(call_ids), "tool_names": names,
+                    "provider_call_ids": call_ids,
+                },
+            )
+            self._prune(conn, session_pk)
+            return rows
 
     def finish_tool_call(
         self, user_id: str, session_id: str, call_id: str, *, status: str = "succeeded", result: Any = None,
@@ -1075,6 +1171,56 @@ class SessionStore:
                 conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()
             )  # type: ignore[return-value]
 
+    def transition_task_phase(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        expected_phase: str,
+        expected_version: int,
+        new_phase: str,
+        next_action: str | None,
+        event_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """CAS the controller phase and append its event in one transaction."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        valid = {
+            "received", "planning", "executing", "awaiting_child", "awaiting_user",
+            "verifying", "delivering", "completed", "partial", "failed",
+        }
+        before = _required(expected_phase, "expected_phase").casefold()
+        after = _required(new_phase, "new_phase").casefold()
+        if before not in valid or after not in valid:
+            raise ValueError("invalid task phase")
+        version = int(expected_version)
+        if version < 0:
+            raise ValueError("expected_version must be non-negative")
+        if event_payload and {"phase", "next_action"}.intersection(event_payload):
+            raise ValueError("phase event payload cannot override transition metadata")
+        normalized_action = None if next_action is None else str(next_action)[:500]
+        now = _now()
+        with self._write() as conn:
+            self._task_pk(conn, owner, task_key)
+            cursor = conn.execute(
+                """UPDATE task_runs SET phase=?, phase_next_action=?, version=version+1,
+                          updated_at=?
+                   WHERE task_id=? AND user_id=? AND phase=? AND version=?""",
+                (after, normalized_action, now,
+                 task_key, owner, before, version),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task phase/version changed before transition")
+            payload = {"phase": after, "next_action": normalized_action}
+            if event_payload:
+                payload.update(event_payload)
+            self._insert_task_event(
+                conn, task_id=task_key, event_type="task.phase_transitioned", payload=payload
+            )
+            return self._row(
+                conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()
+            )  # type: ignore[return-value]
+
     def transition_task_step(
         self,
         user_id: str,
@@ -1296,7 +1442,9 @@ class SessionStore:
         owner = _required(user_id, "user_id")
         with self._lock:
             row = self.connection.execute(
-                """SELECT tc.* FROM tool_calls tc JOIN sessions s ON s.id=tc.session_id
+                """SELECT tc.*, t.turn_key FROM tool_calls tc
+                   JOIN sessions s ON s.id=tc.session_id
+                   LEFT JOIN turns t ON t.id=tc.turn_id
                    WHERE tc.id=? AND s.user_id=?""",
                 (int(tool_call_id), owner),
             ).fetchone()
@@ -1401,6 +1549,53 @@ class SessionStore:
                 ]
             return result
 
+    def list_assistant_tool_call_blocks(
+        self, user_id: str, task_id: str, *, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """Reconstruct bounded ordered tool-call blocks from task events and call rows."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        bounded_limit = max(1, min(int(limit), 500))
+        with self._lock:
+            task = self._task_pk(self.connection, owner, task_key)
+            events = self.connection.execute(
+                """SELECT event_id, payload_json FROM task_events
+                   WHERE task_id=? AND event_type='assistant.tool_call_block_persisted'
+                   ORDER BY event_id DESC LIMIT ?""",
+                (task_key, bounded_limit + 1),
+            ).fetchall()
+            if len(events) > bounded_limit:
+                raise ValueError("task has too many persisted tool-call blocks for bounded recovery")
+            blocks: list[dict[str, Any]] = []
+            for event in reversed(events):
+                payload = _decode(event["payload_json"], {})
+                call_ids = payload.get("provider_call_ids", []) if isinstance(payload, dict) else []
+                if not isinstance(call_ids, list):
+                    raise ValueError("persisted tool-call block manifest is malformed")
+                calls: list[dict[str, Any]] = []
+                for raw_id in call_ids:
+                    call_id = _required(raw_id, "provider_call_id")
+                    row = self.connection.execute(
+                        """SELECT tc.call_key, tc.tool_name, tc.arguments_json,
+                                  tc.status, t.turn_key
+                           FROM tool_calls tc LEFT JOIN turns t ON t.id=tc.turn_id
+                           WHERE tc.session_id=? AND tc.call_key=?""",
+                        (int(task["session_id"]), call_id),
+                    ).fetchone()
+                    if row is None:
+                        raise TaskNotFound("persisted tool-call block is missing a referenced call")
+                    calls.append({
+                        "call_id": str(row["call_key"]),
+                        "tool_name": str(row["tool_name"]),
+                        "arguments": _decode(row["arguments_json"], {}),
+                        "status": str(row["status"]),
+                        "turn_id": str(row["turn_key"] or ""),
+                    })
+                if len(calls) != int(payload.get("call_count", -1)):
+                    raise ValueError("persisted tool-call block manifest count does not match")
+                blocks.append({"event_id": int(event["event_id"]), "calls": calls})
+            return blocks
+
     def list_tasks(
         self,
         user_id: str,
@@ -1492,8 +1687,17 @@ class SessionStore:
                    SELECT tc.turn_id FROM tool_calls tc
                    JOIN task_steps ts ON ts.tool_call_id=tc.id
                    WHERE tc.session_id=? AND tc.turn_id IS NOT NULL
+               )
+               AND id NOT IN (
+                   SELECT tc.turn_id FROM tool_calls tc
+                   JOIN task_runs tr ON tr.session_id=tc.session_id
+                   JOIN task_events te ON te.task_id=tr.task_id
+                   JOIN json_each(te.payload_json, '$.provider_call_ids') ids
+                     ON ids.value=tc.call_key
+                   WHERE tc.session_id=? AND tc.turn_id IS NOT NULL
+                     AND te.event_type='assistant.tool_call_block_persisted'
                )""",
-            (session_pk, session_pk, self.max_turns_per_session, session_pk),
+            (session_pk, session_pk, self.max_turns_per_session, session_pk, session_pk),
         )
         conn.execute(
             """DELETE FROM messages WHERE session_id=? AND id NOT IN
@@ -1508,8 +1712,17 @@ class SessionStore:
                (SELECT id FROM tool_calls WHERE session_id=? ORDER BY id DESC LIMIT ?)
                AND id NOT IN (
                    SELECT tool_call_id FROM task_steps WHERE tool_call_id IS NOT NULL
+               )
+               AND id NOT IN (
+                   SELECT tc.id FROM tool_calls tc
+                   JOIN task_runs tr ON tr.session_id=tc.session_id
+                   JOIN task_events te ON te.task_id=tr.task_id
+                   JOIN json_each(te.payload_json, '$.provider_call_ids') ids
+                     ON ids.value=tc.call_key
+                   WHERE tc.session_id=?
+                     AND te.event_type='assistant.tool_call_block_persisted'
                )""",
-            (session_pk, session_pk, self.max_tool_calls_per_session),
+            (session_pk, session_pk, self.max_tool_calls_per_session, session_pk),
         )
 
     def list_messages(

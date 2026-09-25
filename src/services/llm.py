@@ -586,6 +586,26 @@ def _record_durable_tool_call(
         return None
 
 
+def _persist_task_phase(
+    user_id: str,
+    task_id: str | None,
+    phase: str,
+    *,
+    next_action: str | None,
+    event_payload: dict | None = None,
+) -> dict | None:
+    """Persist a controller phase before crossing its corresponding boundary."""
+    if not task_id:
+        return None
+    store = _durable_session_store()
+    if store is None:
+        raise RuntimeError("durable task store is unavailable before phase transition")
+    return TaskController(store).transition_phase(
+        user_id, task_id, phase, next_action=next_action,
+        event_payload=event_payload,
+    )
+
+
 def _redact_inline_credentials(text: str) -> str:
     """Remove obvious inline credential assignments before model/history use."""
     value = str(text or "")
@@ -8462,6 +8482,48 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 else tool_call
                 for tool_call in tool_batch
             ]
+            _persist_task_phase(
+                uid, CURRENT_TASK_ID.get(), "executing",
+                next_action="dispatch_provider_tool_batch",
+            )
+            active_task_id = CURRENT_TASK_ID.get()
+            if active_task_id:
+                task_store = _durable_session_store()
+                if task_store is None:
+                    raise RuntimeError("durable task store is unavailable before tool-call block persistence")
+                block_records: list[dict[str, object]] = []
+                for block_call in history_tool_batch:
+                    if not isinstance(block_call, dict):
+                        raise TypeError("assistant tool-call block contains a malformed call")
+                    block_function = block_call.get("function") or {}
+                    if not isinstance(block_function, dict):
+                        raise TypeError("assistant tool-call block contains malformed function metadata")
+                    block_name = str(block_function.get("name") or "unknown_tool")
+                    block_args = block_function.get("arguments", {}) or {}
+                    if isinstance(block_args, str):
+                        try:
+                            block_args = json.loads(block_args)
+                        except (TypeError, ValueError):
+                            # Preserve malformed model output as inert evidence;
+                            # the ordinary validator rejects it before dispatch.
+                            pass
+                    block_call_id = str(block_call.get("id") or "").strip()
+                    if not block_call_id:
+                        raise ValueError("assistant tool-call block has no correlation ID")
+                    block_records.append({
+                        "tool_name": block_name,
+                        "arguments": block_args,
+                        "call_id": block_call_id,
+                    })
+                session_id = CURRENT_SESSION_KEY.get()
+                active_turn_id = CURRENT_TURN_ID.get()
+                if not session_id or not active_turn_id:
+                    raise RuntimeError("durable tool-call block context is incomplete")
+                task_store.persist_assistant_tool_call_block(
+                    uid, session_id, active_task_id, active_turn_id, block_records,
+                    channel_id=CURRENT_CHANNEL_ID.get(),
+                    thread_id=CURRENT_THREAD_ID.get(),
+                )
             messages.append(
                 {"role": "assistant", "content": "", "tool_calls": history_tool_batch}
             )
@@ -9850,6 +9912,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             expires_in_minutes=int(args.get("expires_in_minutes", 1440)),
                         )
                         question_id = question_request["question_id"]
+                        TaskController(store).transition_phase(
+                            uid, task_id, "awaiting_user",
+                            next_action="wait_for_exact_choice",
+                            event_payload={"question_id": question_id},
+                        )
                         expires_at = question_request["expires_at"]
                         choices = question_request["choices"]
                         expires_minutes = question_request["expires_in_minutes"]
@@ -11443,6 +11510,12 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 )
                 end_turn_called = True
 
+        if tool_calls and not end_turn_called:
+            _persist_task_phase(
+                uid, CURRENT_TASK_ID.get(), "planning",
+                next_action="request_next_model_step",
+            )
+
         if end_turn_called:
             if _audit_is_active():
                 AUDIT_SESSION_STATE.pop(uid, None)
@@ -11463,6 +11536,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
     final_content = re.sub(r"(?im)^\s*end_turn\s*$", "", final_content).strip()
 
 
+    _persist_task_phase(
+        uid, CURRENT_TASK_ID.get(), "verifying",
+        next_action="verify_final_claims",
+    )
     # Final output is the last and authoritative claim boundary.  The model's
     # prose is not evidence that a tool ran; only the execution trace can
     # support a completed-action claim.  Give the model one tool-free repair
@@ -11565,9 +11642,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
     final_content = re.sub(r"<memory>.*?</memory>", "", final_content, flags=re.DOTALL | re.IGNORECASE).strip()
 
+    _persist_task_phase(
+        uid, CURRENT_TASK_ID.get(), "delivering",
+        next_action="deliver_final_response",
+    )
+    final_delivery_confirmed = False
     try:
         await delete_live_preview()
         await render_stream(final_content)
+        final_delivery_confirmed = True
         print(
             f" [ADVISOR FINAL SENT] uid={uid} chars={len(final_content)} "
             f"messages={len(stream_messages) + len(code_stream_messages)}"
@@ -11581,19 +11664,39 @@ CURRENT DATABASE FINANCIAL CONTEXT
             print(f" [THINKING DELETE FAILED] uid={uid}: {delete_err}")
     except Exception as render_err:
         print(f" [FINAL SEND FAILED] uid={uid}: {render_err}")
-        try:
-            fallback = await reply_msg.channel.send(content=final_content[:1900])
-            print(f" [ADVISOR FINAL FALLBACK SENT] uid={uid} message_id={fallback.id}")
+        # Discord may have accepted a send before the client observed an
+        # exception. Do not issue another send/edit on this ambiguous outcome.
+        task_id = CURRENT_TASK_ID.get()
+        if task_id:
             try:
-                await reply_msg.delete()
-            except Exception as delete_err:
-                print(f" [THINKING DELETE FAILED] uid={uid}: {delete_err}")
-        except Exception as fallback_err:
-            print(f" [ADVISOR FINAL FALLBACK FAILED] uid={uid}: {fallback_err}")
-            try:
-                await reply_msg.edit(content=final_content[:1900])
-            except Exception as edit_err:
-                print(f" [FINAL EDIT FALLBACK FAILED] uid={uid}: {edit_err}")
+                delivery_store = _durable_session_store()
+                if delivery_store is not None:
+                    TaskController(delivery_store).mark_delivery_unknown(uid, task_id)
+            except Exception as phase_err:
+                print(f" [DELIVERY PHASE UPDATE FAILED] {phase_err}")
+
+    if final_delivery_confirmed:
+        task_id = CURRENT_TASK_ID.get()
+        store = _durable_session_store() if task_id else None
+        if store is not None and task_id:
+            persisted_task = TaskController(store).finish_turn(uid, task_id)
+            delivery_phase = {
+                "waiting_user": "awaiting_user",
+                "queued": "planning",
+                "needs_reconciliation": "partial",
+                "succeeded": "completed",
+                "partial": "partial",
+                "failed": "failed",
+                "cancelled": "failed",
+            }.get(str(persisted_task["status"]), "planning")
+            _persist_task_phase(
+                uid, task_id, delivery_phase,
+                next_action=(
+                    "wait_for_exact_choice" if delivery_phase == "awaiting_user"
+                    else "resume_queued_task" if delivery_phase == "planning"
+                    else None
+                ),
+            )
 
     # Persist compact mutation-result metadata separately from general tool
     # activity. This prevents a later model turn from turning failed mutations
@@ -12152,6 +12255,11 @@ async def chat_with_delilah(
                         )
                     if resumed["task"]["status"] != "queued":
                         raise ValueError("task question expired or did not authorize resumption")
+                    controller.transition_phase(
+                        scope["user_id"], resume_task_id, "planning",
+                        next_action="continue_resumed_task",
+                        event_payload={"question_id": resume_question_id},
+                    )
                 else:
                     controller.resume_ready_task(scope["user_id"], resume_task_id)
                 return str(resume_task_id)
@@ -12159,6 +12267,10 @@ async def chat_with_delilah(
                 scope["user_id"], scope["session_id"], turn_id,
                 _redact_inline_credentials(request.message.text),
                 channel_id=scope["channel_id"], thread_id=scope["thread_id"],
+            )
+            controller.transition_phase(
+                scope["user_id"], task_record["task_id"], "planning",
+                next_action="request_model_plan",
             )
             return str(task_record["task_id"])
         except Exception as exc:
@@ -12230,9 +12342,17 @@ async def chat_with_delilah(
             )
             task_id = CURRENT_TASK_ID.get()
             if task_id:
-                TaskController(store).finish_turn(
+                controller = TaskController(store)
+                finished_task = controller.finish_turn(
                     scope["user_id"], task_id, failed=True
                 )
+                if finished_task["status"] == "failed":
+                    phase = str(finished_task.get("phase") or "received")
+                    if phase not in {"failed", "completed", "partial"}:
+                        controller.transition_phase(
+                            scope["user_id"], task_id, "failed",
+                            next_action="report_turn_failure",
+                        )
         except Exception as exc:
             print(f" [SESSION STORE] error update failed uid={uid}: {type(exc).__name__}: {exc}")
         finally:

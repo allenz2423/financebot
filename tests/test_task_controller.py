@@ -87,6 +87,461 @@ def test_task_step_is_linked_before_dispatch_and_confirmed_completion(task_env):
     assert controller.finish_turn("owner", "task_turn-1")["status"] == "succeeded"
 
 
+def test_turn_phases_are_durable_ordered_and_record_next_action(task_env):
+    store, _receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    assert store.get_task("owner", task_id)["phase"] == "received"
+    planned = controller.transition_phase(
+        "owner", task_id, "planning", next_action="request_model_plan"
+    )
+    executing = controller.transition_phase(
+        "owner", task_id, "executing", next_action="execute_tool_batch",
+        event_payload={"call_count": 1, "tool_names": ["monitor_add_rule"],
+                       "provider_call_ids": ["call-1"]},
+    )
+    assert planned["phase"] == "planning"
+    assert executing["phase"] == "executing"
+    assert executing["phase_next_action"] == "execute_tool_batch"
+    event = store.get_task("owner", task_id)["events"][-1]
+    assert event["event_type"] == "task.phase_transitioned"
+    assert event["payload"]["tool_names"] == ["monitor_add_rule"]
+    with pytest.raises(ValueError, match="invalid task phase transition"):
+        controller.transition_phase("owner", task_id, "completed", next_action=None)
+
+
+def test_phase_transition_uses_task_version_compare_and_swap(task_env):
+    store, _receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    store.transition_task_phase(
+        "owner", task_id, expected_phase="received", expected_version=task["version"],
+        new_phase="planning", next_action="request_model_plan",
+    )
+    with pytest.raises(Exception, match="phase/version changed"):
+        store.transition_task_phase(
+            "owner", task_id, expected_phase="received", expected_version=task["version"],
+            new_phase="planning", next_action="stale_writer",
+        )
+
+
+def test_phase_transition_retries_only_when_concurrent_update_kept_same_phase(task_env, monkeypatch):
+    store, _receipts, controller, _call = task_env
+    original = store.transition_task_phase
+    raced = False
+
+    def concurrent_task_update(*args, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            task = store.get_task("owner", "task_turn-1", include_steps=False, include_events=False)
+            store.transition_task_run(
+                "owner", "task_turn-1", expected_status="queued",
+                expected_version=int(task["version"]), new_status="running",
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "transition_task_phase", concurrent_task_update)
+    updated = controller.transition_phase(
+        "owner", "task_turn-1", "planning", next_action="request_model_plan"
+    )
+    assert updated["phase"] == "planning"
+    assert updated["status"] == "running"
+
+
+def test_restart_resume_uses_phase_and_stops_on_ambiguous_delivery(task_env):
+    store, _receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="queued", wait_reason="restart_before_dispatch",
+    )
+    controller.transition_phase(
+        "owner", task_id, "planning", next_action="request_model_plan"
+    )
+    controller.transition_phase(
+        "owner", task_id, "executing", next_action="dispatch_provider_tool_batch"
+    )
+    resumed = controller.resume_ready_task("owner", task_id)
+    assert resumed["phase"] == "planning"
+    assert resumed["phase_next_action"] == "resume_recovered_task"
+
+    store.transition_task_phase(
+        "owner", task_id, expected_phase="planning", expected_version=resumed["version"],
+        new_phase="verifying", next_action="verify_final_claims",
+    )
+    delivering = store.get_task("owner", task_id)
+    store.transition_task_phase(
+        "owner", task_id, expected_phase="verifying",
+        expected_version=delivering["version"], new_phase="delivering",
+        next_action="deliver_final_response",
+    )
+    with pytest.raises(ValueError, match="delivery outcome is ambiguous"):
+        controller.resume_ready_task("owner", task_id)
+
+
+def test_restart_during_delivery_becomes_partial_without_retry(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "verifying", next_action="verify_final_claims")
+    controller.transition_phase("owner", task_id, "delivering", next_action="deliver_final_response")
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "partial"}]
+    persisted = store.get_task("owner", task_id)
+    assert persisted["status"] == "partial"
+    assert persisted["phase"] == "partial"
+    assert persisted["wait_reason"] == "delivery_outcome_unknown"
+    assert receipts.get("receipt-1").status == "prepared"
+
+
+def test_restart_repairs_partial_delivery_phase_after_split_write(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="partial", wait_reason="delivery_outcome_unknown",
+    )
+    store.transition_task_phase(
+        "owner", task_id, expected_phase="received", expected_version=int(task["version"]),
+        new_phase="delivering", next_action="deliver_final_response",
+    )
+    assert store.get_task("owner", task_id)["phase"] == "delivering"
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "partial"}]
+    assert store.get_task("owner", task_id)["phase"] == "partial"
+
+
+def test_restart_after_persisted_but_unstarted_tool_block_becomes_explicitly_resumable(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_only_lookup", "arguments": {"query": "x"}, "call_id": "read-call"}],
+    )
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "queued"}]
+    persisted = store.get_task("owner", task_id)
+    assert persisted["wait_reason"] == "restart_before_dispatch"
+    assert persisted["phase"] == "planning"
+    assert controller.resume_ready_task("owner", task_id)["status"] == "queued"
+    block = store.list_assistant_tool_call_blocks("owner", task_id)[0]
+    assert block["calls"][0]["call_id"] == "read-call"
+    assert block["calls"][0]["status"] == "pending"
+
+
+def test_restart_with_unlinked_running_call_requires_manual_reconciliation(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "unclassified_tool", "arguments": {}, "call_id": "running-call"}],
+    )
+    store.record_tool_call(
+        "owner", "session", tool_name="unclassified_tool", arguments={},
+        call_id="running-call", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="running-receipt", call_id="running-call", user_id="owner",
+        turn_id="turn-1", round_id=2, tool_name="unclassified_tool",
+        origin="native", arguments={},
+    )
+    receipts.start("running-receipt")
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "needs_reconciliation"}]
+    persisted = store.get_task("owner", task_id)
+    assert persisted["wait_reason"] == "unlinked_tool_call_outcome_unknown"
+    assert persisted["phase"] == "partial"
+
+
+def test_recovery_checks_earlier_blocks_for_ambiguous_call_receipts(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_one", "arguments": {}, "call_id": "old-call"}],
+    )
+    store.record_tool_call(
+        "owner", "session", tool_name="read_one", arguments={},
+        call_id="old-call", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="old-receipt", call_id="old-call", user_id="owner",
+        turn_id="turn-1", round_id=2, tool_name="read_one", origin="native", arguments={},
+    )
+    receipts.start("old-receipt")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_two", "arguments": {}, "call_id": "new-pending-call"}],
+    )
+    step = controller.prepare_step("owner", task_id, tool_name="monitor_add_rule")
+    controller.link_call_to_step(
+        "owner", task_id, step["step_id"], tool_call_id=_call["id"]
+    )
+    controller.transition_phase(
+        "owner", task_id, "planning", next_action="request_next_model_step"
+    )
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "needs_reconciliation"}]
+    assert store.get_task("owner", task_id)["phase"] == "partial"
+
+
+def test_recovery_ignores_confirmed_historical_block_before_active_pending_block(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_one", "arguments": {}, "call_id": "completed-old-call"}],
+    )
+    store.record_tool_call(
+        "owner", "session", tool_name="read_one", arguments={},
+        call_id="completed-old-call", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="completed-old-receipt", call_id="completed-old-call", user_id="owner",
+        turn_id="turn-1", round_id=2, tool_name="read_one", origin="native", arguments={},
+    )
+    receipts.start("completed-old-receipt")
+    receipts.finish(
+        "completed-old-receipt", status="confirmed", ok=True, complete=True,
+        result_summary="read complete",
+    )
+    store.finish_tool_call(
+        "owner", "session", "completed-old-call", status="succeeded", result={"ok": True}
+    )
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_two", "arguments": {}, "call_id": "active-pending-call"}],
+    )
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "queued"}]
+    persisted = store.get_task("owner", task_id)
+    assert persisted["wait_reason"] == "restart_before_dispatch"
+
+
+def test_recovery_allows_consistently_failed_historical_block(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_one", "arguments": {}, "call_id": "failed-old-call"}],
+    )
+    store.record_tool_call(
+        "owner", "session", tool_name="read_one", arguments={},
+        call_id="failed-old-call", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="failed-old-receipt", call_id="failed-old-call", user_id="owner",
+        turn_id="turn-1", round_id=2, tool_name="read_one", origin="native", arguments={},
+    )
+    receipts.start("failed-old-receipt")
+    receipts.finish(
+        "failed-old-receipt", status="failed", ok=False, complete=False,
+        error="read failed",
+    )
+    store.finish_tool_call(
+        "owner", "session", "failed-old-call", status="failed", error="read failed"
+    )
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_two", "arguments": {}, "call_id": "active-pending-call"}],
+    )
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "queued"}]
+
+
+def test_active_terminal_unlinked_block_is_not_resumed(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "read_one", "arguments": {}, "call_id": "active-completed-call"}],
+    )
+    store.record_tool_call(
+        "owner", "session", tool_name="read_one", arguments={},
+        call_id="active-completed-call", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="active-completed-receipt", call_id="active-completed-call", user_id="owner",
+        turn_id="turn-1", round_id=2, tool_name="read_one", origin="native", arguments={},
+    )
+    receipts.start("active-completed-receipt")
+    receipts.finish(
+        "active-completed-receipt", status="confirmed", ok=True, complete=True,
+        result_summary="done",
+    )
+    store.finish_tool_call(
+        "owner", "session", "active-completed-call", status="succeeded", result={"ok": True}
+    )
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "needs_reconciliation"}]
+
+
+def test_unlinked_receipt_from_another_turn_is_not_accepted(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "unlinked_tool", "arguments": {}, "call_id": "foreign-receipt-call"}],
+    )
+    store.record_tool_call(
+        "owner", "session", tool_name="unlinked_tool", arguments={},
+        call_id="foreign-receipt-call", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="foreign-unlinked-receipt", call_id="foreign-receipt-call", user_id="owner",
+        turn_id="other-turn", round_id=2, tool_name="unlinked_tool",
+        origin="native", arguments={},
+    )
+    receipts.start("foreign-unlinked-receipt")
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "needs_reconciliation"}]
+
+
+def test_recovery_repairs_needs_reconciliation_phase_after_split_write(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="needs_reconciliation", wait_reason="unlinked_tool_call_outcome_unknown",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "needs_reconciliation"}]
+    persisted = store.get_task("owner", task_id)
+    assert persisted["status"] == "needs_reconciliation"
+    assert persisted["phase"] == "partial"
+
+
+def test_recovery_repairs_successful_run_phase_after_split_write(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="succeeded",
+    )
+    store.transition_task_phase(
+        "owner", task_id, expected_phase="received", expected_version=int(task["version"]),
+        new_phase="delivering", next_action="deliver_final_response",
+    )
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "succeeded"}]
+    assert store.get_task("owner", task_id)["phase"] == "completed"
+
+
+def test_terminal_call_with_prepared_receipt_is_not_resumed(task_env):
+    store, receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "executing", next_action="dispatch_provider_tool_batch")
+    store.persist_assistant_tool_call_block(
+        "owner", "session", task_id, "turn-1",
+        [{"tool_name": "tool_x", "arguments": {}, "call_id": "terminal-call"}],
+    )
+    store.record_tool_call(
+        "owner", "session", tool_name="tool_x", arguments={},
+        call_id="terminal-call", turn_id="turn-1", status="running",
+    )
+    store.finish_tool_call("owner", "session", "terminal-call", status="failed")
+    receipts.prepare(
+        receipt_id="prepared-terminal-receipt", call_id="terminal-call", user_id="owner",
+        turn_id="turn-1", round_id=2, tool_name="tool_x", origin="native", arguments={},
+    )
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": task_id, "status": "needs_reconciliation"}]
+    assert store.get_task("owner", task_id)["phase"] == "partial"
+
+
+def test_turn_finalization_preserves_ambiguous_delivery_as_partial(task_env):
+    store, _receipts, controller, _call = task_env
+    task_id = "task_turn-1"
+    task = store.get_task("owner", task_id)
+    task = store.transition_task_run(
+        "owner", task_id, expected_status="queued", expected_version=int(task["version"]),
+        new_status="running",
+    )
+    controller.transition_phase("owner", task_id, "planning", next_action="request_model_plan")
+    controller.transition_phase("owner", task_id, "verifying", next_action="verify_final_claims")
+    controller.transition_phase("owner", task_id, "delivering", next_action="deliver_final_response")
+    partial = controller.mark_delivery_unknown("owner", task_id)
+    assert partial["phase"] == "partial"
+    assert partial["wait_reason"] == "delivery_outcome_unknown"
+    finalized = controller.finish_turn("owner", task_id)
+    assert finalized["status"] == partial["status"] == "partial"
+    assert finalized["wait_reason"] == "delivery_outcome_unknown"
+
+
 def test_durable_plan_claims_only_the_next_exact_tool_and_reuses_task_steps(task_env):
     store, receipts, controller, call = task_env
     plan = controller.create_plan(
@@ -383,6 +838,51 @@ def test_started_receipt_after_restart_requires_reconciliation(task_env):
     receipts.start("receipt-1")
     recovered = controller.recover_incomplete("owner", receipts)
     assert recovered == [{"task_id": "task_turn-1", "status": "needs_reconciliation"}]
+
+
+def test_linked_prepared_receipt_cannot_hide_second_started_receipt(task_env):
+    store, receipts, controller, call = task_env
+    controller.start_step(
+        "owner", "task_turn-1", tool_call_id=call["id"],
+        receipt_id="receipt-1", tool_name="monitor_add_rule",
+    )
+    receipts.prepare(
+        receipt_id="receipt-duplicate", call_id="call-1", user_id="owner",
+        turn_id="turn-1", round_id=2, tool_name="monitor_add_rule",
+        origin="native", arguments={"name": "x"},
+    )
+    receipts.start("receipt-duplicate")
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": "task_turn-1", "status": "needs_reconciliation"}]
+    persisted = store.get_task("owner", "task_turn-1")
+    assert persisted["status"] == "needs_reconciliation"
+    assert persisted["steps"][0]["status"] == "needs_reconciliation"
+    assert receipts.get("receipt-1").status == "prepared"
+    assert receipts.get("receipt-duplicate").status == "started"
+
+
+def test_linked_receipt_from_another_turn_is_not_accepted(task_env):
+    store, receipts, controller, _call = task_env
+    foreign_call = store.record_tool_call(
+        "owner", "session", tool_name="monitor_add_rule", arguments={"name": "y"},
+        call_id="foreign-turn-call", turn_id="turn-1", status="running",
+    )
+    receipts.prepare(
+        receipt_id="foreign-turn-receipt", call_id="foreign-turn-call", user_id="owner",
+        turn_id="other-turn", round_id=2, tool_name="monitor_add_rule",
+        origin="native", arguments={"name": "y"},
+    )
+    controller.start_step(
+        "owner", "task_turn-1", tool_call_id=foreign_call["id"],
+        receipt_id="foreign-turn-receipt", tool_name="monitor_add_rule",
+    )
+
+    recovered = controller.recover_incomplete("owner", receipts)
+    assert recovered == [{"task_id": "task_turn-1", "status": "needs_reconciliation"}]
+    persisted = store.get_task("owner", "task_turn-1")
+    assert persisted["status"] == "needs_reconciliation"
+    assert persisted["steps"][0]["status"] == "needs_reconciliation"
     task = controller.store.get_task("owner", "task_turn-1")
     assert task["status"] == "needs_reconciliation"
     assert task["steps"][0]["status"] == "needs_reconciliation"

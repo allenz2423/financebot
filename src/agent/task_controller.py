@@ -17,12 +17,53 @@ from src.services.authorization import (
     HumanApproval,
     approve_request,
 )
-from src.db.session_store import SessionStore
+from src.db.session_store import ConcurrentTaskUpdate, SessionStore
+from src.services.tool_receipts import arguments_hash
 
 
 class TaskController:
+    _PHASE_TRANSITIONS = {
+        "received": {"planning", "partial", "failed"},
+        "planning": {"executing", "awaiting_child", "awaiting_user", "verifying", "partial", "failed"},
+        "executing": {"planning", "awaiting_child", "awaiting_user", "verifying", "partial", "failed"},
+        "awaiting_child": {"planning", "partial", "failed"},
+        "awaiting_user": {"planning", "verifying", "partial", "failed"},
+        "verifying": {"planning", "delivering", "partial", "failed"},
+        "delivering": {"awaiting_user", "planning", "completed", "partial", "failed"},
+        "completed": set(), "partial": set(), "failed": set(),
+    }
+
     def __init__(self, store: SessionStore):
         self.store = store
+
+    def transition_phase(
+        self, user_id: str, task_id: str, phase: str, *, next_action: str | None,
+        event_payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist an allowed turn phase using task-row version CAS."""
+        target = str(phase).strip().casefold()
+        for attempt in range(3):
+            task = self.store.get_task(
+                user_id, task_id, include_steps=False, include_events=False
+            )
+            current = str(task.get("phase") or "received")
+            if target == current and task.get("phase_next_action") == next_action and not event_payload:
+                return task
+            if target != current and target not in self._PHASE_TRANSITIONS.get(current, set()):
+                raise ValueError(f"invalid task phase transition: {current} -> {target}")
+            try:
+                return self.store.transition_task_phase(
+                    user_id, task_id, expected_phase=current,
+                    expected_version=int(task["version"]), new_phase=target,
+                    next_action=next_action, event_payload=event_payload,
+                )
+            except ConcurrentTaskUpdate:
+                latest = self.store.get_task(
+                    user_id, task_id, include_steps=False, include_events=False
+                )
+                if str(latest.get("phase") or "received") != current or attempt == 2:
+                    raise
+        raise ConcurrentTaskUpdate("task phase could not be persisted after concurrent updates")
 
     def create_turn(
         self, user_id: str, session_id: str, turn_id: str, objective: str,
@@ -159,17 +200,137 @@ class TaskController:
         )
         return self.store.get_task(user_id, task_id)
 
+    def _has_ambiguous_unlinked_call(
+        self, user_id: str, task: Mapping[str, Any], receipt_store: Any
+    ) -> bool:
+        """Fail closed on any non-prepared receipt not owned by a durable step."""
+        linked_call_ids: set[str] = set()
+        try:
+            for step in task.get("steps", []):
+                if step.get("tool_call_id") is not None:
+                    call = self.store.get_tool_call(user_id, int(step["tool_call_id"]))
+                    linked_call_ids.add(str(call["call_key"]))
+            blocks = self.store.list_assistant_tool_call_blocks(
+                user_id, str(task["task_id"]), limit=500
+            )
+        except Exception:
+            return True
+
+        for block_index, block in enumerate(blocks):
+            is_active_block = block_index == len(blocks) - 1
+            for call in block["calls"]:
+                if call["call_id"] in linked_call_ids:
+                    continue
+                try:
+                    receipts = receipt_store.list_for_call(call["call_id"], user_id=user_id)
+                except Exception:
+                    return True
+                if len(receipts) > 1:
+                    return True
+                if not receipts:
+                    if call["status"] not in {"pending", "running"}:
+                        return True
+                    continue
+                receipt = receipts[0]
+                identity_matches = (
+                    receipt.call_id == call["call_id"]
+                    and receipt.user_id == user_id
+                    and receipt.tool_name == call["tool_name"]
+                    and receipt.arguments_hash == arguments_hash(call["arguments"])
+                    and receipt.turn_id == call["turn_id"]
+                )
+                if not identity_matches:
+                    return True
+                if (
+                    receipt.status == "prepared"
+                    and call["status"] in {"pending", "running"}
+                ):
+                    continue
+                if receipt.status in {"started", "unknown"}:
+                    return True
+                expected_status = "succeeded" if receipt.status == "confirmed" else "failed"
+                if receipt.status not in {"confirmed", "failed"} or call["status"] != expected_status:
+                    return True
+                if task.get("phase") == "executing" and is_active_block:
+                    # A tool block returned by the active provider round has
+                    # not had its result fed back into model context yet.
+                    return True
+        return False
+
     def recover_incomplete(self, user_id: str, receipt_store: Any) -> list[dict[str, Any]]:
         """Project linked receipt outcomes after a process restart, never replay."""
         recovered: list[dict[str, Any]] = []
         for listed in self.store.list_tasks(user_id, statuses=["running", "queued"], limit=500):
             task = self.store.get_task(user_id, listed["task_id"])
+            if self._has_ambiguous_unlinked_call(user_id, task, receipt_store):
+                updated = self.store.transition_task_run(
+                    user_id, task["task_id"], expected_status=task["status"],
+                    expected_version=int(task["version"]),
+                    new_status="needs_reconciliation",
+                    wait_reason="unlinked_tool_call_outcome_unknown",
+                    event_type="task.reconciliation_required",
+                    event_payload={"reason_code": "unlinked_tool_call_outcome_unknown"},
+                )
+                self.transition_phase(
+                    user_id, task["task_id"], "partial",
+                    next_action="manual_tool_call_reconciliation",
+                )
+                recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                continue
             current_id = task.get("current_step_id")
             step = next((s for s in task["steps"] if s["step_id"] == current_id), None)
             if step is None or step["status"] not in {"pending", "running"}:
                 step = next((s for s in reversed(task["steps"])
                              if s["status"] in {"pending", "running"}), None)
             if step is None:
+                if task.get("phase") == "delivering":
+                    # A restart can occur after Discord accepted the response
+                    # but before the client observed success. Preserve that
+                    # ambiguity as partial and never issue a duplicate send.
+                    updated = self.store.transition_task_run(
+                        user_id, task["task_id"], expected_status=task["status"],
+                        expected_version=int(task["version"]), new_status="partial",
+                        wait_reason="delivery_outcome_unknown",
+                        event_type="task.delivery_outcome_unknown",
+                        event_payload={"reason_code": "delivery_outcome_unknown"},
+                    )
+                    self.transition_phase(
+                        user_id, task["task_id"], "partial",
+                        next_action="manual_delivery_reconciliation",
+                    )
+                    recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                    continue
+                if task.get("phase") == "executing":
+                    updated = self.store.transition_task_run(
+                        user_id, task["task_id"], expected_status=task["status"],
+                        expected_version=int(task["version"]), new_status="queued",
+                        wait_reason="restart_before_dispatch",
+                        event_type="task.resume_ready",
+                        event_payload={"status": "restart_before_dispatch"},
+                    )
+                    self.transition_phase(
+                        user_id, task["task_id"], "planning",
+                        next_action="resume_recovered_task",
+                    )
+                    recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                    continue
+                if task.get("phase") in {"planning", "verifying"} and not any(
+                    item["status"] == "ready" and item.get("description") is not None
+                    for item in task["steps"]
+                ):
+                    updated = self.store.transition_task_run(
+                        user_id, task["task_id"], expected_status=task["status"],
+                        expected_version=int(task["version"]), new_status="queued",
+                        wait_reason="restart_before_dispatch",
+                        event_type="task.resume_ready",
+                        event_payload={"status": "restart_before_dispatch"},
+                    )
+                    self.transition_phase(
+                        user_id, task["task_id"], "planning",
+                        next_action="resume_recovered_task",
+                    )
+                    recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                    continue
                 has_ready_plan_step = any(
                     s["status"] == "ready" and s.get("description") is not None
                     for s in task["steps"]
@@ -214,24 +375,29 @@ class TaskController:
             }:
                 continue
             receipt = None
-            if step.get("receipt_id"):
-                try:
-                    receipt = receipt_store.get(step["receipt_id"])
-                except Exception:
-                    receipt = None
-                    receipt_missing = True
-                else:
-                    receipt_missing = False
-            elif step.get("tool_call_id"):
+            if step.get("tool_call_id"):
                 call = self.store.get_tool_call(user_id, int(step["tool_call_id"]))
                 candidates = receipt_store.list_for_call(call["call_key"], user_id=user_id)
-                if len(candidates) == 1:
+                if (
+                    len(candidates) == 1
+                    and (
+                        step.get("receipt_id") is None
+                        or candidates[0].receipt_id == step.get("receipt_id")
+                    )
+                    and candidates[0].call_id == call["call_key"]
+                    and candidates[0].user_id == user_id
+                    and candidates[0].tool_name == call["tool_name"]
+                    and candidates[0].arguments_hash == arguments_hash(call["arguments"])
+                    and candidates[0].turn_id == call.get("turn_key")
+                ):
                     receipt = candidates[0]
-                elif len(candidates) > 1:
-                    receipt_missing = True
-                    receipt = None
-                else:
                     receipt_missing = False
+                else:
+                    receipt_missing = True
+            elif step.get("receipt_id"):
+                # A receipt without its matching call link cannot prove which
+                # exact action it describes; never treat it as undispatched.
+                receipt_missing = True
             else:
                 receipt_missing = False
 
@@ -320,6 +486,38 @@ class TaskController:
                     reason=f"receipt_{receipt.status}_after_restart",
                 )
                 recovered.append({"task_id": task["task_id"], "status": "needs_reconciliation"})
+        status_phase = {
+            "succeeded": "completed", "failed": "failed", "cancelled": "failed",
+            "partial": "partial", "needs_reconciliation": "partial",
+            "waiting_user": "awaiting_user", "waiting_approval": "awaiting_user",
+        }
+        for status, target_phase in status_phase.items():
+            for listed in self.store.list_tasks(user_id, statuses=[status], limit=500):
+                task = self.store.get_task(
+                    user_id, listed["task_id"], include_steps=False, include_events=False
+                )
+                phase = str(task.get("phase") or "received")
+                # Only repair a crash-window mismatch; do not rewrite an
+                # already terminal phase based on an inconsistent lifecycle row.
+                if phase in {"completed", "partial", "failed"} or phase == target_phase:
+                    continue
+                if status == "succeeded" and phase != "delivering":
+                    continue
+                action = {
+                    "completed": None,
+                    "failed": "report_turn_failure",
+                    "awaiting_user": "wait_for_exact_choice",
+                    "partial": (
+                        "manual_delivery_reconciliation"
+                        if phase == "delivering"
+                        else "manual_tool_call_reconciliation"
+                    ),
+                }[target_phase]
+                self.transition_phase(
+                    user_id, task["task_id"], target_phase, next_action=action
+                )
+                if not any(item.get("task_id") == task["task_id"] for item in recovered):
+                    recovered.append({"task_id": task["task_id"], "status": status})
         return recovered
 
     def resume_ready_task(self, user_id: str, task_id: str) -> dict[str, Any]:
@@ -333,6 +531,17 @@ class TaskController:
             and not wait_reason.startswith("resume_after_reply:")
         ):
             raise ValueError("task is not ready for a safe post-restart continuation")
+        phase = str(task.get("phase") or "received")
+        if phase == "delivering":
+            raise ValueError(
+                "task delivery outcome is ambiguous; reconcile the prior response before resuming"
+            )
+        if phase in {"partial", "failed", "completed"}:
+            raise ValueError("task phase is terminal and cannot be resumed")
+        self.transition_phase(
+            user_id, task_id, "planning", next_action="resume_recovered_task"
+        )
+        task = self.store.get_task(user_id, task_id)
         return task
 
     def finish_turn(self, user_id: str, task_id: str, *, failed: bool = False) -> dict[str, Any]:
@@ -390,6 +599,27 @@ class TaskController:
             expected_version=int(task["version"]), new_status=terminal,
             result_ref="turn_completed" if terminal == "succeeded" else None,
         )
+        return self.store.get_task(user_id, task_id)
+
+    def mark_delivery_unknown(self, user_id: str, task_id: str) -> dict[str, Any]:
+        """Keep an ambiguous outbound send partial and prohibit automatic resend."""
+        task = self.store.get_task(user_id, task_id, include_steps=False, include_events=False)
+        if task["status"] in {
+            "queued", "running", "waiting_user", "waiting_approval", "verifying",
+        }:
+            self.store.transition_task_run(
+                user_id, task_id, expected_status=task["status"],
+                expected_version=int(task["version"]), new_status="partial",
+                wait_reason="delivery_outcome_unknown",
+                event_type="task.delivery_outcome_unknown",
+                event_payload={"reason_code": "delivery_outcome_unknown"},
+            )
+        task = self.store.get_task(user_id, task_id, include_steps=False, include_events=False)
+        if task.get("phase") == "delivering":
+            self.transition_phase(
+                user_id, task_id, "partial",
+                next_action="manual_delivery_reconciliation",
+            )
         return self.store.get_task(user_id, task_id)
 
     def request_user(
