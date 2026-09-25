@@ -8,10 +8,17 @@
 - **Human decisions needed before Step 2 can pass:** (1) define how an affirmative persisted approval becomes the exact action-bound grant consumed by dispatch and linked receipt, without a second approval/authorization ledger; (2) decide reconciliation-notice delivery semantics across SQLite and Discord, which cannot be exactly-once, while preserving no-duplicate/no-ambiguous-retry guarantees. Do not dispatch approved or ambiguous side effects.
 - **Dependency-blocked:** Steps 3–6; roadmap item 3 (background jobs), item 2 (delegation/capacity routing), then items 11/5/6, 8/12, and 10/13/14/15 in the documented recommended order. Their required continuity/scheduler dependencies have not passed. No scheduler, delegation, background-job, browser, or reviewer-model work was started.
 - **Deferred item 4 suggestions:** full Gmail-dispatcher integration test; model-level prompt-injection evaluation; many-intervening-calls retention test; explicit test/documentation for stale unlinked Gmail records suppressing recall; review mixed email/financial intent classification.
-- **Verification baseline:** item 4 focused suite: 25 passed. Full suite in an isolated temporary directory: 590 passed, 1 skipped, 10 failed. The failures are the known clean-DB/seed-data expectations and pre-existing Discord budget-dashboard failure; no live finance database or account credentials were used. `py_compile` and `git diff --check` passed.
-- **Review first:** resolve the Step 2 approval/grant and notice-delivery contract, then add dispatcher-level coverage for input-only replies before authorizing Steps 3+.
+- **Verification baseline:** latest task-list change: focused session/catalog/store suite 28 passed; full suite in an isolated temporary directory: 596 passed, 1 skipped, 10 failed. Failures are the known clean-DB/seed-data expectations and pre-existing Discord budget-dashboard failure; no live finance database or account credentials were used. `py_compile` and `git diff --check` passed.
+- **Review first:** finish item 1's durable plan creation/policy, resolve the Step 2 approval/grant and notice-delivery contracts, and add dispatcher-level coverage for input-only replies before authorizing Steps 3+.
 
 ## Progress
+
+### Item 1 — model-visible durable task inspection — partial; item remains in progress
+
+- Added read-only `task_list` to the model schema and tool loop. It inspects only the active owner/conversation, supports an exact status filter, and returns bounded task/step summaries. SQL limits task count, objective/wait text, step count, and next-action text before building the model payload; task/event histories are not loaded. The tool and persisted text are explicitly described as untrusted context, and task status is not treated as proof of an external action.
+- Verification: focused session recall/catalog/store suite: 28 passed; full suite: 596 passed, 1 skipped, 10 known clean-database/seed-data failures. `py_compile` and `git diff --check` passed. Fresh adversarial critic: no blockers.
+- Remaining item 1 work: persist a plan for requests with three or more actions/artifacts/external side effects, with criteria and status transitions. This tool alone does not satisfy item 1's Proposed Sol or the overall continuity slice.
+- Deferred critic suggestions: add a dispatcher-level test proving `task_list` passes the active owner/session/channel/thread and remains read-only; provide a model-usable evidence lookup path from listed task steps to linked call/receipt evidence before the model makes outcome claims. Isolation tests now cover same session keys across owners, channels, threads, and unthreaded conversations.
 
 ### Item 4 — durable session recall — passed
 
