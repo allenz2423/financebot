@@ -101,6 +101,7 @@ def test_task_steps_events_and_existing_evidence_links_survive_restart(tmp_path)
         first = store.add_task_step(
             "owner-1", task["task_id"], 0, step_id="step-1", status="ready",
             next_action="search_gmail", retry_policy={"mode": "safe_read"},
+            description="Search the inbox", completion_criteria="A confirmed receipt has message IDs.",
             tool_call_id=call["id"], receipt_id=receipt.receipt_id,
         )
         second = store.add_task_step(
@@ -126,6 +127,9 @@ def test_task_steps_events_and_existing_evidence_links_survive_restart(tmp_path)
         assert recovered["steps"][0]["tool_call_id"] == call["id"]
         assert recovered["steps"][0]["receipt_id"] == "gmail-receipt"
         assert recovered["steps"][0]["retry_policy"] == {"mode": "safe_read"}
+        assert recovered["steps"][0]["description"] == "Search the inbox"
+        assert recovered["steps"][0]["completion_criteria"] == "A confirmed receipt has message IDs."
+        assert recovered["steps"][0]["retry_count"] == 0
         assert [event["event_type"] for event in recovered["events"]] == [
             "task.created", "step.created", "step.created",
             "step.transitioned", "task.transitioned",

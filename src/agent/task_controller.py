@@ -56,6 +56,14 @@ class TaskController:
             next_action=f"dispatch:{tool_name}",
         )
 
+    def create_plan(
+        self, user_id: str, task_id: str, steps: list[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return self.store.create_task_plan(user_id, task_id, steps)
+
+    def has_plan(self, user_id: str, task_id: str) -> bool:
+        return self.store.task_has_plan(user_id, task_id)
+
     def prepare_step(self, user_id: str, task_id: str, *, tool_name: str) -> dict[str, Any]:
         task = self.store.get_task(user_id, task_id)
         if task["status"] not in {"queued", "running"}:
@@ -65,6 +73,23 @@ class TaskController:
             if pending.get("next_action") != f"dispatch:{tool_name}":
                 raise ValueError("a different undispatched task step must be resumed first")
             return pending
+        planned = next(
+            (
+                step for step in task["steps"]
+                if step["status"] == "ready" and step.get("description") is not None
+            ),
+            None,
+        )
+        if planned is not None:
+            if planned.get("next_action") != f"dispatch:{tool_name}":
+                raise ValueError("the next planned task step requires a different tool")
+            return self.store.transition_task_step(
+                user_id, task_id, planned["step_id"],
+                expected_status="ready", expected_version=int(planned["version"]),
+                new_status="pending", next_action=planned["next_action"],
+            )
+        if self.store.task_has_plan(user_id, task_id):
+            raise ValueError("the durable plan has no remaining dispatchable steps")
         return self.store.add_task_step(
             user_id, task_id, len(task["steps"]), status="pending",
             next_action=f"dispatch:{tool_name}",
@@ -113,7 +138,8 @@ class TaskController:
         if outcome == "confirmed":
             pass
         elif outcome == "failed":
-            pass
+            if step.get("description") is not None:
+                task_status = "failed"
         elif outcome == "unknown":
             step_status = "needs_reconciliation"
             task_status = "needs_reconciliation"
@@ -144,6 +170,19 @@ class TaskController:
                 step = next((s for s in reversed(task["steps"])
                              if s["status"] in {"pending", "running"}), None)
             if step is None:
+                has_ready_plan_step = any(
+                    s["status"] == "ready" and s.get("description") is not None
+                    for s in task["steps"]
+                )
+                if task["status"] == "queued" and has_ready_plan_step and task.get("wait_reason") != "plan_pending":
+                    self.store.transition_task_run(
+                        user_id, task["task_id"], expected_status="queued",
+                        expected_version=int(task["version"]), new_status="queued",
+                        wait_reason="plan_pending", event_type="task.resume_ready",
+                        event_payload={"status": "planned_steps_pending"},
+                    )
+                    recovered.append({"task_id": task["task_id"], "status": "queued"})
+                    continue
                 if task["status"] == "running" and task["steps"]:
                     if any(s["status"] == "failed" for s in task["steps"]):
                         self.store.transition_task_run(
@@ -152,6 +191,14 @@ class TaskController:
                             wait_reason="restart_after_confirmed_failure",
                         )
                         recovered.append({"task_id": task["task_id"], "status": "failed"})
+                    elif has_ready_plan_step:
+                        self.store.transition_task_run(
+                            user_id, task["task_id"], expected_status="running",
+                            expected_version=int(task["version"]), new_status="queued",
+                            wait_reason="plan_pending", event_type="task.resume_ready",
+                            event_payload={"status": "planned_steps_pending"},
+                        )
+                        recovered.append({"task_id": task["task_id"], "status": "queued"})
                     elif all(s["status"] == "succeeded" for s in task["steps"]):
                         self.store.transition_task_run(
                             user_id, task["task_id"], expected_status="running",
@@ -281,7 +328,7 @@ class TaskController:
         if task["status"] != "queued" or (
             wait_reason not in {
                 "restart_after_confirmed_step", "restart_before_dispatch",
-                "monitor_readback_required",
+                "monitor_readback_required", "plan_pending",
             }
             and not wait_reason.startswith("resume_after_reply:")
         ):
@@ -290,7 +337,10 @@ class TaskController:
 
     def finish_turn(self, user_id: str, task_id: str, *, failed: bool = False) -> dict[str, Any]:
         task = self.store.get_task(user_id, task_id)
-        if task["status"] in {"needs_reconciliation", "waiting_user", "waiting_approval"}:
+        if task["status"] in {
+            "needs_reconciliation", "waiting_user", "waiting_approval",
+            "succeeded", "partial", "failed", "cancelled",
+        }:
             return task
         steps = task["steps"]
         if self.store.task_requires_monitor_readback(user_id, task_id):
@@ -302,7 +352,7 @@ class TaskController:
                 event_payload={"status": "monitor_readback_required"},
             )
             return self.store.get_task(user_id, task_id)
-        active = [s for s in steps if s["status"] in {"running", "ready"}]
+        active = [s for s in steps if s["status"] == "running"]
         if active:
             step = active[0]
             self.store.transition_task_step_and_run(
@@ -321,6 +371,17 @@ class TaskController:
                 wait_reason="restart_before_dispatch",
                 event_type="task.resume_ready",
                 event_payload={"status": "pending_step"},
+            )
+            return self.store.get_task(user_id, task_id)
+        planned = [
+            s for s in steps if s["status"] == "ready" and s.get("description") is not None
+        ]
+        if planned:
+            self.store.transition_task_run(
+                user_id, task_id, expected_status=task["status"],
+                expected_version=int(task["version"]), new_status="queued",
+                wait_reason="plan_pending", event_type="task.resume_ready",
+                event_payload={"status": "planned_steps_pending"},
             )
             return self.store.get_task(user_id, task_id)
         terminal = "failed" if failed or any(s["status"] == "failed" for s in steps) else "succeeded"

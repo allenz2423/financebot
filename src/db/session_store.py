@@ -73,6 +73,7 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "enum", "required",
     "toolname", "operation", "risk", "summary", "approvalexpiresat",
     "approvalstatus", "approvedby", "decidedat",
+    "plannedstepids", "stepcount",
 }
 _UNSET = object()
 
@@ -725,6 +726,8 @@ class SessionStore:
         dependency_ids: list[str] | tuple[str, ...] = (),
         status: str = "pending",
         next_action: str | None = None,
+        description: str | None = None,
+        completion_criteria: str | None = None,
         retry_policy: Mapping[str, Any] | None = None,
         tool_call_id: int | None = None,
         receipt_id: str | None = None,
@@ -755,12 +758,14 @@ class SessionStore:
             conn.execute(
                 """INSERT INTO task_steps(
                        step_id, task_id, step_order, dependency_ids_json, status,
-                       next_action, retry_policy_json, tool_call_id, receipt_id,
+                       next_action, description, completion_criteria,
+                       retry_policy_json, tool_call_id, receipt_id,
                        created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     step_key, task_key, order, _json(dependencies, default=[]),
-                    step_status, next_action, _json(retry_policy, default={}),
+                    step_status, next_action, description, completion_criteria,
+                    _json(retry_policy, default={}),
                     call_pk, receipt_key, now, now,
                 ),
             )
@@ -775,6 +780,92 @@ class SessionStore:
             return self._row(
                 conn.execute("SELECT * FROM task_steps WHERE step_id=?", (step_key,)).fetchone()
             )  # type: ignore[return-value]
+
+    def create_task_plan(
+        self,
+        user_id: str,
+        task_id: str,
+        steps: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Atomically seed an ordered plan on the task's canonical step rows."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        if not isinstance(steps, list) or not 2 <= len(steps) <= 20:
+            raise ValueError("a durable plan must contain 2–20 steps")
+        normalized: list[dict[str, str]] = []
+        for item in steps:
+            if not isinstance(item, Mapping):
+                raise ValueError("each plan step must be an object")
+            action = _required(item.get("tool_name"), "tool_name")
+            description = _required(item.get("description"), "description")
+            criteria = _required(item.get("completion_criteria"), "completion_criteria")
+            if len(action) > 100 or len(description) > 500 or len(criteria) > 500:
+                raise ValueError("plan step fields exceed their length limits")
+            normalized.append({
+                "step_id": f"step_{uuid.uuid4().hex}",
+                "tool_name": action,
+                "description": description,
+                "completion_criteria": criteria,
+            })
+        now = _now()
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            if str(task["status"]) not in {"queued", "running"}:
+                raise ValueError("task is not accepting a plan")
+            if conn.execute(
+                "SELECT 1 FROM task_steps WHERE task_id=? LIMIT 1", (task_key,)
+            ).fetchone() is not None:
+                raise ValueError("task already has steps; a new plan revision is not supported")
+            for order, step in enumerate(normalized):
+                conn.execute(
+                    """INSERT INTO task_steps(
+                           step_id, task_id, step_order, dependency_ids_json, status,
+                           next_action, description, completion_criteria, retry_policy_json,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, '[]', 'ready', ?, ?, ?, '{}', ?, ?)""",
+                    (
+                        step["step_id"], task_key, order,
+                        f"dispatch:{step['tool_name']}", step["description"],
+                        step["completion_criteria"], now, now,
+                    ),
+                )
+            cursor = conn.execute(
+                "UPDATE task_runs SET version=version+1, updated_at=? "
+                "WHERE task_id=? AND user_id=? AND status=? AND version=?",
+                (now, task_key, owner, str(task["status"]), int(task["version"])),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task changed while its plan was being saved")
+            self._insert_task_event(
+                conn,
+                task_id=task_key,
+                event_type="task.plan_created",
+                payload={
+                    "status": "planned",
+                    "step_count": len(normalized),
+                    "planned_step_ids": [step["step_id"] for step in normalized],
+                },
+            )
+            return [
+                {
+                    **step,
+                    "step_order": order,
+                    "status": "ready",
+                    "retry_count": 0,
+                    "next_action": f"dispatch:{step['tool_name']}",
+                }
+                for order, step in enumerate(normalized)
+            ]
+
+    def task_has_plan(self, user_id: str, task_id: str) -> bool:
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        with self._lock:
+            self._task_pk(self.connection, owner, task_key)
+            return self.connection.execute(
+                "SELECT 1 FROM task_steps WHERE task_id=? AND description IS NOT NULL LIMIT 1",
+                (task_key,),
+            ).fetchone() is not None
 
     def start_task_step(
         self,
@@ -1168,7 +1259,10 @@ class SessionStore:
         with self._lock:
             self._task_pk(self.connection, owner, task_key)
             rows = self.connection.execute(
-                """SELECT step_id, status, substr(next_action, 1, 201) AS next_action
+                """SELECT step_id, status, retry_count,
+                          substr(next_action, 1, 201) AS next_action,
+                          substr(description, 1, 501) AS description,
+                          substr(completion_criteria, 1, 501) AS completion_criteria
                    FROM task_steps WHERE task_id=?
                    ORDER BY step_order, step_id LIMIT ?""",
                 (task_key, bounded_limit),

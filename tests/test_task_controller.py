@@ -87,6 +87,108 @@ def test_task_step_is_linked_before_dispatch_and_confirmed_completion(task_env):
     assert controller.finish_turn("owner", "task_turn-1")["status"] == "succeeded"
 
 
+def test_durable_plan_claims_only_the_next_exact_tool_and_reuses_task_steps(task_env):
+    store, receipts, controller, call = task_env
+    plan = controller.create_plan(
+        "owner", "task_turn-1", [
+            {
+                "tool_name": "monitor_add_rule",
+                "description": "Create the requested monitor rule.",
+                "completion_criteria": "A confirmed receipt records the rule ID.",
+            },
+            {
+                "tool_name": "monitor_list_rules",
+                "description": "Read the new rule back.",
+                "completion_criteria": "The owner-scoped rule ID and configuration match.",
+            },
+        ],
+    )
+    assert len(plan) == 2
+    assert controller.has_plan("owner", "task_turn-1")
+    task = store.get_task("owner", "task_turn-1")
+    assert task["steps"][0]["status"] == "ready"
+    assert task["steps"][0]["completion_criteria"].startswith("A confirmed receipt")
+
+    with pytest.raises(ValueError, match="requires a different tool"):
+        controller.prepare_step("owner", "task_turn-1", tool_name="monitor_list_rules")
+    first = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_add_rule")
+    controller.link_call_to_step(
+        "owner", "task_turn-1", first["step_id"], tool_call_id=call["id"]
+    )
+    controller.claim_step(
+        "owner", "task_turn-1", first["step_id"], receipt_id="receipt-1"
+    )
+    receipts.start("receipt-1")
+    receipts.finish("receipt-1", status="confirmed", ok=True, complete=True)
+    controller.finish_step("owner", "task_turn-1", first["step_id"], outcome="confirmed")
+
+    second = controller.prepare_step(
+        "owner", "task_turn-1", tool_name="monitor_list_rules"
+    )
+    assert second["step_id"] == plan[1]["step_id"]
+    assert second["status"] == "pending"
+    with pytest.raises(ValueError, match="different undispatched task step"):
+        # A planned task cannot skip the next saved action.
+        controller.prepare_step("owner", "task_turn-1", tool_name="monitor_add_rule")
+
+
+def test_restart_marks_an_unfinished_saved_plan_as_explicitly_resumable(task_env):
+    store, receipts, controller, _call = task_env
+    controller.create_plan(
+        "owner", "task_turn-1", [
+            {
+                "tool_name": "monitor_add_rule",
+                "description": "Create a rule.",
+                "completion_criteria": "A confirmed receipt exists.",
+            },
+            {
+                "tool_name": "monitor_list_rules",
+                "description": "Read back the rule.",
+                "completion_criteria": "The new rule matches the intended configuration.",
+            },
+        ],
+    )
+    restarted = TaskController(SessionStore(connection=store.connection))
+    assert restarted.recover_incomplete("owner", receipts) == [
+        {"task_id": "task_turn-1", "status": "queued"}
+    ]
+    recovered = store.get_task("owner", "task_turn-1")
+    assert recovered["wait_reason"] == "plan_pending"
+    assert restarted.resume_ready_task("owner", "task_turn-1")["status"] == "queued"
+
+
+def test_failed_planned_step_stops_later_steps(task_env):
+    store, receipts, controller, call = task_env
+    controller.create_plan(
+        "owner", "task_turn-1", [
+            {
+                "tool_name": "monitor_add_rule",
+                "description": "Create a rule.",
+                "completion_criteria": "The matching rule receipt is confirmed.",
+            },
+            {
+                "tool_name": "monitor_list_rules",
+                "description": "Verify the rule.",
+                "completion_criteria": "The owner-scoped rule exists with the requested fields.",
+            },
+        ],
+    )
+    step = controller.prepare_step("owner", "task_turn-1", tool_name="monitor_add_rule")
+    controller.link_call_to_step(
+        "owner", "task_turn-1", step["step_id"], tool_call_id=call["id"]
+    )
+    controller.claim_step("owner", "task_turn-1", step["step_id"], receipt_id="receipt-1")
+    receipts.start("receipt-1")
+    receipts.finish("receipt-1", status="failed", ok=False, complete=False)
+    failed = controller.finish_step(
+        "owner", "task_turn-1", step["step_id"], outcome="failed"
+    )
+    assert failed["status"] == "failed"
+    assert controller.finish_turn("owner", "task_turn-1")["status"] == "failed"
+    with pytest.raises(ValueError, match="not dispatchable"):
+        controller.prepare_step("owner", "task_turn-1", tool_name="monitor_list_rules")
+
+
 def test_monitor_readback_must_match_owner_scoped_rule_details(task_env):
     store, receipts, controller, call = task_env
     created = controller.start_step(

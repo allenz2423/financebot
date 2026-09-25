@@ -82,6 +82,59 @@ def test_task_list_is_registered_as_read_only_durable_progress_lookup():
     assert "task_list" not in llm.MUTATION_TOOLS
 
 
+def test_task_plan_is_bounded_and_multi_action_policy_is_deterministic():
+    import src.services.llm as llm
+
+    schema = next(
+        tool["function"] for tool in llm.BOT_TOOLS_SCHEMA
+        if tool["function"]["name"] == "task_plan"
+    )
+    steps = schema["parameters"]["properties"]["steps"]
+    assert steps["minItems"] == 2
+    assert steps["maxItems"] == 20
+    assert {"tool_name", "description", "completion_criteria"} <= set(
+        steps["items"]["required"]
+    )
+    assert "task_plan" in llm.EXPECTED_TOOL_NAMES
+    assert llm._requires_durable_plan("1. Search\n2. Read\n3. Summarize", set())
+    assert llm._requires_durable_plan("Please create a PDF report", set())
+    assert not llm._requires_durable_plan("What is my current balance?", set())
+    assert llm._tool_requires_durable_plan("monitor_add_rule")
+    assert llm._tool_requires_durable_plan("set_savings_goal")
+    assert llm._tool_requires_durable_plan("monitor_ack_alert")
+    assert not llm._tool_requires_durable_plan("get_financial_dashboard")
+    assert llm._tool_call_requires_durable_plan({
+        "function": {"name": "fetch_webpage", "arguments": {"save_only": True}}
+    })
+    assert llm._tool_call_requires_durable_plan({
+        "function": {"name": "fetch_webpage", "arguments": '{"save_only": true}'}
+    })
+    assert llm._durable_plan_batch_error(
+        ["search_gmail"], required=True, has_plan=False, audit_active=False
+    )
+    assert llm._durable_plan_batch_error(
+        ["task_plan", "search_gmail"], required=False, has_plan=False,
+        audit_active=False,
+    )
+    assert llm._durable_plan_batch_error(
+        ["task_plan"], required=True, has_plan=False, audit_active=False
+    ) is None
+    assert llm._durable_plan_batch_error(
+        ["search_gmail"], required=True, has_plan=True, audit_active=False
+    ) is None
+    assert llm._durable_plan_batch_error(
+        ["search_gmail", "set_savings_goal"], required=False,
+        has_plan=False, audit_active=False,
+    )
+    assert llm._durable_plan_batch_error(
+        ["search_gmail", "set_savings_goal"], required=False,
+        has_plan=False, audit_active=True,
+    ) is None
+    llm._validate_plan_tool_names([{"tool_name": "search_gmail"}])
+    with pytest.raises(ValueError, match="non-action tool"):
+        llm._validate_plan_tool_names([{"tool_name": "task_list"}])
+
+
 def test_every_advertised_tool_has_a_dispatch_branch_or_registry_handler():
     import src.services.llm as llm
 
