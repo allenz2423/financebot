@@ -33,7 +33,11 @@ from src.services.claim_evidence import (
     evaluate_claims,
     safe_claim_fallback,
 )
-from src.services.tool_receipts import ReceiptLifecycleError, ReceiptStore
+from src.services.tool_receipts import (
+    ReceiptLifecycleError,
+    ReceiptStore,
+    terminal_status_for_outcome,
+)
 from src.services.provider_protocol import parse_stream_line
 from src.services.route_profiles import AUTO_ROUTE_NAMES, parse_route_profiles, profile_for
 from src.services.tool_results import ToolResultEnvelope
@@ -7873,6 +7877,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 receipt_id = f"receipt_{uuid.uuid4().hex}"
                 receipt_status = "started"
                 receipt_started = False
+                ambiguous_side_effect = False
                 grant_id = None
                 try:
                     await _set_advisor_status(
@@ -9524,11 +9529,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             lines = []
                             for r in rules:
                                 state = "on" if r["enabled"] else "off"
+                                rule_config = json.dumps(
+                                    r.get("config") or {},
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                    sort_keys=True,
+                                )
                                 lines.append(
                                     f"- #{r['id']} [{state}] {r['name']} "
                                     f"({r['kind']}) severity={r['severity']} "
                                     f"cooldown={r['cooldown_hours']}h "
-                                    f"last={r['last_fired_at'] or 'never'}"
+                                    f"last={r['last_fired_at'] or 'never'} "
+                                    f"config={rule_config}"
                                 )
                             db_result = f"Monitor rules ({len(rules)}):\n" + "\n".join(lines)
                     elif func_name == "monitor_add_rule":
@@ -9543,12 +9555,28 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                         db_result = msg if ok else f"Error: {msg}"
                     elif func_name == "monitor_create_natural_rule":
-                        from src.services.monitor import add_monitor_rule_from_nl
+                        from src.services.monitor import (
+                            MonitorRuleCommitOutcomeUnknown,
+                            add_monitor_rule_from_nl,
+                        )
                         try:
                             spec = add_monitor_rule_from_nl(conn, user_id=uid, instruction=str(args.get("instruction", "")))
                             db_result = f"Created monitor rule #{spec['id']} '{spec['name']}' ({spec['kind']}) with config: {spec['config']}"
-                        except Exception as e:
+                        except MonitorRuleCommitOutcomeUnknown as e:
+                            ambiguous_side_effect = True
+                            db_result = f"UNKNOWN: {e}. Do not retry; reconcile the owner-scoped monitor rules first."
+                        except ValueError as e:
                             db_result = f"Error creating rule: {e}"
+                        except Exception as e:
+                            # Once this tool entered its create implementation,
+                            # an unexpected error is not proof that the insert
+                            # failed. Preserve the ambiguity and block replays.
+                            ambiguous_side_effect = True
+                            db_result = (
+                                "UNKNOWN: monitor creation may have taken effect; "
+                                "do not retry until owner-scoped monitor rules are reconciled. "
+                                f"{type(e).__name__}: {e}"
+                            )
                     elif func_name == "monitor_run_pass":
                         res = run_monitor_pass(conn, uid, deliver=False)
                         db_result = (
@@ -10049,7 +10077,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                 except Exception as tool_err:
                     tool_label = func_name or "unknown"
-                    db_result = f"Error executing tool '{tool_label}': {type(tool_err).__name__}: {tool_err}. Please check your JSON format and ensure all required parameters are provided."
+                    if receipt_started and func_name in {
+                        "monitor_create_natural_rule",
+                        "monitor_add_rule",
+                    }:
+                        ambiguous_side_effect = True
+                        db_result = (
+                            "UNKNOWN: monitor creation may have taken effect; do not retry "
+                            "until owner-scoped monitor rules are reconciled. "
+                            f"{type(tool_err).__name__}: {tool_err}"
+                        )
+                    else:
+                        db_result = f"Error executing tool '{tool_label}': {type(tool_err).__name__}: {tool_err}. Please check your JSON format and ensure all required parameters are provided."
                     print(
                         f" [TOOL EXECUTION ERROR] {tool_label}: {type(tool_err).__name__}: {tool_err}"
                     )
@@ -10069,7 +10108,18 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                     except Exception as commit_err:
                         tool_succeeded = False
-                        db_result = f" Database commit failed for '{func_name}': {type(commit_err).__name__}: {commit_err}"
+                        if func_name in {"monitor_create_natural_rule", "monitor_add_rule"}:
+                            # add_monitor_rule has already committed its insert.
+                            # A failure in this subsequent generic commit cannot
+                            # prove the monitor action was rolled back.
+                            ambiguous_side_effect = True
+                            db_result = (
+                                "UNKNOWN: monitor creation may already have committed; "
+                                "do not retry until owner-scoped monitor rules are reconciled. "
+                                f"{type(commit_err).__name__}: {commit_err}"
+                            )
+                        else:
+                            db_result = f" Database commit failed for '{func_name}': {type(commit_err).__name__}: {commit_err}"
                         print(f" [DB COMMIT FAILED] {func_name}: {commit_err}")
 
                 if db_result is None:
@@ -10078,7 +10128,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     )
 
                 if receipt_started:
-                    receipt_status = "confirmed" if tool_succeeded else "failed"
+                    receipt_status = terminal_status_for_outcome(
+                        succeeded=tool_succeeded,
+                        ambiguous=ambiguous_side_effect,
+                    )
                     try:
                         receipt_store.finish(
                             receipt_id,

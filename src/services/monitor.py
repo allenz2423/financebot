@@ -32,6 +32,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+class MonitorRuleCommitOutcomeUnknown(RuntimeError):
+    """The monitor insert's commit acknowledgement was not reliable."""
+
+
 # ============================================================
 # Rule kind allowlist
 # ============================================================
@@ -869,15 +873,23 @@ def add_monitor_rule(
     if not ok:
         return False, err, None
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cur = conn.execute(
-        """
-        INSERT INTO monitor_rules
-        (user_id, name, kind, config, enabled, severity, cooldown_hours, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
-        """,
-        (uid, name, kind, json.dumps(normalized), severity, cooldown_hours, now, now),
-    )
-    conn.commit()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO monitor_rules
+            (user_id, name, kind, config, enabled, severity, cooldown_hours, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+            """,
+            (uid, name, kind, json.dumps(normalized), severity, cooldown_hours, now, now),
+        )
+        conn.commit()
+    except Exception as exc:
+        # Errors while executing INSERT/COMMIT do not prove that the write was
+        # rolled back. Keep this distinct so the tool receipt remains unknown
+        # and future non-idempotent monitor creates fail closed.
+        raise MonitorRuleCommitOutcomeUnknown(
+            f"monitor rule insert outcome is unknown: {type(exc).__name__}: {exc}"
+        ) from exc
     return True, f"Created monitor rule #{cur.lastrowid}: {name}.", cur.lastrowid
 
 

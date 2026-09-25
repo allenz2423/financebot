@@ -5,10 +5,12 @@ import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.services import monitor as mon
+from src.services.tool_receipts import ReceiptLifecycleError, ReceiptStore
 from src.db.migrations import apply_all
 
 
@@ -109,6 +111,69 @@ def test_add_and_list_rule():
     assert len(rules) == 1
     assert rules[0]["kind"] == "projected_balance_low"
     assert rules[0]["severity"] == "warning"
+    assert rules[0]["config"] == {"threshold": 1000.0, "window_days": 14}
+
+
+@pytest.mark.parametrize("failure_stage", ["execute", "commit"])
+def test_monitor_insert_outcome_loss_stays_ambiguous_and_blocks_retry(failure_stage):
+    base = _fresh_conn()
+
+    class CommitAcknowledgementLost:
+        def execute(self, *args, **kwargs):
+            cursor = base.execute(*args, **kwargs)
+            if failure_stage == "execute" and "INSERT INTO monitor_rules" in args[0]:
+                raise sqlite3.OperationalError("simulated lost insert acknowledgement")
+            return cursor
+
+        def commit(self):
+            base.commit()
+            if failure_stage == "commit":
+                raise sqlite3.OperationalError("simulated lost commit acknowledgement")
+
+    receipts = ReceiptStore(base)
+    receipts.prepare(
+        receipt_id="ambiguous-monitor",
+        call_id="call-ambiguous-monitor",
+        user_id="owner-1",
+        turn_id="turn-1",
+        round_id=1,
+        tool_name="monitor_create_natural_rule",
+        origin="native",
+        arguments={"instruction": "alert me on large deposits"},
+    )
+    receipts.start("ambiguous-monitor")
+
+    with pytest.raises(mon.MonitorRuleCommitOutcomeUnknown):
+        mon.add_monitor_rule(
+            CommitAcknowledgementLost(),
+            "owner-1",
+            "large deposit",
+            "large_deposit",
+            {"min_amount": 1000},
+        )
+
+    # Receipt finalization may commit the insert left pending after execute's
+    # acknowledgement was lost, so the outcome must remain explicitly unknown.
+    receipts.finish(
+        "ambiguous-monitor",
+        status="unknown",
+        ok=False,
+        complete=False,
+        error="monitor rule insert commit outcome is unknown",
+    )
+    assert len(mon.list_monitor_rules(base, "owner-1")) == 1
+    receipts.prepare(
+        receipt_id="monitor-retry",
+        call_id="call-monitor-retry",
+        user_id="owner-1",
+        turn_id="turn-2",
+        round_id=1,
+        tool_name="monitor_create_natural_rule",
+        origin="native",
+        arguments={"instruction": "alert me on large deposits"},
+    )
+    with pytest.raises(ReceiptLifecycleError, match="requires manual reconciliation"):
+        receipts.start("monitor-retry")
 
 
 def test_toggle_and_delete_rule():

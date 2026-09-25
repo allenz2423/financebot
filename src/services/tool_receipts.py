@@ -56,6 +56,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def terminal_status_for_outcome(*, succeeded: bool, ambiguous: bool = False) -> str:
+    """Map execution evidence to a terminal receipt without hiding ambiguity."""
+    if succeeded:
+        return "confirmed"
+    return "unknown" if ambiguous else "failed"
+
+
 class ReceiptStore:
     """SQLite-backed compact receipt store.
 
@@ -456,6 +463,60 @@ class ReceiptStore:
         return self.get(receipt_id)
 
     def start(self, receipt_id: str) -> ToolReceipt:
+        # Monitor inserts have no provider idempotency key. If a prior insert
+        # for this user is still started/unknown, do not dispatch another one:
+        # even changed arguments or a different insert tool could describe the
+        # same intended rule. The writer lock makes this check and the new
+        # start transition atomic across ReceiptStore instances sharing DB.
+        self.ensure_schema()
+        current = self.get(receipt_id)
+        monitor_insert_tools = {"monitor_create_natural_rule", "monitor_add_rule"}
+        if current.tool_name in monitor_insert_tools:
+            try:
+                self.connection.execute("BEGIN IMMEDIATE")
+                unresolved = self.connection.execute(
+                    """SELECT receipt_id FROM tool_receipts
+                       WHERE user_id = ?
+                         AND tool_name IN ('monitor_create_natural_rule', 'monitor_add_rule')
+                         AND status IN ('started', 'unknown')
+                       LIMIT 1""",
+                    (current.user_id,),
+                ).fetchone()
+                if unresolved is not None:
+                    reason = (
+                        "Blocked monitor creation: an earlier monitor insert has an "
+                        "ambiguous outcome and requires manual reconciliation."
+                    )
+                    self.connection.execute(
+                        """UPDATE tool_receipts
+                           SET status = 'failed', ok = 0, complete = 0,
+                               error = ?, updated_at = ?
+                           WHERE receipt_id = ? AND status = 'prepared'""",
+                        (reason, _now(), receipt_id),
+                    )
+                    self.connection.commit()
+                    raise ReceiptLifecycleError(reason)
+                transition = self.connection.execute(
+                    """UPDATE tool_receipts SET status = 'started', updated_at = ?
+                       WHERE receipt_id = ? AND status = 'prepared'""",
+                    (_now(), receipt_id),
+                )
+                if transition.rowcount != 1:
+                    raise ReceiptLifecycleError(
+                        f"invalid receipt transition for {receipt_id}: expected prepared"
+                    )
+                self.connection.commit()
+                return self.get(receipt_id)
+            except ReceiptLifecycleError:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+            except Exception as exc:
+                self.connection.rollback()
+                raise ReceiptLifecycleError(
+                    f"unable to safely start monitor receipt {receipt_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
         return self._transition(receipt_id, "started")
 
     def finish(
@@ -532,6 +593,19 @@ class ReceiptStore:
             self.connection.commit()
         except Exception as exc:
             self.connection.rollback()
+            # A lost commit acknowledgement does not imply that SQLite
+            # rolled back. Read the canonical row back: if the exact terminal
+            # evidence is durable, return it; otherwise preserve the prior
+            # state (typically started), which keeps retry guards fail-closed.
+            try:
+                persisted = self.get(receipt_id)
+                if persisted.status == status and all(
+                    getattr(persisted, key) == value
+                    for key, value in fields.items()
+                ):
+                    return persisted
+            except Exception:
+                pass
             raise ReceiptLifecycleError(
                 f"unable to persist receipt transition {receipt_id}: "
                 f"{type(exc).__name__}: {exc}"
