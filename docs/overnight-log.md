@@ -2,6 +2,13 @@
 
 ## Progress
 
+### Item 4 — durable session recall — passed
+
+- Added bounded `search_session_history` model tool plus automatic recall cues backed by `SessionStore.search_messages`; recalled records include session/turn IDs, timestamps, freshness, and explicit untrusted-content framing. Prompt cache is scoped to exact owner/session/channel/thread and bounded to six messages/6,000 characters; returned history is bounded to ten messages/1,600 characters each.
+- Gmail/mail-only turns and turns that actually invoked Gmail tools are excluded from future recall. Legacy turns are also excluded using owner-scoped durable Gmail tool-call evidence. An unlinked legacy Gmail call fails closed for that conversation because its associated turn cannot be identified. The lookup is bounded by retained messages rather than only the newest tool-call rows.
+- Verification: focused session recall/store/tool catalog suite: 25 passed. Full suite in an isolated temporary working directory: 590 passed, 1 skipped, 10 failed. The same clean-database/seed-data expectation failures and pre-existing Discord budget-dashboard failure remain. `py_compile` and `git diff --check` passed. Fresh final critic: no blockers.
+- Deferred critic suggestions: test Gmail exclusion through the full dispatcher rather than the marker helper; add a model-level behavioral prompt-injection evaluation; test many intervening non-Gmail calls with an older retained Gmail call; document/test that a stale unlinked Gmail record can suppress recall for the entire conversation until pruning. Intent classification for mixed mail/financial prompts remains heuristic and merits separate policy review.
+
 ### Step 2 — resumable task execution — in progress; acceptance gate blocked
 
 - Added task-controller operations and runtime integration for the scoped Gmail and monitor workflows: durable turn/task correlation, call/receipt-linked steps, restart projection, exact-question reply matching, explicit resume, monitor read-back enforcement, reconciliation status, and once-per-task notice claims. Ambiguous side effects are never replayed. Pending approval decisions are stored with the exact action fingerprint, but affirmative approvals intentionally remain blocked because the dispatcher does not yet consume a persisted action-bound authorization grant.
