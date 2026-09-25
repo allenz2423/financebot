@@ -7,8 +7,9 @@ stores only task progression and links; it never invokes tools or retries them.
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from typing import Any, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.services.authorization import (
     ApprovalRequest,
@@ -335,6 +336,7 @@ class TaskController:
         allowed_answers: Mapping[str, Any], expires_at: str | None = None,
         approval_request: ApprovalRequest | None = None,
         authorization_request: AuthorizationRequest | None = None,
+        input_only: bool = False,
     ) -> dict[str, Any]:
         task = self.store.get_task(user_id, task_id)
         if task["status"] not in {"queued", "running"}:
@@ -342,6 +344,7 @@ class TaskController:
         payload: dict[str, Any] = {
             "question_id": question_id, "question": question[:1000],
             "allowed_answers": dict(allowed_answers),
+            "input_only": bool(input_only),
         }
         if expires_at:
             payload["expires_at"] = expires_at
@@ -370,6 +373,53 @@ class TaskController:
             wait_reason=f"question:{question_id}",
             event_type="task.question_issued", event_payload=payload,
         )
+
+    def request_user_choice(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        question: str,
+        choices: list[str],
+        expires_in_minutes: int = 1440,
+    ) -> dict[str, Any]:
+        """Persist a bounded, expiring enum question for normal task resumption."""
+        if not isinstance(question, str):
+            raise ValueError("question must be text")
+        prompt = question.strip()
+        if not prompt or len(prompt) > 1000:
+            raise ValueError("question must contain 1–1000 characters")
+        if not isinstance(choices, list) or not 2 <= len(choices) <= 8:
+            raise ValueError("choices must contain 2–8 exact answer strings")
+        if any(not isinstance(value, str) for value in choices):
+            raise ValueError("each answer choice must be text")
+        normalized = [str(value).strip() for value in choices]
+        if any(not value or len(value) > 100 for value in normalized):
+            raise ValueError("each answer choice must contain 1–100 characters")
+        if len({value.casefold() for value in normalized}) != len(normalized):
+            raise ValueError("answer choices must be unique, ignoring case")
+        minutes = int(expires_in_minutes)
+        if not 5 <= minutes <= 10080:
+            raise ValueError("expires_in_minutes must be between 5 and 10080")
+        question_id = uuid.uuid4().hex
+        expires_iso = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+        task = self.request_user(
+            user_id,
+            task_id,
+            question_id=question_id,
+            question=prompt,
+            allowed_answers={"type": "enum", "enum": normalized},
+            expires_at=expires_iso,
+            input_only=True,
+        )
+        return {
+            "task": task,
+            "question_id": question_id,
+            "expires_at": expires_iso,
+            "expires_in_minutes": minutes,
+            "question": prompt,
+            "choices": normalized,
+        }
 
     def accept_reply(
         self, user_id: str, task_id: str, *, question_id: str, answer: str,
@@ -455,12 +505,28 @@ class TaskController:
         )
         return {"task": changed, "answer": answer_text, "question": question, "approval": approval}
 
+    def reply_is_input_only(self, user_id: str, task_id: str) -> bool:
+        """Whether the active resumed reply supplies data but grants no action."""
+        task = self.store.get_task(user_id, task_id)
+        reason = str(task.get("wait_reason") or "")
+        if not reason.startswith("resume_after_reply:"):
+            return False
+        question_id = reason.split(":", 1)[1]
+        return any(
+            event["event_type"] == "task.question_issued"
+            and event["payload"].get("question_id") == question_id
+            and event["payload"].get("input_only") is True
+            for event in task["events"]
+        )
+
     def match_waiting_reply(
         self, user_id: str, session_id: str, content: str
     ) -> dict[str, str] | None:
         """Find one exact, typed enum answer; ambiguous/free text stays a new turn."""
         matches: list[dict[str, str]] = []
-        for listed in self.store.list_tasks(user_id, statuses=["waiting_user"], limit=100):
+        for listed in self.store.list_tasks(
+            user_id, session_id=session_id, statuses=["waiting_user"], limit=500
+        ):
             task = self.store.get_task(user_id, listed["task_id"])
             if task["session_key"] != session_id:
                 continue
@@ -468,6 +534,26 @@ class TaskController:
             if not questions:
                 continue
             question = questions[-1]["payload"]
+            expires_at = question.get("expires_at")
+            if expires_at:
+                try:
+                    expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    expiry = datetime.min.replace(tzinfo=timezone.utc)
+                if expiry <= datetime.now(timezone.utc):
+                    self.store.transition_task_run(
+                        user_id,
+                        task["task_id"],
+                        expected_status="waiting_user",
+                        expected_version=int(task["version"]),
+                        new_status="cancelled",
+                        wait_reason=None,
+                        event_type="task.question_expired",
+                        event_payload={"question_id": question.get("question_id")},
+                    )
+                    continue
             allowed = question.get("allowed_answers") or {}
             if allowed.get("type") != "enum":
                 continue
@@ -479,6 +565,16 @@ class TaskController:
                     "question_id": str(question.get("question_id") or ""),
                     "answer": answer,
                     "question": str(question.get("question") or ""),
+                    "objective": str(task.get("objective") or ""),
+                    "step_states": [
+                        {
+                            "step_id": step["step_id"],
+                            "step_order": step["step_order"],
+                            "status": step["status"],
+                            "next_action": step.get("next_action"),
+                        }
+                        for step in task.get("steps", [])
+                    ],
                 })
         return matches[0] if len(matches) == 1 and matches[0]["question_id"] else None
 

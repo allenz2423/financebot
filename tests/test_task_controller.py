@@ -356,9 +356,74 @@ def test_ordinary_reply_matching_is_exact_and_conversation_scoped(task_env):
     assert match == {
         "task_id": "task_turn-1", "question_id": "q-match",
         "answer": "yes", "question": "Proceed?",
+        "objective": "Create a monitor", "step_states": [],
     }
     assert controller.match_waiting_reply("owner", "session", "what's my balance?") is None
     assert controller.match_waiting_reply("owner", "another-channel", "yes") is None
+
+
+def test_request_user_choice_is_durable_and_resumes_same_task(task_env):
+    store, _receipts, controller, _call = task_env
+    issued = controller.request_user_choice(
+        "owner", "task_turn-1", question="Which report should I prepare?",
+        choices=["monthly", "quarterly"], expires_in_minutes=60,
+    )
+    assert issued["task"]["status"] == "waiting_user"
+    assert issued["question_id"]
+    assert issued["expires_at"]
+    assert controller.reply_is_input_only("owner", "task_turn-1") is False
+    match = controller.match_waiting_reply("owner", "session", "QUARTERLY")
+    assert match["question_id"] == issued["question_id"]
+    assert match["answer"] == "quarterly"
+    store.add_message(
+        "owner", "session", role="user", content="quarterly", message_id="answer-1",
+    )
+    resumed = controller.accept_reply(
+        "owner", "task_turn-1", question_id=issued["question_id"],
+        answer=match["answer"], source_message_id="answer-1",
+    )
+    assert resumed["task"]["status"] == "queued"
+    assert controller.reply_is_input_only("owner", "task_turn-1") is True
+    assert controller.get_persisted_reply("owner", "task_turn-1")["answer"] == "quarterly"
+    from src.services.llm import _input_only_reply_blocks_tool
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "get_financial_dashboard", {}
+    ) is False
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "monitor_add_rule", {"name": "x"}
+    ) is True
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "run_shell", {"command": "touch file"}
+    ) is True
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "fetch_webpage", {"save_only": True}
+    ) is True
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "fetch_webpage", {"save_only": False}
+    ) is False
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "set_savings_goal", {"name": "x"}
+    ) is True
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "monitor_ack_alert", {"alert_id": 1}
+    ) is True
+    assert _input_only_reply_blocks_tool(
+        controller, "owner", "task_turn-1", "future_unclassified_tool", {}
+    ) is True
+
+
+def test_expired_user_choice_is_cancelled_and_never_matched(task_env):
+    store, _receipts, controller, _call = task_env
+    waiting = controller.request_user(
+        "owner", "task_turn-1", question_id="expired-q", question="Continue?",
+        allowed_answers={"type": "enum", "enum": ["yes", "no"]},
+        expires_at="2000-01-01T00:00:00Z",
+    )
+    assert waiting["status"] == "waiting_user"
+    assert controller.match_waiting_reply("owner", "session", "yes") is None
+    expired = store.get_task("owner", "task_turn-1")
+    assert expired["status"] == "cancelled"
+    assert expired["events"][-1]["event_type"] == "task.question_expired"
 
 
 def test_pending_approval_link_is_fingerprint_bound(task_env):

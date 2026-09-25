@@ -5327,6 +5327,32 @@ def _match_waiting_task_reply(user_id: str, channel_id: str, content: str):
         store.close()
 
 
+def _task_reply_resume_request(match: dict) -> tuple[str, dict]:
+    """Build the resumption request from durable objective/step state."""
+    step_statuses = ", ".join(
+        f"{step['step_order']}:{step['step_id']}:{step['status']}"
+        + (f" ({step['next_action']})" if step.get("next_action") else "")
+        for step in match.get("step_states", [])
+    ) or "no dispatched steps"
+    prompt = (
+        f"Continue the existing task {match['task_id']}.\n"
+        f"Original objective: {match['objective']}\n"
+        f"Previously persisted step states: {step_statuses}\n"
+        f"The user answered the pending task question: {match['answer']}\n"
+        f"Question: {match['question']}\n"
+        "Continue from the pending step. Do not repeat completed steps; "
+        "the answer supplies information only and is not authorization for any side effect. "
+        "If a side effect is needed, stop and ask for a separate explicit instruction. "
+        "Report only outcomes supported by receipts."
+    )
+    options = {
+        "resume_task_id": match["task_id"],
+        "resume_question_id": match["question_id"],
+        "resume_answer": match["answer"],
+    }
+    return prompt, options
+
+
 async def _send_thinking_placeholder(message: discord.Message, handle: _AdvisorReplyHandle):
     """Best-effort placeholder. It is never allowed to block advisor execution."""
     user_id = str(message.author.id)
@@ -5389,15 +5415,30 @@ async def resume_task_command(ctx: commands.Context, task_id: str, *, response: 
                     return
                 if task_record["status"] != "waiting_user":
                     raise ValueError("task is not awaiting a user reply")
-                question = next(
-                    (event["payload"].get("question") for event in reversed(task_record["events"])
+                question_event = next(
+                    (event for event in reversed(task_record["events"])
                      if event["event_type"] == "task.question_issued"),
-                    "the pending decision",
+                    {"payload": {}},
+                )
+                question = question_event["payload"].get("question", "the pending decision")
+                step_statuses = ", ".join(
+                    f"{step['step_order']}:{step['step_id']}:{step['status']}"
+                    + (f" ({step['next_action']})" if step.get("next_action") else "")
+                    for step in task_record["steps"]
+                ) or "no dispatched steps"
+                input_only_instruction = (
+                    "The answer supplies information only and is not authorization for any side effect. "
+                    "If a side effect is needed, stop and ask for a separate explicit instruction. "
+                    if question_event["payload"].get("input_only") else ""
                 )
                 resume_prompt = (
-                    f"The user answered the persisted task question {question_id!r}: {answer}\n"
-                    f"Question: {question}\nContinue the existing task from its pending step. "
-                    "Do not repeat completed steps; report only outcomes supported by receipts."
+                    f"Continue the existing task {task_id} after the user's persisted decision.\n"
+                    f"Original objective: {task_record['objective']}\n"
+                    f"Previously persisted step states: {step_statuses}\n"
+                    f"The user answered question {question_id!r}: {answer}\n"
+                    f"Question: {question}\nContinue from its pending step. "
+                    f"{input_only_instruction}Do not repeat completed steps; "
+                    "report only outcomes supported by receipts."
                 )
             else:
                 task_record = TaskController(store).resume_ready_task(uid, task_id)
@@ -5456,12 +5497,17 @@ async def resume_task_command(ctx: commands.Context, task_id: str, *, response: 
 async def _run_queued_advisor_item(uid: str, item: dict) -> None:
     """Drain one queued message after the user's active turn completes."""
     handle = item["handle"]
+    prompt = item["prompt"]
+    resume_options = {}
+    if item.get("resume_match"):
+        prompt, resume_options = _task_reply_resume_request(item["resume_match"])
     task = asyncio.create_task(
         chat_with_delilah(
-            item["prompt"],
+            prompt,
             item["author_id"],
             handle,
             image_b64_list=item.get("images") or [],
+            **resume_options,
         ),
         name=f"advisor:queued:{item['author_id']}:{item['message_id']}",
     )
@@ -5794,6 +5840,13 @@ async def on_message(message: discord.Message):
     try:
         async with ADVISOR_TASK_REGISTRATION_LOCK:
             print(f" [MESSAGE] advisor registration lock acquired id={message_id}")
+            resume_match = None
+            try:
+                resume_match = _match_waiting_task_reply(
+                    str(uid), str(message.channel.id), prompt
+                ) if prompt else None
+            except Exception as match_err:
+                print(f" [TASK REPLY] matching failed safely: {type(match_err).__name__}: {match_err}")
             existing = ACTIVE_ADVISOR_TASKS.get(uid)
             if existing is not None and not existing.done():
                 print(f" [MESSAGE] existing advisor task uid={uid}")
@@ -5806,9 +5859,20 @@ async def on_message(message: discord.Message):
                         "channel": message.channel,
                         "message": message,
                         "handle": handle,
+                        "resume_match": resume_match,
                     })
                     if position is None:
-                        response = f" **I'm already working on your previous request, and the queue is full ({MAX_PENDING_ADVISOR_MESSAGES}).** Use `!status` or `!cancel`."
+                        if resume_match:
+                            response = (
+                                f" **I couldn't queue that answer because the queue is full "
+                                f"({MAX_PENDING_ADVISOR_MESSAGES}). It was not accepted. After the "
+                                f"current response, retry with `!resume {resume_match['task_id']} "
+                                f"{resume_match['question_id']} | your exact choice`.**"
+                            )
+                        else:
+                            response = f" **I'm already working on your previous request, and the queue is full ({MAX_PENDING_ADVISOR_MESSAGES}).** Use `!status` or `!cancel`."
+                    elif resume_match:
+                        response = " **I received your choice. I’ll resume the paused task as soon as the current response finishes.**"
                     else:
                         response = f" **Queued this request as #{position}.** I’ll start it after the current task finishes. Use `!status` to check progress."
                     await asyncio.wait_for(message.channel.send(response), timeout=8.0
@@ -5817,27 +5881,10 @@ async def on_message(message: discord.Message):
                     print(f" [MESSAGE] busy response failed: {type(exc).__name__}: {exc}")
                 return
 
-            resume_match = None
-            try:
-                resume_match = _match_waiting_task_reply(
-                    str(uid), str(message.channel.id), prompt
-                ) if prompt else None
-            except Exception as match_err:
-                print(f" [TASK REPLY] matching failed safely: {type(match_err).__name__}: {match_err}")
             advisor_prompt = prompt
             resume_options = {}
             if resume_match:
-                advisor_prompt = (
-                    f"The user answered the pending task question: {resume_match['answer']}\n"
-                    f"Question: {resume_match['question']}\n"
-                    "Continue that task from its pending step. Do not repeat completed steps; "
-                    "report only outcomes supported by receipts."
-                )
-                resume_options = {
-                    "resume_task_id": resume_match["task_id"],
-                    "resume_question_id": resume_match["question_id"],
-                    "resume_answer": resume_match["answer"],
-                }
+                advisor_prompt, resume_options = _task_reply_resume_request(resume_match)
 
             # Register/create the advisor BEFORE any Discord reply API call.
             # A stalled message.reply() must never prevent the actual request from running.

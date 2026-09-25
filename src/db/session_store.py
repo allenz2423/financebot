@@ -67,6 +67,7 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "status", "lane", "from", "to", "version", "expectedversion",
     "steporder", "dependencyids", "nextaction", "reasoncode", "waitreason",
     "questionid", "question", "allowedanswers", "expiresat", "approvalid",
+    "inputonly",
     "actionfingerprint", "toolcallid", "receiptid", "resultref", "evidenceref",
     "sourcemessageid", "steeredstepid", "correction", "type", "format",
     "enum", "required",
@@ -1293,6 +1294,7 @@ class SessionStore:
         self,
         user_id: str,
         *,
+        session_id: str | None = None,
         statuses: list[str] | tuple[str, ...] | None = None,
         lane: str | None = None,
         limit: int = 50,
@@ -1301,6 +1303,9 @@ class SessionStore:
         limit = max(1, min(int(limit), 500))
         clauses = ["t.user_id=?"]
         params: list[Any] = [owner]
+        if session_id is not None:
+            clauses.append("s.session_key=?")
+            params.append(_required(session_id, "session_id"))
         if statuses is not None:
             normalized = [self._validate_task_status(item) for item in statuses]
             if not normalized:
@@ -1314,11 +1319,12 @@ class SessionStore:
             clauses.append("t.lane=?")
             params.append(selected_lane)
         params.append(limit)
+        ordering = "t.updated_at DESC, t.task_id" if session_id is not None else "t.enqueued_at, t.task_id"
         with self._lock:
             rows = self.connection.execute(
                 f"SELECT t.* FROM task_runs t JOIN sessions s ON s.id=t.session_id "
                 f"WHERE {' AND '.join(clauses)} "
-                "AND s.user_id=t.user_id ORDER BY t.enqueued_at, t.task_id LIMIT ?",
+                f"AND s.user_id=t.user_id ORDER BY {ordering} LIMIT ?",
                 params,
             ).fetchall()
             return [self._row(row) for row in rows]  # type: ignore[misc]

@@ -52,6 +52,20 @@ def test_live_delilah_catalog_has_unique_schema_and_registered_advisor_tools():
     assert len(llm.ADVISOR_TOOL_REGISTRY) == len(llm.ADVISOR_TOOLS_DISPATCH)
 
 
+def test_await_user_is_registered_as_a_bounded_durable_question_tool():
+    import src.services.llm as llm
+
+    assert "await_user" in llm.KNOWN_TOOLS
+    schema = next(
+        tool["function"] for tool in llm.BOT_TOOLS_SCHEMA
+        if tool["function"]["name"] == "await_user"
+    )
+    assert schema["parameters"]["required"] == ["question", "choices"]
+    assert schema["parameters"]["properties"]["choices"]["minItems"] == 2
+    assert schema["parameters"]["properties"]["choices"]["maxItems"] == 8
+    assert "only tool call" in schema["description"]
+
+
 def test_every_advertised_tool_has_a_dispatch_branch_or_registry_handler():
     import src.services.llm as llm
 
