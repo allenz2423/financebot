@@ -714,3 +714,17 @@ def test_valid_domain_queries_return_official_pdfs():
         assert res.get("form_name")
         assert res.get("eligibility_purpose")
 
+
+def test_stirling_candidates_default_to_service_dns_and_respect_override(monkeypatch):
+    monkeypatch.delenv("STIRLING_PDF_URL", raising=False)
+
+    from src.services.forms import get_stirling_candidates
+
+    candidates = get_stirling_candidates()
+
+    assert candidates[0] == "http://stirling-pdf:8080"
+    assert len(candidates) == len(set(candidates))
+    assert "http://172.20.0.4:8080" not in candidates
+
+    monkeypatch.setenv("STIRLING_PDF_URL", "http://stirling-custom:8080/")
+    assert get_stirling_candidates()[0] == "http://stirling-custom:8080"

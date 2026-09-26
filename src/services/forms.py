@@ -19,7 +19,6 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -420,29 +419,9 @@ def get_stirling_candidates() -> list[str]:
             "http://stirling-pdf:8080",
             "http://localhost:8085",
             "http://127.0.0.1:8085",
-            "http://172.20.0.4:8080",
             "http://localhost:8080",
         ]
     )
-
-    # Inspect docker container IP if running on host
-    try:
-        ip = subprocess.check_output(
-            [
-                "docker",
-                "inspect",
-                "-f",
-                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-                "financebot-stirling-pdf",
-            ],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=1.0,
-        ).strip()
-        if ip:
-            candidates.insert(1, f"http://{ip}:8080")
-    except Exception:
-        pass
 
     seen = set()
     deduped: list[str] = []

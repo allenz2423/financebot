@@ -26,9 +26,9 @@ networks:
   sandbox-egress:
     driver: bridge
     internal: true
-  # Public internet is opt-in for the isolated execution sandbox. Keep this
-  # separate from the shared egress network so sandbox code can reach public
-  # HTTPS endpoints without gaining peer access to OmniRoute/browser services.
+  # The sandbox has public egress but also joins financebot-internal below,
+  # so this network alone does NOT isolate it from internal service peers.
+  # Per-task egress/peer isolation requires a dedicated worker topology.
   sandbox-internet:
     driver: bridge
   egress:
@@ -88,7 +88,6 @@ services:
     volumes:
       - ./data:/app/data
       - sandbox-workspace:/workspace
-      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - financebot-internal
       - egress

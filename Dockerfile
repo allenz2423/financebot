@@ -35,8 +35,6 @@ ENV PATH=/usr/local/cuda/bin:${PATH}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        docker.io \
-        docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -122,6 +122,8 @@ Problem: Muse research describes a Plan–Execute–Reflect–Memorize cycle. De
 
 Proposed Sol: After verification, run a bounded reflector that extracts only durable lessons: `[DECISION]`, `[FACT]`, `[LESSON]`, failed-tool patterns, and workflow improvements. Store each item with provenance, confidence, sensitivity, and expiry. Never turn an unverified model inference into a user fact.
 
+Owner policy clarified 2026-09-26: memory TTL is owner-controlled and defaults to no expiry for this personal self-hosted deployment; the owner may set an expiry. Reflection may use the configured model provider, including a remote provider, with no silent provider fallback. A `[FACT]` may be based on a user-authored statement or a cited web-research source; preserve the turn/source reference and label which kind of evidence supports it. Model-generated inference is never itself a fact. A `[LESSON]` is a reusable, evidence-linked procedure or heuristic learned from task execution (for example, “verify a submitted form by checking the resulting confirmation page”), not a fact about the user and not a permission. The conservative initial implementation should reflect only verified successful tasks; failed, partial, cancelled, or unreconciled tasks must not create durable lessons until their treatment is explicitly designed.
+
 ### 11. Verifier, peer-review, and repair gates
 
 Problem: Muse's open architecture uses planners, workers, inspectors, and peer reviewers; the research literature also emphasizes deterministic verification and verifier-guided repair. Delilah has claim evidence and audit gates, but no generic reviewer pass for multi-step outputs such as financial summaries, reconciliations, or generated artifacts.
@@ -144,7 +146,7 @@ Proposed Sol: Add an explicit, user-scoped preference profile with inspect/edit/
 
 Problem: Meta describes Muse running in a secure virtual machine, while Hermes restricts child contexts and available tools. Delilah has browser/sandbox concepts and tool grants, but no unified per-task environment boundary or capability lease. A dedicated always-on VM per user may be excessive for Delilah's workload.
 
-Proposed Sol: When interactive browser automation is added, run it in an on-demand isolated worker/container with configurable CPU, memory, and runtime limits. Scope its browser profile, credentials, and network access to the task and user; keep credentials executor-only; persist encrypted browser state only when continuity is needed; then stop the worker. Use a microVM only if a deployment's threat model requires the stronger boundary. Keep financial authorization and receipt checks in the host runtime.
+Proposed Sol: When interactive browser automation is added, run it in an on-demand isolated worker/container with configurable CPU, memory, and runtime limits. Scope its browser profile, credentials, and network access to the task and user; keep credentials executor-only; persist encrypted browser state only when continuity is needed; then stop the worker. Use a microVM only if a deployment's threat model requires the stronger boundary. Keep financial authorization and receipt checks in the host runtime. The owner chose one bot process per task database; multi-process and multi-host leases remain disabled. See [Muse secure-environment research and phased design](muse-secure-environment-research.md) for the published Muse architecture comparison and Delilah-specific worker constraints.
 
 ### 15. Safe capability and skill creation
 
