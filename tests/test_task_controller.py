@@ -840,6 +840,48 @@ def test_started_receipt_after_restart_requires_reconciliation(task_env):
     assert recovered == [{"task_id": "task_turn-1", "status": "needs_reconciliation"}]
 
 
+def test_unknown_workspace_file_send_is_not_replayed_after_restart(task_env):
+    store, receipts, _controller, _call = task_env
+    store.begin_turn("owner", "session", turn_id="turn-file-send")
+    controller = TaskController(store)
+    controller.create_turn("owner", "session", "turn-file-send", "Send the report")
+    task_id = "task_turn-file-send"
+    call = store.record_tool_call(
+        "owner", "session", tool_name="send_workspace_file", arguments={"path": "report.csv"},
+        call_id="call-file-send", turn_id="turn-file-send", status="running",
+    )
+    receipts.prepare(
+        receipt_id="receipt-file-send", call_id="call-file-send", user_id="owner",
+        turn_id="turn-file-send", round_id=1, tool_name="send_workspace_file",
+        origin="native", arguments={"path": "report.csv"},
+    )
+    step = controller.prepare_step("owner", task_id, tool_name="send_workspace_file")
+    controller.link_call_to_step("owner", task_id, step["step_id"], tool_call_id=call["id"])
+    controller.claim_step("owner", task_id, step["step_id"], receipt_id="receipt-file-send")
+    receipts.start("receipt-file-send")
+    receipts.finish("receipt-file-send", status="unknown", ok=False, complete=False)
+
+    restarted = TaskController(SessionStore(connection=store.connection))
+    recovered = restarted.recover_incomplete("owner", receipts)
+    assert {"task_id": task_id, "status": "needs_reconciliation"} in recovered
+    task = store.get_task("owner", task_id)
+    assert task["steps"][0]["status"] == "needs_reconciliation"
+    assert task["status"] == "needs_reconciliation"
+    file_receipt = receipts.get("receipt-file-send")
+    assert file_receipt.tool_name == "send_workspace_file"
+    assert file_receipt.status == "unknown"
+
+    restarted_again = TaskController(SessionStore(connection=store.connection))
+    recovered_again = restarted_again.recover_incomplete("owner", receipts)
+    assert not any(item["task_id"] == task_id for item in recovered_again)
+    with pytest.raises(ValueError, match="not dispatchable"):
+        restarted_again.prepare_step("owner", task_id, tool_name="send_workspace_file")
+    with pytest.raises(PermissionError, match="TASK_NOT_DISPATCHABLE"):
+        restarted_again.validate_tool_dispatch(
+            "owner", task_id, tool_name="send_workspace_file", arguments={"path": "report.csv"}
+        )
+
+
 def test_linked_prepared_receipt_cannot_hide_second_started_receipt(task_env):
     store, receipts, controller, call = task_env
     controller.start_step(
@@ -1466,6 +1508,3 @@ def test_step2_resumable_execution_full_gate(task_env):
     task_planned_after = store.get_task("owner", plan_task_id)
     assert task_planned_after["wait_reason"] == "plan_pending"
     assert task_planned_after["status"] == "queued"
-
-
-

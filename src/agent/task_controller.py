@@ -18,6 +18,7 @@ from src.services.authorization import (
     approve_request,
 )
 from src.db.session_store import ConcurrentTaskUpdate, SessionStore, TaskNotFound
+from src.agent.task_verifier import verify_task_contract
 from src.services.tool_receipts import arguments_hash
 
 
@@ -104,6 +105,39 @@ class TaskController:
 
     def has_plan(self, user_id: str, task_id: str) -> bool:
         return self.store.task_has_plan(user_id, task_id)
+
+    def verify_and_persist(
+        self,
+        user_id: str,
+        task_id: str,
+        contract: dict[str, Any],
+        evidence: dict[str, Any],
+        *,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        """Evaluate supplied deterministic evidence and persist it with task CAS.
+
+        Task lookup is owner-scoped. The store then atomically requires this
+        same task to remain in ``verifying`` at ``expected_version`` while it
+        appends the result; a failed result parks the task for manual repair.
+        This method never executes tools or retries failed side effects.
+        """
+        if not isinstance(contract, dict) or not isinstance(evidence, dict):
+            raise TypeError("contract and evidence must be dictionaries")
+        task = self.store.get_task(
+            user_id, task_id, include_steps=False, include_events=False
+        )
+        if str(task.get("phase") or "received") != "verifying":
+            raise ConcurrentTaskUpdate("task is not in the verifying phase")
+        outcome = verify_task_contract(contract, evidence)
+        persisted = self.store.persist_task_verification(
+            user_id,
+            task_id,
+            expected_version=expected_version,
+            passed=bool(outcome.get("passed")),
+            checks=outcome.get("checks", []),
+        )
+        return {**persisted, "outcome": outcome}
 
     def _load_parent_delegation_receipt(
         self, user_id: str, step: Mapping[str, Any], receipt_store: Any,

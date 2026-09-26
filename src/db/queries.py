@@ -104,19 +104,50 @@ def get_current_financial_position(*, user_id: str) -> dict:
             "date": None,
         }
     sync_date_str = row[3]
-    is_stale = False
+    is_stale = not bool(sync_date_str)
     warning = None
+    source_timestamp_utc = None
+    verification_snapshot = None
 
     if sync_date_str:
         try:
-            from datetime import datetime
+            from datetime import datetime, timezone
             sync_dt = datetime.strptime(sync_date_str, "%Y-%m-%d %H:%M:%S")
             hours_old = (datetime.now() - sync_dt).total_seconds() / 3600.0
             if hours_old > 12.0:
                 is_stale = True
                 warning = f" Data may be stale (last Plaid sync was {hours_old:.1f} hours ago)."
+            source_timestamp_utc = sync_dt.astimezone(timezone.utc).isoformat()
+            # The balance-history writer records an authoritative calculation
+            # snapshot immediately before the transaction marker. Require a
+            # close timestamp match; otherwise no arithmetic proof is exposed.
+            try:
+                c.execute(
+                    """SELECT captured_at, checking_balance, total_credit_debt, net_cash
+                       FROM financial_snapshots WHERE user_id = ?
+                       ORDER BY datetime(captured_at) DESC LIMIT 1""",
+                    (user_id,),
+                )
+                snapshot = c.fetchone()
+                if snapshot and snapshot[0]:
+                    snapshot_dt = datetime.strptime(
+                        str(snapshot[0])[:19], "%Y-%m-%d %H:%M:%S"
+                    )
+                    if abs((sync_dt - snapshot_dt).total_seconds()) <= 60:
+                        verification_snapshot = {
+                            "captured_at": snapshot[0],
+                            "checking_balance": snapshot[1],
+                            "total_credit_debt": snapshot[2],
+                            "net_cash": snapshot[3],
+                        }
+            except Exception:
+                # Optional verification evidence must fail closed without
+                # making the existing read-only balance query unavailable.
+                verification_snapshot = None
         except Exception:
-            pass
+            is_stale = True
+            warning = " Data freshness could not be verified because the sync timestamp is invalid."
+            source_timestamp_utc = None
 
     return {
         "available": True,
@@ -124,8 +155,10 @@ def get_current_financial_position(*, user_id: str) -> dict:
         "net_cash": row[1],
         "all_balances": row[2],
         "date": row[3],
+        "source_timestamp_utc": source_timestamp_utc,
         "data_stale": is_stale,
         "warning": warning,
+        "verification_snapshot": verification_snapshot,
     }
 
 def get_transaction_context(*, transaction_row_id: int, user_id: str) -> list[dict]:
@@ -4758,4 +4791,3 @@ def get_plaid_credential(user_id, key: str) -> str | None:
     if row and row[0]:
         return row[0]
     return os.getenv(key.upper())
-

@@ -17,7 +17,10 @@ class ResultContract:
 RESULT_CONTRACTS = {
     "get_current_financial_position": ResultContract(
         "get_current_financial_position",
-        ("total_liquid", "net_worth", "net_cash", "date"),
+        (
+            "available", "total_liquid", "net_worth", "net_cash", "date",
+            "source_timestamp_utc", "data_stale",
+        ),
         "read",
     ),
     "search_gmail": ResultContract(
@@ -34,6 +37,14 @@ RESULT_CONTRACTS = {
     ),
     "send_push_alert": ResultContract(
         "send_push_alert", (), "mutation"
+    ),
+    "send_workspace_file": ResultContract(
+        "send_workspace_file",
+        (
+            "status", "owner_id", "call_id", "receipt_id", "path", "filename",
+            "sha256", "byte_size", "message_id", "valid_json", "valid_csv",
+        ),
+        "mutation",
     ),
     "save_memory": ResultContract(
         "save_memory", ("claim_id", "predicate"), "mutation"

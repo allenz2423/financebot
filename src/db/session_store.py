@@ -77,6 +77,8 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "phase", "callcount", "toolnames", "providercallids", "childtaskid", "parenttaskid",
     "turnid", "delegationgrantid", "allowedtools", "budget", "maxsteps", "timeoutseconds", "maxtokens",
     "terminalchildids", "childtaskids",
+    "passed", "checks", "checkid", "checkids", "failedcheckids",
+    "reasoncodes", "evidencerefs",
 }
 _UNSET = object()
 
@@ -1338,6 +1340,242 @@ class SessionStore:
             return self._row(
                 conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()
             )  # type: ignore[return-value]
+
+    def persist_task_verification(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        expected_version: int,
+        passed: bool,
+        checks: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """CAS-persist a bounded verification result while the task is verifying.
+
+        A failed result, its one ready repair step, and the task's partial
+        status/phase are committed together. This records no execution data
+        and never dispatches or retries the repair step.
+        """
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        version = int(expected_version)
+        if version < 0:
+            raise ValueError("expected_version must be non-negative")
+        if not isinstance(passed, bool):
+            raise TypeError("passed must be a boolean")
+        if (
+            not isinstance(checks, Sequence) or isinstance(checks, (str, bytes))
+            or not 1 <= len(checks) <= 100
+        ):
+            raise ValueError("checks must contain 1–100 structured results")
+
+        compact_checks: list[dict[str, Any]] = []
+        failed_check_ids: list[str] = []
+        evidence_ref_count = 0
+        for check in checks:
+            if not isinstance(check, Mapping):
+                raise TypeError("each verification check must be a mapping")
+            check_id = check.get("check_id")
+            reason_code = check.get("reason_code")
+            check_passed = check.get("passed")
+            refs = check.get("evidence_refs", [])
+            if (
+                not isinstance(check_id, str) or not 1 <= len(check_id) <= 256
+                or check_id.strip() != check_id
+            ):
+                raise ValueError("verification check_id is invalid")
+            if (
+                not isinstance(reason_code, str) or len(reason_code) > 64
+                or re.fullmatch(r"[a-z][a-z0-9_]*", reason_code) is None
+            ):
+                raise ValueError("verification reason_code is invalid")
+            if not isinstance(check_passed, bool):
+                raise TypeError("verification check passed must be a boolean")
+            if (
+                not isinstance(refs, (list, tuple)) or len(refs) > 20
+                or any(
+                    not isinstance(ref, str) or not 1 <= len(ref) <= 256
+                    or ref.strip() != ref for ref in refs
+                )
+            ):
+                raise ValueError("verification evidence references are invalid")
+            evidence_ref_count += len(refs)
+            if evidence_ref_count > 100:
+                raise ValueError("verification evidence references exceed the event limit")
+            compact_checks.append({
+                "check_id": check_id,
+                "reason_code": reason_code,
+                "evidence_refs": list(refs),
+            })
+            if not check_passed:
+                failed_check_ids.append(check_id)
+
+        if passed != (not failed_check_ids):
+            raise ValueError("verification outcome does not match its check results")
+        if len(set(item["check_id"] for item in compact_checks)) != len(compact_checks):
+            raise ValueError("verification check IDs must be unique")
+
+        payload = {
+            "passed": passed,
+            "checks": compact_checks,
+            "check_ids": [item["check_id"] for item in compact_checks],
+            "failed_check_ids": failed_check_ids,
+            "reason_codes": [item["reason_code"] for item in compact_checks],
+            "evidence_refs": [ref for item in compact_checks for ref in item["evidence_refs"]],
+        }
+        # Protect the append-only event stream from oversized but otherwise
+        # individually valid strings and nested structures.
+        if len(_json(payload, default={}).encode("utf-8")) > 32_768:
+            raise ValueError("verification event exceeds its size limit")
+
+        now = _now()
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            if str(task["phase"] or "received") != "verifying" or int(task["version"]) != version:
+                raise ConcurrentTaskUpdate("task phase/version changed before verification persistence")
+
+            repair_step = None
+            if passed:
+                cursor = conn.execute(
+                    """UPDATE task_runs SET version=version+1, updated_at=?
+                       WHERE task_id=? AND user_id=? AND phase='verifying' AND version=?""",
+                    (now, task_key, owner, version),
+                )
+                event_type = "task.verification_passed"
+            else:
+                existing_repair = conn.execute(
+                    "SELECT 1 FROM task_steps WHERE task_id=? AND next_action='repair_failed_checks' LIMIT 1",
+                    (task_key,),
+                ).fetchone()
+                if existing_repair is not None:
+                    raise ConcurrentTaskUpdate("verification repair step already exists")
+                order = int(conn.execute(
+                    "SELECT COALESCE(MAX(step_order), -1) + 1 FROM task_steps WHERE task_id=?",
+                    (task_key,),
+                ).fetchone()[0])
+                repair_id = f"step_verify_repair_{uuid.uuid4().hex}"
+                conn.execute(
+                    """INSERT INTO task_steps(
+                           step_id, task_id, step_order, dependency_ids_json, status,
+                           next_action, description, completion_criteria, retry_policy_json,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, '[]', 'ready', 'repair_failed_checks',
+                                 'Manually repair failed deterministic checks', ?, '{}', ?, ?)""",
+                    (repair_id, task_key, order, _json(failed_check_ids, default=[]), now, now),
+                )
+                cursor = conn.execute(
+                    """UPDATE task_runs SET status='partial', phase='partial',
+                              phase_next_action='manual_repair_failed_checks',
+                              wait_reason='verification_failed', version=version+1, updated_at=?
+                       WHERE task_id=? AND user_id=? AND phase='verifying' AND version=?""",
+                    (now, task_key, owner, version),
+                )
+                event_type = "task.verification_failed"
+                repair_step = self._row(conn.execute(
+                    "SELECT * FROM task_steps WHERE step_id=?", (repair_id,)
+                ).fetchone())
+
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task phase/version changed before verification persistence")
+            event_id = self._insert_task_event(
+                conn, task_id=task_key, event_type=event_type, payload=payload,
+                step_id=None if repair_step is None else str(repair_step["step_id"]),
+            )
+            return {
+                "task": self._row(self._task_pk(conn, owner, task_key)),
+                "repair_step": repair_step,
+                "event_id": event_id,
+            }  # type: ignore[return-value]
+
+    def park_task_verification_unavailable(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        """Atomically park an unverifiable active task for manual repair.
+
+        The task transition, one ready repair step, and a bounded event are a
+        single transaction. A stale or no-longer-verifying task is untouched.
+        """
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        version = int(expected_version)
+        if version < 0:
+            raise ValueError("expected_version must be non-negative")
+
+        now = _now()
+        active_statuses = (
+            "queued", "running", "waiting_user", "waiting_approval",
+            "verifying", "needs_reconciliation",
+        )
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            if (
+                str(task["status"]) not in active_statuses
+                or str(task["phase"] or "received") != "verifying"
+                or int(task["version"]) != version
+            ):
+                raise ConcurrentTaskUpdate(
+                    "task status/phase/version changed before verification recovery"
+                )
+            existing_repair = conn.execute(
+                "SELECT 1 FROM task_steps WHERE task_id=? "
+                "AND next_action='manual_repair_verification_unavailable' LIMIT 1",
+                (task_key,),
+            ).fetchone()
+            if existing_repair is not None:
+                raise ConcurrentTaskUpdate("verification recovery step already exists")
+
+            order = int(conn.execute(
+                "SELECT COALESCE(MAX(step_order), -1) + 1 FROM task_steps WHERE task_id=?",
+                (task_key,),
+            ).fetchone()[0])
+            repair_id = f"step_verify_unavailable_{uuid.uuid4().hex}"
+            failed_check_ids = ["verification_unavailable"]
+            conn.execute(
+                """INSERT INTO task_steps(
+                       step_id, task_id, step_order, dependency_ids_json, status,
+                       next_action, description, completion_criteria, retry_policy_json,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, '[]', 'ready',
+                             'manual_repair_verification_unavailable',
+                             'Manually review task because deterministic verification was unavailable',
+                             ?, '{}', ?, ?)""",
+                (repair_id, task_key, order, _json(failed_check_ids, default=[]), now, now),
+            )
+            cursor = conn.execute(
+                """UPDATE task_runs SET status='partial', phase='partial',
+                          phase_next_action='manual_verification_repair',
+                          wait_reason='verification_unavailable', version=version+1,
+                          updated_at=?
+                   WHERE task_id=? AND user_id=? AND status IN (?, ?, ?, ?, ?, ?)
+                     AND phase='verifying' AND version=?""",
+                (now, task_key, owner, *active_statuses, version),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate(
+                    "task status/phase/version changed before verification recovery"
+                )
+            repair_step = self._row(conn.execute(
+                "SELECT * FROM task_steps WHERE step_id=?", (repair_id,)
+            ).fetchone())
+            event_id = self._insert_task_event(
+                conn,
+                task_id=task_key,
+                step_id=repair_id,
+                event_type="task.verification_unavailable",
+                payload={
+                    "reason_code": "verification_unavailable",
+                    "failed_check_ids": failed_check_ids,
+                },
+            )
+            return {
+                "task": self._row(self._task_pk(conn, owner, task_key)),
+                "repair_step": repair_step,
+                "event_id": event_id,
+            }  # type: ignore[return-value]
 
     def transition_task_step(
         self,

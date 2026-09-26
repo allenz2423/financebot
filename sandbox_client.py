@@ -1,8 +1,12 @@
 """Client for the isolated financebot sandbox."""
 
 import base64
+import csv
+import hashlib
 import io
+import json
 import os
+import posixpath
 
 import discord
 import httpx
@@ -640,6 +644,19 @@ async def read_workspace_file(
 ) -> tuple[str, bytes] | None:
     """Read one file from the current user's persistent workspace."""
 
+    result = await _read_workspace_file_details(user_id, path)
+    if result is None:
+        return None
+    filename, content, _canonical_path = result
+    return filename, content
+
+
+async def _read_workspace_file_details(
+    user_id: str,
+    path: str,
+) -> tuple[str, bytes, str] | None:
+    """Read a workspace file while retaining its server-reported identity."""
+
     try:
 
         async with httpx.AsyncClient(
@@ -672,10 +689,90 @@ async def read_workspace_file(
             data["filename"]
         )
 
-        return filename, content
+        response_path = data.get("path") or data.get("relative_path")
+        if not isinstance(response_path, str) or not response_path.strip():
+            return None
+        canonical_path = _canonical_owner_relative_path(response_path, user_id)
+        if not canonical_path:
+            return None
+        return filename, content, canonical_path
 
     except Exception:
         return None
+
+
+def _canonical_owner_relative_path(path: object, user_id: str) -> str:
+    """Normalize a sandbox path into a bounded owner-relative path."""
+    value = str(path or "").replace("\\", "/").strip()
+    owner_prefix = f"workspace/{str(user_id).strip('/')}/"
+    if value.startswith("/"):
+        value = value.lstrip("/")
+    if value.startswith(owner_prefix):
+        value = value[len(owner_prefix):]
+    elif value.startswith("workspace/"):
+        # A workspace-prefixed response for another account is inconsistent,
+        # not a valid relative path in this user's workspace.
+        return ""
+    normalized = posixpath.normpath(value)
+    if normalized in {"", "."} or normalized == ".." or normalized.startswith("../"):
+        return ""
+    return normalized[:512]
+
+
+def _reject_nonstandard_json_constant(value: str) -> None:
+    """Python's JSON decoder accepts NaN/Infinity unless explicitly rejected."""
+    raise ValueError(f"nonstandard JSON constant: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate JSON keys instead of silently keeping the last value."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _validate_csv_bytes(content: bytes) -> bool:
+    """Check bounded UTF-8 CSV structure and reject JSON documents named .csv."""
+    if not content or len(content) > 2_000_000:
+        return False
+    try:
+        text = content.decode("utf-8-sig")
+        if not text.strip():
+            return False
+        try:
+            parsed = json.loads(
+                content,
+                object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_nonstandard_json_constant,
+            )
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            parsed = None
+        else:
+            # A JSON scalar (e.g. 123 or "text") is syntactically valid CSV,
+            # but cannot prove a requested tabular export format.
+            return False
+        if text.lstrip().startswith(("{", "[")):
+            # Also reject JSON-looking objects that failed strict parsing,
+            # including duplicate-key documents.
+            return False
+        width = None
+        row_count = 0
+        for row in csv.reader(io.StringIO(text, newline=""), strict=True):
+            if not row:
+                continue
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                return False
+            row_count += 1
+            if row_count > 50_000:
+                return False
+        return width is not None and width > 0 and row_count > 0
+    except (UnicodeDecodeError, csv.Error, ValueError, RecursionError):
+        return False
 
 
 async def send_workspace_file(
@@ -683,13 +780,14 @@ async def send_workspace_file(
     user_id: str,
     path: str,
     title: str | None = None,
-) -> bool:
+    return_evidence: bool = False,
+) -> bool | dict[str, object]:
     """Retrieve a user's persistent workspace file and attach it to Discord."""
 
     if not channel:
         return False
 
-    result = await read_workspace_file(
+    result = await _read_workspace_file_details(
         user_id,
         path,
     )
@@ -697,29 +795,56 @@ async def send_workspace_file(
     if result is None:
         return False
 
-    filename, content = result
+    filename, content, canonical_path = result
 
     try:
-
         file = discord.File(
             io.BytesIO(content),
             filename=filename,
         )
+    except Exception:
+        return False
 
-        message = (
-            title
-            or f" **Workspace file:** `{filename}`"
-        )
-
-        await channel.send(
+    message = title or f" **Workspace file:** `{filename}`"
+    try:
+        sent_message = await channel.send(
             content=message,
             file=file,
         )
-
-        return True
-
     except Exception:
-        return False
+        # Discord may have accepted the upload before the client lost its
+        # acknowledgement. Preserve ambiguity for the receipt lifecycle; do
+        # not turn it into a known failure that could be retried.
+        return {"status": "unknown"} if return_evidence else False
+
+    if return_evidence:
+        message_id = getattr(sent_message, "id", None)
+        if not canonical_path or message_id is None:
+            return {"status": "unknown"}
+        evidence = {
+            "path": canonical_path,
+            "filename": str(filename)[:255],
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "byte_size": len(content),
+            "message_id": str(message_id)[:64],
+        }
+        if str(filename).casefold().endswith(".json"):
+            try:
+                if len(content) > 2_000_000:
+                    evidence["valid_json"] = False
+                else:
+                    json.loads(
+                        content,
+                        object_pairs_hook=_unique_json_object,
+                        parse_constant=_reject_nonstandard_json_constant,
+                    )
+                    evidence["valid_json"] = True
+            except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+                evidence["valid_json"] = False
+        elif str(filename).casefold().endswith(".csv"):
+            evidence["valid_csv"] = _validate_csv_bytes(content)
+        return evidence
+    return True
 
 
 async def post_sandbox_images(
