@@ -17,6 +17,8 @@ import asyncio
 import math
 import os
 import uuid
+import weakref
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
@@ -59,6 +61,32 @@ def _positive_float_setting(name: str, default: float) -> float:
 MAX_CHILD_STEPS = _positive_int_setting("DELEGATION_MAX_STEPS", 5)
 MAX_CHILD_TIMEOUT_SECONDS = _positive_float_setting("DELEGATION_MAX_TIMEOUT_SECONDS", 60.0)
 MAX_CHILD_TOKENS = _positive_int_setting("DELEGATION_MAX_TOKENS", 4096)
+
+# Process-local dispatch registry used to keep restart-only receipt recovery
+# from rewriting a child that is actively executing in this process.
+ACTIVE_DELEGATION_CHILDREN: dict[str, str] = {}
+_OWNER_CHILD_SEMAPHORES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, int], asyncio.Semaphore]
+] = weakref.WeakKeyDictionary()
+
+
+def _active_children_per_owner() -> int:
+    try:
+        return max(1, min(int(os.getenv("AGENT_MAX_ACTIVE_TASKS_PER_OWNER", "1")), 64))
+    except (TypeError, ValueError):
+        return 1
+
+
+@asynccontextmanager
+async def _owner_child_execution_slot(user_id: str):
+    """Enforce the configured active-child cap across every dispatch path."""
+    loop = asyncio.get_running_loop()
+    owner = str(user_id)
+    limit = _active_children_per_owner()
+    slots = _OWNER_CHILD_SEMAPHORES.setdefault(loop, {})
+    semaphore = slots.setdefault((owner, limit), asyncio.Semaphore(limit))
+    async with semaphore:
+        yield
 
 
 @dataclass(frozen=True)
@@ -448,6 +476,7 @@ class DelegationController:
                 CURRENT_TURN_ID.reset(turn_token)
                 CURRENT_TASK_ID.reset(task_token)
 
+        ACTIVE_DELEGATION_CHILDREN[child_task_id] = str(user_id)
         try:
             # Do not wrap a whole child turn in a scheduler worker: its model
             # requests must enter the scheduler individually, otherwise a
@@ -455,8 +484,9 @@ class DelegationController:
             # The separate child admission slot bounds unscheduled tool work
             # while leaving worker slots free for those nested inference units.
             async def _run_with_child_slot() -> DelegationResult:
-                async with self.scheduler.child_execution_slot():
-                    return await _execute_child_unit()
+                async with _owner_child_execution_slot(user_id):
+                    async with self.scheduler.child_execution_slot():
+                        return await _execute_child_unit()
 
             result: DelegationResult = await asyncio.wait_for(
                 _run_with_child_slot(), timeout=budget.timeout_seconds
@@ -496,6 +526,7 @@ class DelegationController:
             self.task_controller.cancel(user_id, parent_task_id)
             raise
         finally:
+            ACTIVE_DELEGATION_CHILDREN.pop(child_task_id, None)
             # Resume only after a known terminal child outcome. An interrupted
             # or ambiguous child remains linked to the durable awaiting state.
             parent_curr = self.store.get_task(user_id, parent_task_id, include_steps=False, include_events=False)
@@ -550,11 +581,20 @@ class DelegationController:
     ) -> DelegationResult:
         """Resume only a durable, owner-scoped child whose prior actions reconcile safely."""
         recovery_receipts = self.receipt_store or ReceiptStore(self.store.connection)
-        self.task_controller.recover_incomplete(user_id, recovery_receipts)
         spec = self.store.get_child_delegation_spec(user_id, child_task_id)
         child = spec["child"]
         parent = spec["parent"]
         parent_id = str(spec["parent_task_id"])
+        # Validate only this parent/child evidence chain. An owner-wide restart
+        # sweep here could reset a different task that is actively executing.
+        self.task_controller.recover_incomplete(
+            user_id,
+            recovery_receipts,
+            only_task_ids={parent_id, child_task_id},
+        )
+        spec = self.store.get_child_delegation_spec(user_id, child_task_id)
+        child = spec["child"]
+        parent = spec["parent"]
         if child.get("status") != "queued":
             raise ValueError("only a safely queued child task may be resumed")
         if parent.get("phase") != "awaiting_child" or parent.get("status") not in {"queued", "running"}:
@@ -671,6 +711,7 @@ class DelegationController:
         grant_token = CURRENT_DELEGATION_GRANT.set(grant)
         steps_token = CURRENT_MAX_TOOL_STEPS.set(remaining_steps)
         tokens_token = CURRENT_DELEGATION_MAX_TOKENS.set(budget.max_tokens)
+        ACTIVE_DELEGATION_CHILDREN[child_task_id] = str(user_id)
         try:
             self.store.begin_turn(
                 user_id, child_session_id, turn_id=turn_id,
@@ -686,19 +727,20 @@ class DelegationController:
                 metadata={"parent_task_id": parent_id, "child_task_id": child_task_id,
                           "delegated": True, "recovered": True},
             )
-            async with self.scheduler.child_execution_slot():
-                result = await asyncio.wait_for(
-                    runner_fn(
-                        child_task_id, user_id, str(child["objective"]), allowed_tools,
-                        {"parent_task_id": parent_id, "recovered": True},
-                        DelegationBudget(
-                            max_steps=remaining_steps,
-                            timeout_seconds=remaining_timeout,
-                            max_tokens=budget.max_tokens,
+            async with _owner_child_execution_slot(user_id):
+                async with self.scheduler.child_execution_slot():
+                    result = await asyncio.wait_for(
+                        runner_fn(
+                            child_task_id, user_id, str(child["objective"]), allowed_tools,
+                            {"parent_task_id": parent_id, "recovered": True},
+                            DelegationBudget(
+                                max_steps=remaining_steps,
+                                timeout_seconds=remaining_timeout,
+                                max_tokens=budget.max_tokens,
+                            ),
                         ),
-                    ),
-                    timeout=remaining_timeout,
-                )
+                        timeout=remaining_timeout,
+                    )
             if result.task_id != child_task_id or result.parent_task_id != parent_id:
                 raise ValueError("recovered child runner returned mismatched task identity")
             if result.steps_executed < 0 or result.steps_executed > budget.max_steps:
@@ -762,6 +804,7 @@ class DelegationController:
             self.task_controller.recover_incomplete(user_id, recovery_receipts)
             raise
         finally:
+            ACTIVE_DELEGATION_CHILDREN.pop(child_task_id, None)
             CURRENT_DELEGATION_MAX_TOKENS.reset(tokens_token)
             CURRENT_MAX_TOOL_STEPS.reset(steps_token)
             CURRENT_DELEGATION_GRANT.reset(grant_token)

@@ -85,6 +85,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _background_queue_limit() -> int:
+    try:
+        return max(1, min(int(os.getenv("AGENT_MAX_QUEUE_PER_OWNER", "8")), 64))
+    except (TypeError, ValueError):
+        return 8
+
+
 def _required(value: Any, name: str) -> str:
     value = str(value).strip() if value is not None else ""
     if not value:
@@ -814,6 +821,15 @@ class SessionStore:
             ).fetchone()
             if active_child is not None:
                 raise ValueError("parent already has an active child task")
+            queued_children = int(conn.execute(
+                """SELECT COUNT(*) FROM task_runs
+                   WHERE user_id=? AND lane='background' AND status='queued'""",
+                (owner,),
+            ).fetchone()[0] or 0)
+            if queued_children >= _background_queue_limit():
+                raise ValueError(
+                    "owner background queue is full; no child task was created"
+                )
             child_scope = (
                 owner,
                 _required(child_session_id, "child_session_id"),
@@ -1664,6 +1680,170 @@ class SessionStore:
             ).fetchall()
             return [self._row(r) for r in rows]
 
+    def list_recoverable_background_children(
+        self,
+        *,
+        limit: int = 500,
+        include_running: bool = True,
+        per_owner_limit: int = 1,
+        after: tuple[str, str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a fair bounded page of active child jobs, oldest first.
+
+        This is only a discovery query. Dispatch still requires the child CAS
+        claim and parent/delegation-manifest validation in DelegationController.
+        Per-owner selection avoids letting one owner's backlog monopolize a
+        startup sweep; the capacity scheduler arbitrates the resulting work.
+        """
+        bounded_limit = max(1, min(int(limit), 500))
+        bounded_per_owner = max(1, min(int(per_owner_limit), 8))
+        statuses = "'queued','running'" if include_running else "'queued'"
+        after_clause = ""
+        params: list[Any] = [bounded_per_owner]
+        if after is not None:
+            if len(after) != 3:
+                raise ValueError("after cursor must contain enqueued_at, user_id, task_id")
+            after_clause = "AND (enqueued_at, user_id, task_id) > (?, ?, ?)"
+            params.extend(str(value) for value in after)
+        params.append(bounded_limit)
+        with self._lock:
+            rows = self.connection.execute(
+                f"""WITH candidates AS (
+                       SELECT t.*, s.session_key, s.channel_id, s.thread_id,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY t.user_id
+                                  ORDER BY t.enqueued_at, t.task_id
+                              ) AS owner_rank
+                       FROM task_runs t
+                       JOIN sessions s ON s.id=t.session_id AND s.user_id=t.user_id
+                       JOIN task_runs p ON p.task_id=t.parent_task_id
+                                      AND p.user_id=t.user_id
+                         WHERE t.status IN ({statuses}) AND t.lane='background'
+                         AND t.parent_task_id IS NOT NULL
+                         AND p.status IN ('queued','running')
+                         AND p.phase='awaiting_child'
+                         AND p.wait_reason='awaiting_child:' || t.task_id
+                   )
+                   SELECT * FROM candidates
+                   WHERE owner_rank <= ? {after_clause}
+                   ORDER BY enqueued_at, user_id, task_id LIMIT ?""",
+                params,
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
+    def claim_background_completion_notice(
+        self, user_id: str, task_id: str
+    ) -> bool:
+        """Claim a single completion-notice attempt for a terminal background child.
+
+        The unique event index is the cross-process at-most-once boundary. A
+        crash after claiming intentionally does not cause a resend because the
+        external chat API may have accepted the original message.
+        """
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            if (
+                task["lane"] != "background"
+                or task["parent_task_id"] is None
+                or task["status"] not in {
+                    "succeeded", "partial", "failed", "cancelled", "needs_reconciliation"
+                }
+            ):
+                return False
+            try:
+                self._insert_task_event(
+                    conn,
+                    task_id=task_key,
+                    event_type="task.background_completion_notice_claimed",
+                    payload={"status": str(task["status"])},
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+    def begin_background_completion_notice(
+        self, user_id: str, task_id: str
+    ) -> bool:
+        """Atomically authorize the one external-send attempt after durable intent.
+
+        A prior claim without a started event is safe to recover: the send call
+        is only made after this method returns. Once started is persisted, the
+        outcome may be ambiguous and is never retried.
+        """
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            if (
+                task["lane"] != "background"
+                or task["parent_task_id"] is None
+                or task["status"] not in {
+                    "succeeded", "partial", "failed", "cancelled", "needs_reconciliation"
+                }
+            ):
+                return False
+            started = conn.execute(
+                """SELECT 1 FROM task_events WHERE task_id=?
+                   AND event_type='task.background_completion_notice_started' LIMIT 1""",
+                (task_key,),
+            ).fetchone()
+            if started is not None:
+                return False
+            claimed = conn.execute(
+                """SELECT 1 FROM task_events WHERE task_id=?
+                   AND event_type='task.background_completion_notice_claimed' LIMIT 1""",
+                (task_key,),
+            ).fetchone()
+            if claimed is None:
+                self._insert_task_event(
+                    conn,
+                    task_id=task_key,
+                    event_type="task.background_completion_notice_claimed",
+                    payload={"status": str(task["status"])},
+                )
+            try:
+                self._insert_task_event(
+                    conn,
+                    task_id=task_key,
+                    event_type="task.background_completion_notice_started",
+                    payload={"status": str(task["status"])},
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
+
+    def list_pending_background_completion_notices(
+        self, *, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """Find terminal child jobs whose single notification attempt is unclaimed."""
+        bounded_limit = max(1, min(int(limit), 500))
+        terminal = "'succeeded','partial','failed','cancelled','needs_reconciliation'"
+        with self._lock:
+            rows = self.connection.execute(
+                f"""WITH candidates AS (
+                       SELECT t.*, s.session_key, s.channel_id, s.thread_id,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY t.user_id
+                                  ORDER BY t.updated_at, t.task_id
+                              ) AS owner_rank
+                       FROM task_runs t
+                       JOIN sessions s ON s.id=t.session_id AND s.user_id=t.user_id
+                       WHERE t.lane='background' AND t.parent_task_id IS NOT NULL
+                         AND t.status IN ({terminal})
+                         AND NOT EXISTS (
+                             SELECT 1 FROM task_events e
+                             WHERE e.task_id=t.task_id
+                               AND e.event_type='task.background_completion_notice_started'
+                         )
+                   )
+                   SELECT * FROM candidates WHERE owner_rank=1
+                   ORDER BY updated_at, user_id, task_id LIMIT ?""",
+                (bounded_limit,),
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
     def get_child_delegation_spec(self, user_id: str, child_task_id: str) -> dict[str, Any]:
         """Return the unique parent-issued execution scope for an owner-scoped child."""
         owner = _required(user_id, "user_id")
@@ -1747,6 +1927,99 @@ class SessionStore:
                 payload={"turn_id": turn_key, "parent_task_id": parent_key},
             )
             return self._row(self._task_pk(conn, owner, child_key))  # type: ignore[return-value]
+
+    def park_undispatchable_background_child(
+        self,
+        user_id: str,
+        parent_task_id: str,
+        child_task_id: str,
+        *,
+        expected_parent_status: str,
+        expected_parent_version: int,
+        expected_child_status: str,
+        expected_child_version: int,
+        reason_code: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Atomically park an undispatchable child and its exact awaiting parent.
+
+        This records a manual-reconciliation outcome only; it never schedules,
+        retries, or otherwise executes the child.
+        """
+        owner = _required(user_id, "user_id")
+        parent_key = _required(parent_task_id, "parent_task_id")
+        child_key = _required(child_task_id, "child_task_id")
+        if parent_key == child_key:
+            raise ValueError("parent_task_id and child_task_id must differ")
+        parent_status = self._validate_task_status(expected_parent_status)
+        child_status = self._validate_task_status(expected_child_status)
+        if parent_status not in {"queued", "running"}:
+            raise ValueError("expected parent status must be queued or running")
+        if child_status not in {"queued", "running"}:
+            raise ValueError("expected child status must be queued or running")
+        parent_version = int(expected_parent_version)
+        child_version = int(expected_child_version)
+        if parent_version < 0 or child_version < 0:
+            raise ValueError("expected versions must be non-negative")
+        reason = _required(reason_code, "reason_code")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason):
+            raise ValueError("reason_code must be a lowercase identifier")
+
+        now = _now()
+        with self._write() as conn:
+            parent = self._task_pk(conn, owner, parent_key)
+            child = self._task_pk(conn, owner, child_key)
+            if (
+                child["parent_task_id"] != parent_key
+                or child["lane"] != "background"
+                or parent["status"] != parent_status
+                or int(parent["version"]) != parent_version
+                or parent["phase"] != "awaiting_child"
+                or parent["wait_reason"] != f"awaiting_child:{child_key}"
+                or child["status"] != child_status
+                or int(child["version"]) != child_version
+            ):
+                raise ConcurrentTaskUpdate(
+                    "background child or its exact awaiting parent changed before parking"
+                )
+
+            child_update = conn.execute(
+                """UPDATE task_runs SET status='needs_reconciliation', phase='partial',
+                          phase_next_action='manual_child_reconciliation',
+                          wait_reason=NULL, version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND parent_task_id=? AND lane='background'
+                     AND status=? AND version=?""",
+                (now, child_key, owner, parent_key, child_status, child_version),
+            )
+            if child_update.rowcount != 1:
+                raise ConcurrentTaskUpdate("background child changed while parking")
+            parent_update = conn.execute(
+                """UPDATE task_runs SET status='partial', phase='partial',
+                          phase_next_action='manual_child_reconciliation',
+                          wait_reason=NULL, version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND status=? AND phase='awaiting_child'
+                     AND wait_reason=? AND version=?""",
+                (now, parent_key, owner, parent_status,
+                 f"awaiting_child:{child_key}", parent_version),
+            )
+            if parent_update.rowcount != 1:
+                raise ConcurrentTaskUpdate("awaiting parent changed while parking child")
+
+            # Events are append-only and carry only a validated, non-sensitive
+            # reason code; no task objective, provider output, or exception text.
+            self._insert_task_event(
+                conn, task_id=child_key,
+                event_type="background.child_parked_undispatchable",
+                payload={"reason_code": reason},
+            )
+            self._insert_task_event(
+                conn, task_id=parent_key,
+                event_type="background.parent_parked_undispatchable",
+                payload={"reason_code": reason},
+            )
+            return {
+                "parent": self._row(self._task_pk(conn, owner, parent_key)),
+                "child": self._row(self._task_pk(conn, owner, child_key)),
+            }  # type: ignore[return-value]
 
     def count_task_tool_calls(
         self, user_id: str, task_id: str, *, exclude_tool_names: Sequence[str] = ()

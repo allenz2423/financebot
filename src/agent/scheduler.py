@@ -27,6 +27,14 @@ _HELD_PROVIDER_SLOTS: contextvars.ContextVar[frozenset[str]] = contextvars.Conte
 )
 
 
+def _bounded_env_int(name: str, default: int, *, maximum: int = 64) -> int:
+    """Parse an operator capacity setting without making bad config fatal."""
+    try:
+        return max(1, min(int(os.getenv(name, str(default))), maximum))
+    except (TypeError, ValueError):
+        return default
+
+
 class ProviderLimiter:
     """Bounded semaphore at the shared provider-client/request boundary.
 
@@ -594,7 +602,17 @@ def get_global_scheduler() -> CapacityAwareScheduler:
     global _GLOBAL_SCHEDULER
     with _GLOBAL_SCHEDULER_LOCK:
         if _GLOBAL_SCHEDULER is None:
-            _GLOBAL_SCHEDULER = CapacityAwareScheduler()
+            # Keep the self-hosted default conservative; higher-capacity hosts
+            # may opt in, while the provider limiter remains a hard ceiling.
+            _GLOBAL_SCHEDULER = CapacityAwareScheduler(
+                max_workers=_bounded_env_int("AGENT_MAX_WORKERS", 1),
+                max_active_tasks_per_owner=_bounded_env_int(
+                    "AGENT_MAX_ACTIVE_TASKS_PER_OWNER", 1
+                ),
+                max_queue_per_owner=_bounded_env_int(
+                    "AGENT_MAX_QUEUE_PER_OWNER", 8
+                ),
+            )
         return _GLOBAL_SCHEDULER
 
 

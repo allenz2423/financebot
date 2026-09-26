@@ -13,6 +13,7 @@ from src.agent.delegation import (
     DelegationBudget,
     DelegationController,
     DelegationResult,
+    _owner_child_execution_slot,
 )
 from src.agent.runtime import CURRENT_TURN_ID
 from src.agent.scheduler import (
@@ -812,14 +813,15 @@ def test_cancel_with_started_child_receipt_stays_reconciliation(delegation_env):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "workers, provider_limit, expected_max",
-    [(1, 1, 1), (3, 3, 3), (3, 1, 1)],
+    "workers, provider_limit, expected_max, owner_limit",
+    [(1, 1, 1, 1), (3, 3, 3, 3), (3, 1, 1, 1), (3, 3, 1, 1)],
 )
 async def test_delegated_children_use_scheduler_provider_capacity(
-    delegation_env, monkeypatch, workers, provider_limit, expected_max
+    delegation_env, monkeypatch, workers, provider_limit, expected_max, owner_limit
 ):
     store, _receipts, tasks, controller = delegation_env
     provider = f"delegation_test_{uuid.uuid4().hex}"
+    monkeypatch.setenv("AGENT_MAX_ACTIVE_TASKS_PER_OWNER", str(owner_limit))
     monkeypatch.setenv(f"{provider.upper()}_CONCURRENCY", str(provider_limit))
     scheduler = CapacityAwareScheduler(
         provider_name=provider, max_workers=workers,
@@ -883,3 +885,28 @@ async def test_delegated_children_use_scheduler_provider_capacity(
         assert observed_tool_max == expected_max
     finally:
         reset_global_scheduler()
+
+
+@pytest.mark.asyncio
+async def test_owner_child_execution_slot_enforces_configured_cap(monkeypatch):
+    monkeypatch.setenv("AGENT_MAX_ACTIVE_TASKS_PER_OWNER", "1")
+    active = 0
+    observed_max = 0
+    lock = asyncio.Lock()
+
+    async def work(owner):
+        nonlocal active, observed_max
+        async with _owner_child_execution_slot(owner):
+            async with lock:
+                active += 1
+                observed_max = max(observed_max, active)
+            await asyncio.sleep(0.01)
+            async with lock:
+                active -= 1
+
+    await asyncio.gather(work("owner-a"), work("owner-a"))
+    assert observed_max == 1
+
+    observed_max = 0
+    await asyncio.gather(work("owner-a"), work("owner-b"))
+    assert observed_max == 2

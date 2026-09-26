@@ -118,6 +118,40 @@ _DURABLE_SESSION_STORE: SessionStore | None = None
 _GMAIL_TOOL_USED_TURNS: set[str] = set()
 _RECOVERED_CHILD_RESUMPTIONS: set[str] = set()
 _RECOVERED_CHILD_TASKS: set[asyncio.Task] = set()
+
+
+def _park_undispatchable_background_child(
+    store: SessionStore, owner: str, child_id: str, *, reason_code: str
+) -> bool:
+    """Stop retrying a malformed queued child and surface reconciliation."""
+    try:
+        child = store.get_task(owner, child_id, include_steps=False, include_events=False)
+        if child.get("status") not in {"queued", "running"} or not child.get("parent_task_id"):
+            return False
+        parent_id = str(child["parent_task_id"])
+        parent = store.get_task(owner, parent_id, include_steps=False, include_events=False)
+        store.park_undispatchable_background_child(
+            owner, parent_id, child_id,
+            expected_parent_status=str(parent["status"]),
+            expected_parent_version=int(parent["version"]),
+            expected_child_status=str(child["status"]),
+            expected_child_version=int(child["version"]),
+            reason_code=reason_code,
+        )
+        return True
+    except Exception as park_err:
+        print(
+            f" [BACKGROUND RECOVERY] could not park child={child_id}: "
+            f"{type(park_err).__name__}"
+        )
+        return False
+_BACKGROUND_COMPLETION_DELIVERY = None
+
+
+def set_background_completion_delivery(callback) -> None:
+    """Install the host application's scoped terminal-notice delivery adapter."""
+    global _BACKGROUND_COMPLETION_DELIVERY
+    _BACKGROUND_COMPLETION_DELIVERY = callback
 _STEP2_MIGRATED_TOOLS = frozenset({
     "search_gmail", "read_gmail_message", "monitor_create_natural_rule",
     "monitor_add_rule", "monitor_list_rules", "delegate_task",
@@ -5098,60 +5132,228 @@ async def _run_delegated_child_runtime(
 
 def _schedule_recovered_delegated_children(
     store: SessionStore,
-    user_id: str,
+    user_id: str | None = None,
     *,
-    session_id: str,
-    channel_id: str | None,
-    thread_id: str | None,
+    session_id: str | None = None,
+    channel_id: str | None = None,
+    thread_id: str | None = None,
+    candidate_children: list[dict] | None = None,
+    scheduled_owners: set[str] | None = None,
 ) -> list[asyncio.Task]:
-    """Rehydrate safe queued children only in their original conversation scope."""
+    """Rehydrate safe children only from their persisted owner/conversation scope."""
     scheduled: list[asyncio.Task] = []
-    for listed in store.list_tasks(user_id, statuses=["queued"], limit=500):
-        parent = store.get_task(
-            user_id, listed["task_id"], include_steps=False, include_events=False
-        )
-        if (
-            parent.get("phase") != "awaiting_child"
-            or parent.get("session_key") != session_id
-            or str(parent.get("channel_id") or "") != str(channel_id or "")
-            or str(parent.get("thread_id") or "") != str(thread_id or "")
-        ):
+    candidates = candidate_children
+    if candidates is None:
+        candidates = []
+        if user_id is None or session_id is None:
+            return scheduled
+        for listed in store.list_tasks(user_id, statuses=["queued"], limit=500):
+            parent = store.get_task(
+                user_id, listed["task_id"], include_steps=False, include_events=False
+            )
+            if (
+                parent.get("phase") != "awaiting_child"
+                or parent.get("session_key") != session_id
+                or str(parent.get("channel_id") or "") != str(channel_id or "")
+                or str(parent.get("thread_id") or "") != str(thread_id or "")
+            ):
+                continue
+            candidates.extend(store.get_child_tasks(user_id, parent["task_id"]))
+
+    from src.agent.delegation import ACTIVE_DELEGATION_CHILDREN
+    active_owners = set(ACTIVE_DELEGATION_CHILDREN.values())
+    owner_claims = scheduled_owners if scheduled_owners is not None else set()
+    for child in candidates:
+        owner = str(child.get("user_id") or user_id or "").strip()
+        child_id = str(child.get("task_id") or "")
+        if not owner or not child_id or child.get("status") != "queued":
             continue
-        for child in store.get_child_tasks(user_id, parent["task_id"]):
-            child_id = str(child["task_id"])
-            if child.get("status") != "queued" or child_id in _RECOVERED_CHILD_RESUMPTIONS:
-                continue
+        if owner in active_owners or owner in owner_claims:
+            continue
+        if child_id in _RECOVERED_CHILD_RESUMPTIONS:
+            continue
+        try:
+            store.get_child_delegation_spec(owner, child_id)
+        except Exception as spec_err:
+            reason_code = (
+                "invalid_delegation_spec"
+                if isinstance(spec_err, (ValueError, PermissionError))
+                else "delegation_spec_check_failed"
+            )
+            _park_undispatchable_background_child(
+                store, owner, child_id, reason_code=reason_code
+            )
+            print(
+                f" [DELEGATION RECOVERY] child {child_id} parked or unavailable: "
+                f"{type(spec_err).__name__}"
+            )
+            continue
+        _RECOVERED_CHILD_RESUMPTIONS.add(child_id)
+        owner_claims.add(owner)
+
+        async def _resume_child(owner=owner, task_key=child_id, session_store=store):
             try:
-                store.get_child_delegation_spec(user_id, child_id)
-            except Exception as spec_err:
-                print(f" [DELEGATION RECOVERY] invalid child {child_id}: {spec_err}")
-                continue
-            _RECOVERED_CHILD_RESUMPTIONS.add(child_id)
+                from src.agent.delegation import DelegationController
 
-            async def _resume_child(owner=user_id, task_key=child_id, session_store=store):
-                try:
-                    from src.agent.delegation import DelegationController
+                result = await DelegationController(
+                    session_store,
+                    TaskController(session_store),
+                    receipt_store=ReceiptStore(session_store.connection),
+                ).resume_queued_child(
+                    owner, task_key, runner_fn=_run_delegated_child_runtime
+                )
+                callback = _BACKGROUND_COMPLETION_DELIVERY
+                if callback is not None and result.status in {
+                    "succeeded", "failed", "cancelled", "needs_reconciliation"
+                }:
+                    await callback(owner, task_key, result)
+            except Exception as resume_err:
+                _park_undispatchable_background_child(
+                    session_store, owner, task_key,
+                    reason_code="resume_recovery_failed",
+                )
+                print(
+                    f" [DELEGATION RECOVERY] child={task_key} "
+                    f"failed safely: {type(resume_err).__name__}"
+                )
+            finally:
+                _RECOVERED_CHILD_RESUMPTIONS.discard(task_key)
 
-                    await DelegationController(
-                        session_store,
-                        TaskController(session_store),
-                        receipt_store=ReceiptStore(session_store.connection),
-                    ).resume_queued_child(
-                        owner, task_key, runner_fn=_run_delegated_child_runtime
-                    )
-                except Exception as resume_err:
-                    print(
-                        f" [DELEGATION RECOVERY] child={task_key} "
-                        f"failed safely: {type(resume_err).__name__}: {resume_err}"
-                    )
-                finally:
-                    _RECOVERED_CHILD_RESUMPTIONS.discard(task_key)
-
-            task = asyncio.create_task(_resume_child())
-            _RECOVERED_CHILD_TASKS.add(task)
-            task.add_done_callback(_RECOVERED_CHILD_TASKS.discard)
-            scheduled.append(task)
+        task = asyncio.create_task(_resume_child())
+        _RECOVERED_CHILD_TASKS.add(task)
+        task.add_done_callback(_RECOVERED_CHILD_TASKS.discard)
+        scheduled.append(task)
     return scheduled
+
+
+async def recover_durable_background_tasks_once() -> None:
+    """Reconcile persisted child jobs once, before accepting new turns at startup."""
+    store = _durable_session_store()
+    if store is None:
+        return
+    receipts = ReceiptStore(store.connection)
+    controller = TaskController(store)
+    recoverable_owners: set[str] = set()
+    cursor = None
+    while True:
+        batch = store.list_recoverable_background_children(
+            limit=500, include_running=True, per_owner_limit=8, after=cursor
+        )
+        if not batch:
+            break
+        for owner in dict.fromkeys(str(row["user_id"]) for row in batch):
+            try:
+                controller.recover_incomplete(owner, receipts)
+                recoverable_owners.add(owner)
+            except Exception as recovery_err:
+                for child in batch:
+                    if str(child.get("user_id") or "") == owner:
+                        _park_undispatchable_background_child(
+                            store, owner, str(child["task_id"]),
+                            reason_code="startup_recovery_failed",
+                        )
+                print(
+                    f" [BACKGROUND RECOVERY] owner={owner} "
+                    f"failed safely: {type(recovery_err).__name__}"
+                )
+        last = batch[-1]
+        cursor = (str(last["enqueued_at"]), str(last["user_id"]), str(last["task_id"]))
+        if len(batch) < 500:
+            break
+
+    cursor = None
+    startup_owner_claims: set[str] = set()
+    while True:
+        page = store.list_recoverable_background_children(
+            limit=500, include_running=False, per_owner_limit=8, after=cursor
+        )
+        if not page:
+            break
+        queued = [
+            row for row in page
+            if str(row.get("user_id")) in recoverable_owners
+        ]
+        if queued:
+            _schedule_recovered_delegated_children(
+                store, candidate_children=queued, scheduled_owners=startup_owner_claims
+            )
+        last = page[-1]
+        cursor = (str(last["enqueued_at"]), str(last["user_id"]), str(last["task_id"]))
+        if len(page) < 500:
+            break
+    await deliver_pending_background_completion_notices(store)
+
+
+async def deliver_pending_background_completion_notices(
+    store: SessionStore | None = None,
+) -> None:
+    """Retry only notices with no prior send claim; never replay an ambiguous send."""
+    callback = _BACKGROUND_COMPLETION_DELIVERY
+    if callback is None:
+        return
+    session_store = store or _durable_session_store()
+    if session_store is None:
+        return
+    for task in session_store.list_pending_background_completion_notices(limit=500):
+        try:
+            await callback(
+                str(task["user_id"]), str(task["task_id"]),
+                DelegationResult(
+                    task_id=str(task["task_id"]),
+                    parent_task_id=str(task["parent_task_id"]),
+                    status=str(task["status"]),
+                    summary="",
+                ),
+            )
+        except Exception as delivery_err:
+            print(
+                f" [BACKGROUND DELIVERY] task={task['task_id']} failed safely: "
+                f"{type(delivery_err).__name__}"
+            )
+
+
+async def durable_background_recovery_loop() -> None:
+    """Poll only unclaimed terminal notices; startup alone handles task recovery.
+
+    The periodic sweep never calls restart reconciliation on live tasks. Child
+    claim remains a CAS; cross-process leases are not claimed by this loop.
+    """
+    interval = max(5, min(int(os.getenv("BACKGROUND_RECOVERY_INTERVAL_SECONDS", "30")), 300))
+    while True:
+        try:
+            store = _durable_session_store()
+            if store is not None:
+                cursor = None
+                queue_owner_claims: set[str] = set()
+                while True:
+                    queued = store.list_recoverable_background_children(
+                        limit=500, include_running=False, per_owner_limit=8,
+                        after=cursor,
+                    )
+                    if not queued:
+                        break
+                    _schedule_recovered_delegated_children(
+                        store,
+                        candidate_children=queued,
+                        scheduled_owners=queue_owner_claims,
+                    )
+                    last = queued[-1]
+                    cursor = (
+                        str(last["enqueued_at"]),
+                        str(last["user_id"]),
+                        str(last["task_id"]),
+                    )
+                    if len(queued) < 500:
+                        break
+            await deliver_pending_background_completion_notices()
+        except asyncio.CancelledError:
+            raise
+        except Exception as sweep_err:
+            print(
+                f" [BACKGROUND DELIVERY] sweep failed safely: "
+                f"{type(sweep_err).__name__}"
+            )
+        await asyncio.sleep(interval)
 
 
 async def _chat_with_delilah_impl(
@@ -12715,8 +12917,11 @@ async def chat_with_delilah(
                             )
                         except Exception as notify_err:
                             print(f" [TASK NOTICE] delivery failed: {notify_err}")
+            from src.agent.delegation import ACTIVE_DELEGATION_CHILDREN
             recovered = controller.recover_incomplete(
-                scope["user_id"], ReceiptStore(store.connection)
+                scope["user_id"],
+                ReceiptStore(store.connection),
+                exclude_task_ids=frozenset(ACTIVE_DELEGATION_CHILDREN),
             )
             for item in recovered:
                 if item["status"] == "needs_reconciliation":

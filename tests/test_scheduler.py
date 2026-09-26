@@ -20,6 +20,7 @@ from src.agent.scheduler import (
     CapacityAwareScheduler,
     ProviderCapacityController,
     ProviderLimiter,
+    get_global_scheduler,
     get_provider_limiter,
     provider_capacity,
     reset_global_scheduler,
@@ -35,6 +36,47 @@ def reset_provider_capacity():
     yield
     ProviderCapacityController.reset_instance()
     reset_global_scheduler()
+
+
+def test_get_global_scheduler_uses_agent_max_workers(monkeypatch):
+    """The global scheduler honors the configured worker count and defaults to one."""
+    monkeypatch.delenv("AGENT_MAX_WORKERS", raising=False)
+    monkeypatch.delenv("AGENT_MAX_ACTIVE_TASKS_PER_OWNER", raising=False)
+    monkeypatch.delenv("AGENT_MAX_QUEUE_PER_OWNER", raising=False)
+    reset_global_scheduler()
+    scheduler = get_global_scheduler()
+    assert scheduler.max_workers == 1
+    assert scheduler.max_active_tasks_per_owner == 1
+    assert scheduler.max_queue_per_owner == 8
+
+    monkeypatch.setenv("AGENT_MAX_WORKERS", "3")
+    monkeypatch.setenv("AGENT_MAX_ACTIVE_TASKS_PER_OWNER", "2")
+    monkeypatch.setenv("AGENT_MAX_QUEUE_PER_OWNER", "4")
+    reset_global_scheduler()
+    scheduler = get_global_scheduler()
+    assert scheduler.max_workers == 3
+    assert scheduler.max_active_tasks_per_owner == 2
+    assert scheduler.max_queue_per_owner == 4
+
+
+@pytest.mark.parametrize("value", ["", "not-an-integer", "1.5"])
+def test_get_global_scheduler_invalid_worker_count_falls_back(monkeypatch, value):
+    monkeypatch.setenv("AGENT_MAX_WORKERS", value)
+    reset_global_scheduler()
+    assert get_global_scheduler().max_workers == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-4"])
+def test_get_global_scheduler_low_worker_count_clamps_to_one(monkeypatch, value):
+    monkeypatch.setenv("AGENT_MAX_WORKERS", value)
+    reset_global_scheduler()
+    assert get_global_scheduler().max_workers == 1
+
+
+def test_get_global_scheduler_high_worker_count_clamps_to_maximum(monkeypatch):
+    monkeypatch.setenv("AGENT_MAX_WORKERS", "999")
+    reset_global_scheduler()
+    assert get_global_scheduler().max_workers == 64
 
 
 @pytest.mark.asyncio
@@ -797,7 +839,4 @@ async def test_qdrant_get_embeddings_gated_with_provider_limiter(monkeypatch):
     res = await qdrant_client.get_embeddings(["text 1", "text 2"])
     assert len(res) == 2
     assert acquired is True
-
-
-
 

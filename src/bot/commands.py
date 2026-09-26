@@ -4778,6 +4778,54 @@ async def plaidstatus_cmd(ctx: commands.Context):
 
 BACKGROUND_TASKS_STARTED = False
 _PERSISTENT_TASKS = set()
+_DATABASE_PROCESS_LEASE = None
+
+
+async def _deliver_background_task_completion(user_id: str, task_id: str, result) -> None:
+    """Deliver one minimal owner-scoped terminal notice; never expose task output."""
+    from src.db.session_store import SessionStore
+
+    store = SessionStore(src.core.state.DB_PATH)
+    try:
+        task = store.get_task(user_id, task_id, include_steps=False, include_events=False)
+        destination_id = task.get("thread_id") or task.get("channel_id")
+        target = None
+        if destination_id:
+            try:
+                target = bot.get_channel(int(destination_id))
+                if target is None:
+                    target = await bot.fetch_channel(int(destination_id))
+            except Exception:
+                target = None
+        if target is None:
+            # No send has been attempted, so leave the durable notice pending
+            # for a later poll rather than consuming its single-send claim.
+            return
+        if not store.begin_background_completion_notice(user_id, task_id):
+            return
+        status = str(task.get("status") or result.status).replace("_", " ").upper()
+        content = f"Background task `{task_id}` finished: **{status}**."
+        try:
+            await target.send(content[:1900], allowed_mentions=discord.AllowedMentions.none())
+        except Exception as send_err:
+            # A failed send can mean Discord accepted it but the acknowledgement
+            # was lost. Persist uncertainty and do not attempt a second send.
+            store.append_task_event(
+                user_id, task_id, event_type="task.background_completion_delivery_unknown",
+                payload={"status": status, "reason_code": "send_exception"},
+            )
+            return
+        store.append_task_event(
+            user_id, task_id, event_type="task.background_completion_notice_delivered",
+            payload={"status": status},
+        )
+    except Exception as delivery_err:
+        print(
+            f" [BACKGROUND DELIVERY] task={task_id} failed safely: "
+            f"{type(delivery_err).__name__}"
+        )
+    finally:
+        store.close()
 
 async def preload_advisor_model():
     print(f" Warming up {src.core.state.ADVISOR_MODEL} into VRAM...")
@@ -5209,7 +5257,7 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_ready():
-    global BACKGROUND_TASKS_STARTED
+    global BACKGROUND_TASKS_STARTED, _DATABASE_PROCESS_LEASE
     print("==========================================")
     print("Delilah Financial OS Online")
     print(f"Conversational Advisor:  {src.core.state.ADVISOR_MODEL}")
@@ -5224,6 +5272,24 @@ async def on_ready():
     if BACKGROUND_TASKS_STARTED:
         print(" [DEBUG] on_ready: skipping task creation (already started)", flush=True)
         return
+
+    # Task recovery assumes one live bot process per task database.  Enforce
+    # that deployment boundary before starting any scheduler or recovery loop;
+    # the OS releases the lock on clean shutdown or process death.
+    try:
+        from src.agent.process_lease import DatabaseProcessLease
+
+        if _DATABASE_PROCESS_LEASE is None:
+            _DATABASE_PROCESS_LEASE = DatabaseProcessLease(src.core.state.DB_PATH)
+            _DATABASE_PROCESS_LEASE.acquire()
+    except Exception as lease_err:
+        print(
+            f" [TASKS] Refusing to start: task database process lease unavailable "
+            f"({type(lease_err).__name__})."
+        )
+        await bot.close()
+        return
+
     BACKGROUND_TASKS_STARTED = True
 
     try:
@@ -5250,14 +5316,32 @@ async def on_ready():
         import traceback; traceback.print_exc()
 
     # Apply idempotent DB migrations (monitor_rules, monitor_alerts, ...).\n    # Existing financial data is preserved: migrations only ADD tables/columns.
+    migrations_ready = False
     try:
         from src.db.migrations import apply_all
         applied = apply_all(conn)
         if applied:
             print(f" [DB] Applied migrations: {', '.join(applied)}")
+        migrations_ready = True
     except Exception as exc:
         print(f" [DB] Migration apply failed: {type(exc).__name__}: {exc}")
     print(" [DEBUG] Migrations done. Starting monitor watchdog...", flush=True)
+
+    if migrations_ready:
+        try:
+            from src.services.llm import (
+                durable_background_recovery_loop,
+                recover_durable_background_tasks_once,
+                set_background_completion_delivery,
+            )
+            set_background_completion_delivery(_deliver_background_task_completion)
+            await recover_durable_background_tasks_once()
+            t_background = bot.loop.create_task(durable_background_recovery_loop())
+            _PERSISTENT_TASKS.add(t_background)
+            t_background.add_done_callback(_PERSISTENT_TASKS.discard)
+            print(" [TASKS] Durable background recovery/delivery loop started.")
+        except Exception as exc:
+            print(f" [TASKS] Durable background worker failed to start: {type(exc).__name__}: {exc}")
 
     # Persistent, LLM-free financial monitor.  Rules are declarative
     # predicates; when one fires an alert row is written and pushed.

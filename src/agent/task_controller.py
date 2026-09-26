@@ -17,7 +17,7 @@ from src.services.authorization import (
     HumanApproval,
     approve_request,
 )
-from src.db.session_store import ConcurrentTaskUpdate, SessionStore
+from src.db.session_store import ConcurrentTaskUpdate, SessionStore, TaskNotFound
 from src.services.tool_receipts import arguments_hash
 
 
@@ -344,11 +344,36 @@ class TaskController:
                     return True
         return False
 
-    def recover_incomplete(self, user_id: str, receipt_store: Any) -> list[dict[str, Any]]:
+    def recover_incomplete(
+        self,
+        user_id: str,
+        receipt_store: Any,
+        *,
+        exclude_task_ids: set[str] | frozenset[str] = frozenset(),
+        only_task_ids: set[str] | frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Project linked receipt outcomes after a process restart, never replay."""
         recovered: list[dict[str, Any]] = []
-        for listed in self.store.list_tasks(user_id, statuses=["running", "queued"], limit=500):
-            task = self.store.get_task(user_id, listed["task_id"])
+        if only_task_ids is None:
+            candidates = self.store.list_tasks(
+                user_id, statuses=["running", "queued"], limit=500
+            )
+        else:
+            candidates = []
+            for requested_id in sorted(str(task_id) for task_id in only_task_ids):
+                try:
+                    record = self.store.get_task(user_id, requested_id)
+                except TaskNotFound:
+                    continue
+                if record.get("status") in {"running", "queued"}:
+                    candidates.append(record)
+        for listed in candidates:
+            task_key = str(listed["task_id"])
+            if task_key in exclude_task_ids:
+                continue
+            if only_task_ids is not None and task_key not in only_task_ids:
+                continue
+            task = listed if "steps" in listed else self.store.get_task(user_id, listed["task_id"])
             if task.get("phase") == "awaiting_child":
                 children = self.store.get_child_tasks(user_id, task["task_id"])
                 delegation_step = None
