@@ -14,8 +14,8 @@
 #   2. docker compose up -d --build
 #   3. docker logs delilah_bot -f
 #
-# All services run on an internal bridge network. Only delilah (port 8000),
-# searxng (8080), stirling-pdf (8085), and ollama (11434) are exposed to the host.
+# Services use scoped Docker networks; host exposure is defined per-service
+# below. Browserless host diagnostics bind to loopback by default.
 
 name: financebot
 
@@ -282,7 +282,9 @@ services:
       - financebot-internal
       - egress
     ports:
-      - "3002:3000"
+      # Delilah uses the internal service network; host-side diagnostics bind
+      # only to loopback unless an operator explicitly overrides the exposure.
+      - "${BROWSERLESS_HOST_BIND:-127.0.0.1}:${BROWSERLESS_HOST_PORT:-3002}:3000"
     environment:
       - CONCURRENT=5
       - QUEUED=10
