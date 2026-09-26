@@ -2,15 +2,36 @@
 
 ## Current stopping summary
 
-- **Passed:** Steps 0 (workflow action contracts), 1 (durable task/step/event records), and 2 (resumable task execution state machine & workflow migration), and roadmap items 1 (durable task plans), 4 (bounded session recall), 7 (durable phase recovery), and 9 (await/resume). Commits are pushed on `agentic-roadmap/full-run`; no changes were made to `main`.
-- **In progress / next:** Step 3 — Scheduler & Capacity Controller. Step 3's provider-call inventory is completed in `docs/provider-call-inventory.md`.
-- **Remaining roadmap items:** 1 — passed; 2 — blocked on Step 3; 3 — blocked on Step 3; 4 — passed; 5 — blocked (group 4); 6 — blocked (group 4); 7 — passed; 8 — blocked (group 5); 9 — passed; 10 — blocked (group 6); 11 — blocked (group 4); 12 — blocked (group 5); 13 — blocked (group 6); 14 — blocked; 15 — blocked (group 6).
-- **Human decisions recorded:** (1) affirmative choice replies resume into planning as input-only; affirmative approvals require human grant confirmation before dispatch (fail-closed); (2) reconciliation notice delivery uses atomic single-claim migration 008 index (`ux_task_reconciliation_notice_claimed_once`) to guarantee at-most-once surfacing without duplicate Discord alerts.
-- **Verification baseline:** Full test suite passes: 634 passed, 1 skipped (0 failures; sandbox credentials only; real finances.db untouched).
-- **Latest pushed checkpoint:** Step 2 gate code/tests at commit `6e34f70` on `agentic-roadmap/full-run`.
-- **Review first:** Step 2's resumable recovery gate passed cleanly with zero adversarial blockers; proceed with Step 3 (Scheduler and capacity controller).
+- **Passed:** Steps 0 (workflow action contracts), 1 (durable task/step/event records), 2 (resumable task execution state machine & workflow migration), and 3 (capacity-aware scheduler & provider limiter); and roadmap items 1 (durable task plans), 4 (bounded session recall), 7 (durable phase recovery), and 9 (await/resume). Commits are pushed on `agentic-roadmap/full-run`; no changes were made to `main`.
+- **In progress / next:** Step 4 — Bounded delegation as child tasks (Roadmap Item 2).
+- **Remaining roadmap items:** 1 — passed; 2 — in progress (Step 4); 3 — ready (Item 3 delegation budgets); 4 — passed; 5 — blocked (group 4); 6 — blocked (group 4); 7 — passed; 8 — blocked (group 5); 9 — passed; 10 — blocked (group 6); 11 — blocked (group 4); 12 — blocked (group 5); 13 — blocked (group 6); 14 — blocked; 15 — blocked (group 6).
+- **Human decisions recorded:** (1) affirmative choice replies resume into planning as input-only; affirmative approvals require human grant confirmation before dispatch (fail-closed); (2) reconciliation notice delivery uses atomic single-claim migration 008 index (`ux_task_reconciliation_notice_claimed_once`) to guarantee at-most-once surfacing without duplicate Discord alerts; (3) scheduler defaults strictly follow doc: 1 worker, 1 active task per owner, 8 queue limit per lane; model inference scheduled at unit level rather than locking coarse turns.
+- **Verification baseline:** Full test suite passes: 657 passed, 1 skipped (0 failures; sandbox credentials only; real finances.db untouched).
+- **Latest pushed checkpoint:** Step 3 gate code/tests at commit `c0771ec` on `agentic-roadmap/full-run`.
+- **Review first:** Step 3's scheduler and provider limiter gate passed cleanly with zero adversarial blockers; proceed with Step 4 (Bounded delegation as child tasks).
 
 ## Progress
+
+### Step 3 — scheduler and capacity controller — passed
+
+- Built `CapacityAwareScheduler` and `ProviderLimiter` (`src/agent/scheduler.py`) enforcing hard concurrency ceilings at the provider client boundary across Ollama, OpenAI, OpenRouter, and Kev.
+- Implemented fair round-robin owner rotation with dynamic arrival fairness, longest-wait lane selection between interactive and background lanes, interactive tie-breaking, and per-lane queue capacity limits preventing background backlogs from starving or crashing interactive turns.
+- Enforced non-preemptive cooperative cancellation at dispatch boundaries without leaking worker slots or task counters.
+- Propagated context variables (`CURRENT_TASK_ID`, `CURRENT_TURN_ID`, session tokens) across asynchronous worker tasks via `asyncio.create_task(..., context=unit.context)`.
+- Routed all known model work through the scheduler at unit granularity:
+  - Interactive stream inference (`stream_generator`) via `schedule_work(..., "interactive", unit_type="inference", provider=llm_provider)`.
+  - Background classification (`classify_with_local_llm` and `classify_transaction_batch`).
+  - Autonomous analyst (`run_autonomous_analyst`).
+  - History summarization (`_summarize_history_block`).
+  - Claim extraction (`auto_extract_and_persist_claims`).
+  - Kev decision provider (`DecisionProvider.decide`).
+  - Ollama warm/unload/preload operations in `commands.py`.
+  - Batch and singular local Ollama embedding in `qdrant_client.py` gated with `provider_capacity("ollama")`.
+- Real-time observability: recorded queue wait, inference duration, tool duration, cancellations, and dispatch distributions in `SchedulerMetrics`.
+- Verification: 23 dedicated scheduler tests in `tests/test_scheduler.py` covering hard concurrency, owner rotation on dynamic arrival, continuous readiness arbitration, re-entrancy, waiter leak protection, cooperative cancellation, queue lane isolation, nested inference/decision turns, and embedding limiter gating. Full test suite passes: 657 passed, 1 skipped. Adversarial critic review approved with 0 blocking items.
+- Deferred suggestions: wrap cloud embedding branches in `qdrant_client` with `provider_capacity(backend)`, assign explicit owner ID to tool/classifier work when triggered during an interactive turn, and persist scheduler metrics in Step 6.
+- Gate commit: `[gate] Step 3 route model work through capacity-aware scheduler` (commit `c0771ec`).
+
 
 ### Item 1 — durable task plans and inspection — passed
 
