@@ -169,18 +169,29 @@ async def semantic_search_memory(
     top_k: int = 5,
     min_confidence: float = 0.0,
     *,
-    memory_type: Optional[str] = None,
+    memory_type: Optional[str | List[str] | tuple[str, ...]] = None,
 ) -> str:
     """Retrieve memories using semantic similarity and strict provenance metadata."""
     query_emb = await _get_embedding(query)
     type_clause = ""
     parameters: list[Any] = [user_id, min_confidence]
     if memory_type is not None:
-        normalized_type = str(memory_type).strip().lower()
-        if not normalized_type or len(normalized_type) > 64:
-            raise ValueError("memory_type must be a non-empty string of at most 64 characters")
-        type_clause = " AND LOWER(memory_type) = ?"
-        parameters.append(normalized_type)
+        if isinstance(memory_type, str):
+            raw_types = [memory_type]
+        elif isinstance(memory_type, (list, tuple)):
+            raw_types = list(memory_type)
+        else:
+            raise ValueError("memory_type must be a string or a list/tuple of strings")
+        normalized_types = [str(item).strip().lower() for item in raw_types]
+        if (
+            not 1 <= len(normalized_types) <= 8
+            or any(not item or len(item) > 64 for item in normalized_types)
+            or len(set(normalized_types)) != len(normalized_types)
+        ):
+            raise ValueError("memory_type must contain 1–8 distinct non-empty types")
+        placeholders = ", ".join("?" for _ in normalized_types)
+        type_clause = f" AND LOWER(memory_type) IN ({placeholders})"
+        parameters.extend(normalized_types)
     
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -212,7 +223,13 @@ async def semantic_search_memory(
             # Temporal decay (optional boost for recent facts)
             # Not fully implemented here, keeping it pure semantic + confidence
             score = sim * 0.7 + conf * 0.3 # Weigh similarity and epistemic confidence
-            
+            try:
+                parsed_evidence = json.loads(ev) if isinstance(ev, str) and ev else ev
+            except (TypeError, ValueError):
+                parsed_evidence = []
+            if not isinstance(parsed_evidence, list):
+                parsed_evidence = []
+
             results.append({
                 "score": score,
                 "content": content,
@@ -220,6 +237,7 @@ async def semantic_search_memory(
                 "provenance": prov,
                 "confidence": conf,
                 "sensitivity": sensitivity,
+                "evidence_refs": parsed_evidence,
                 "created_at": created
             })
             
@@ -233,7 +251,10 @@ async def semantic_search_memory(
         output = [f"Found {len(top)} memories for query: '{query}'\n"]
         for r in top:
             sensitivity_label = f" | Sensitivity: {r['sensitivity']}" if r["sensitivity"] else ""
-            output.append(f"[{r['type'].upper()} | Prov: {r['provenance']} | Conf: {r['confidence']}{sensitivity_label}] {r['content']} (Date: {r['created_at']})")
+            refs = r.get("evidence_refs")
+            refs = [str(ref)[:2048] for ref in refs if isinstance(ref, str)][:10] if isinstance(refs, list) else []
+            evidence_label = f" | Evidence: {json.dumps(refs, ensure_ascii=False)}" if refs else ""
+            output.append(f"[{r['type'].upper()} | Prov: {r['provenance']} | Conf: {r['confidence']}{sensitivity_label}{evidence_label}] {r['content']} (Date: {r['created_at']})")
             
         return "\n".join(output)
 

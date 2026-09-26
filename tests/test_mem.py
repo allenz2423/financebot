@@ -140,6 +140,36 @@ async def test_lesson_search_is_owner_scoped_and_excludes_other_memory_types(
 
 
 @pytest.mark.asyncio
+async def test_exact_source_fact_and_decision_search_are_type_scoped(
+    memory_store, deterministic_embedding
+):
+    memory, _ = memory_store
+    await memory.save_epistemic_memory(
+        "owner-a", "[USER-STATED DECISION] I prefer no expiry.",
+        memory_type="decision", provenance_type="user_stated",
+        evidence_refs=["user_message:origin:offsets"],
+    )
+    await memory.save_epistemic_memory(
+        "owner-a", "[WEB-RESEARCH FACT] Exact source quote.",
+        memory_type="fact", provenance_type="web_research_quote",
+        evidence_refs=["web_source:receipt:call", "source_url:https://example.org"],
+    )
+    await memory.save_epistemic_memory(
+        "owner-a", "A workflow procedure.", memory_type="lesson",
+    )
+
+    result = await memory.semantic_search_memory(
+        "owner-a", "source quote", memory_type=("fact", "decision")
+    )
+
+    assert "USER-STATED DECISION" in result
+    assert "WEB-RESEARCH FACT" in result
+    assert "user_message:origin:offsets" in result
+    assert "source_url:https://example.org" in result
+    assert "workflow procedure" not in result
+
+
+@pytest.mark.asyncio
 async def test_dedupe_is_owner_scoped_and_concurrency_safe(memory_store):
     memory, db_path = memory_store
     entered = 0

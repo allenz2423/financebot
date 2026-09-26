@@ -66,11 +66,32 @@ network reachability, and no service was started for this review.
 
 ## Recommended target: a lightweight task computer
 
-Use a fresh, task-owned container as the default execution unit, with the
-option for operators to select a stronger microVM backend when their threat
-model requires it. This offers an OS-like workspace and browser without
-keeping a full VM running for every user. Do not call an ordinary container a
-VM-grade security boundary: it shares the host kernel.
+Meta's published product is a persistent, dedicated computer per user, with
+the harness and untrusted workspace inside a restricted runtime container and
+security-sensitive services outside it. The public computer-use API is only an
+observe/act protocol: the application supplies the desktop, driver, screenshots,
+validation, safety, logging, and recovery. Meta's disposable Linux/Docker
+cookbook demonstrates a lightweight development environment, not the
+production security boundary.
+
+For Delilah, provide the *experience* of a persistent personal computer without
+requiring an always-on hypervisor VM: an owner-scoped durable workspace, tools,
+and (later) a browser profile, combined with disposable task execution and
+scratch overlays. Keep the durable workspace distinct from the task's ephemeral
+execution root; only explicit, bounded file-transfer operations bridge them.
+The owner controls whether the workspace/browser state persists. A fresh,
+task-owned container can be the first backend, with an optional microVM backend
+for operators who require a separate kernel. Do not call an ordinary container
+a VM-grade security boundary: it shares the host kernel. The bot remains the
+single owner of its task database; a worker manager receives task-scoped
+authenticated requests and must not open or mount that database.
+
+Meta says inference and telemetry can receive limited VM data, and its hosted
+product may use sanitized trajectories for training unless users opt out. That
+is not a universal property of computer-use APIs. Delilah must make remote
+inference an explicit operator/provider data-sharing choice and document the
+configured provider's retention and training policy; screenshots, files, and
+page content can be sensitive even when the worker itself is isolated.
 
 Required design constraints before enabling model-driven browser/computer use:
 
@@ -131,7 +152,14 @@ Required design constraints before enabling model-driven browser/computer use:
    hypervisor support, hardware virtualization, or a second always-on VM a
    prerequisite for ordinary self-hosting.
 
-The first three phases are practical for an open-source single-user install
-and a friends-shared one-process deployment. Multi-process worker leases,
+The intended product is a persistent owner-scoped "computer" workspace plus
+isolated task execution, not a promise that a single heavyweight VM stays up
+per task. Keep browser state, shell/process execution, and public network egress
+as separate capabilities; a full desktop/browser UI does not imply raw CDP,
+unrestricted shell authority, or internal-network access.
+
+Design judgment: the first three phases appear practical for an open-source
+single-user install and a friends-shared one-process deployment, subject to
+deployment-specific threat review and backend testing. Multi-process worker leases,
 cross-host scheduling, and provider-capacity coordination remain out of scope;
 Delilah supports one bot process per task database.
