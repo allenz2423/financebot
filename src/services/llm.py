@@ -45,6 +45,12 @@ from src.services.tool_results import ToolResultEnvelope
 from src.services.tool_registry import ToolDefinition, ToolRegistry
 from src.services.tool_catalog import validate_tool_catalog
 from src.services.tool_intent import infer_required_tools
+from src.services.autonomy_contract import (
+    build_autonomy_contract,
+    is_bounded_financial_review,
+    next_required_tool,
+    tool_call_allowed_by_contract,
+)
 from src.services.tool_execution_evidence import tool_result_indicates_failure
 from src.services.browser_evidence import browser_tool_ran, observed_page
 from src.services.progress_policy import ProgressPolicy
@@ -539,6 +545,41 @@ def _list_durable_tasks(
     return results
 
 
+def _cancellable_task_ids(tasks: list[dict]) -> set[str]:
+    """Collect active task IDs already visible in this conversation scope."""
+    cancellable_statuses = {
+        "queued", "running", "waiting_user", "waiting_approval", "verifying",
+    }
+    task_ids: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("status") or "").casefold() in cancellable_statuses:
+            task_id = str(task.get("task_id") or "").strip()
+            if task_id:
+                task_ids.add(task_id)
+        for child in task.get("children") or []:
+            if not isinstance(child, dict):
+                continue
+            if str(child.get("status") or "").casefold() in cancellable_statuses:
+                child_id = str(child.get("task_id") or "").strip()
+                if child_id:
+                    task_ids.add(child_id)
+    return task_ids
+
+
+def _task_cancel_target_allowed(
+    requested_task_id: str,
+    cancellable_ids: set[str] | frozenset[str],
+    *,
+    explicit_target: str | None,
+) -> bool:
+    """Require exact explicit targeting or a unique active conversation task."""
+    if explicit_target is not None:
+        return requested_task_id == explicit_target and requested_task_id in cancellable_ids
+    return len(cancellable_ids) == 1 and requested_task_id in cancellable_ids
+
+
 def _requires_durable_plan(prompt: str, required_tools: set[str]) -> bool:
     """Conservatively recognize explicit multi-action and artifact requests."""
     if len(required_tools) >= 3:
@@ -579,6 +620,271 @@ def _tool_requires_durable_plan(tool_name: str, arguments: dict | None = None) -
         return True
     definition = ADVISOR_TOOL_REGISTRY.get(tool_name)
     return bool(definition is not None and definition.side_effect != "read")
+
+
+def _tool_requires_autonomy_contract(tool_name: str, arguments: dict | None = None) -> bool:
+    """Classify state-changing calls for the per-turn autonomy boundary.
+
+    Most tools reuse the durable-plan and mutation catalogs. Conditional legacy
+    tools are handled explicitly so their read-only mode does not accidentally
+    acquire write permission from a default argument.
+    """
+    return _autonomy_contract_effect(tool_name, arguments) != "read"
+
+
+def _autonomy_contract_effect(tool_name: str, arguments: dict | None = None) -> str:
+    """Return a fail-closed effect class for known and future model tools."""
+    args = arguments if isinstance(arguments, dict) else {}
+    name = str(tool_name or "")
+    resolver = globals().get("_resolve_tool_alias")
+    if callable(resolver):
+        name = resolver(name)
+    if name in _AUTONOMY_CONTROL_TOOLS:
+        return "read"
+    if name == "canonicalize_transactions":
+        return "read" if args.get("dry_run") is True else "mutation"
+    if name == "scan_and_auto_tag_deductions":
+        return "mutation" if args.get("auto_apply", False) is True else "read"
+    if (
+        name in MUTATION_TOOLS
+        or name in FALLBACK_BLOCKED_TOOLS
+        or _tool_requires_durable_plan(name, args)
+        or name in {"run_shell", "run_python_sandbox", "request_user_form"}
+    ):
+        return "mutation"
+    definition = ADVISOR_TOOL_REGISTRY.get(name)
+    if definition is not None and definition.side_effect in {"mutation", "conditional", "external"}:
+        return str(definition.side_effect)
+    if name in _AUTONOMY_READ_ONLY_TOOLS or name in _AUTONOMY_CONTROL_TOOLS:
+        return "read"
+    # Unknown or newly added tools must explicitly join the read-only allowlist
+    # or carry authoritative side-effect metadata before they can run.
+    return "unknown"
+
+
+_AUTONOMY_CONTROL_TOOLS = frozenset({
+    "await_user", "delegate_task", "end_turn", "enable_reasoning",
+    "task_plan", "task_list",
+})
+_AUTONOMY_READ_ONLY_TOOLS = frozenset({
+    "query_knowledge_base", "calculate_lifestyle_creep", "allocate_next_best_dollar",
+    "analyze_recurring_leakage", "simulate_what_if_scenario", "predict_next_paydays",
+    "calculate_locked_liabilities", "calculate_credit_float_velocity",
+    "get_safe_to_spend_metrics", "calculate_emergency_fund_health",
+    "simulate_stochastic_cash_flow", "get_user_timezone", "get_temporal_projection",
+    "search_tools", "explore_domain", "load_tool_schemas", "verify_claim",
+    "query_spending", "get_spending_breakdown", "get_savings_buckets",
+    "check_budget_status", "get_current_financial_position", "get_subscriptions",
+    "get_recent_income", "get_recent_corrections", "get_accounts_overview",
+    "get_recent_transactions", "get_transaction_items", "get_tax_deductions_summary",
+    "simulate_cash_flow_scenario", "get_known_merchant",
+    "get_unique_unregistered_merchants", "get_unlocked_transactions",
+    "get_locked_transactions", "search_transactions", "get_debt_overview",
+    "simulate_debt_payoff", "get_net_worth_history", "get_cash_flow_summary",
+    "get_financial_dashboard", "get_expected_income", "get_planned_transactions",
+    "get_upcoming_cash_flow", "search_gmail", "task_list", "search_session_history",
+    "read_gmail_message", "read_gmail_thread", "research_topic", "search_web",
+    "fetch_webpage",
+    "list_workspace_files", "read_workspace_file", "get_transactions_by_context",
+    "get_lifestyle_context", "explain_world_model_claim",
+    "simulate_counterfactual_scenario", "audit_cognitive_health",
+    "get_world_model_entity", "search_world_model", "get_world_model_dossier",
+    "list_world_model_claims", "crawl_deeper", "search_vector_memory",
+    "get_scheduled_reminders", "monitor_list_rules", "monitor_list_alerts",
+    "get_sinking_funds_overview", "generate_financial_digest",
+    "generate_negotiation_script", "recommend_best_card",
+    "audit_wallet_rewards", "calculate_rebalancing_drift",
+    "analyze_price_drop_and_draft_refund", "get_budget_pacing_and_forecast",
+    "get_unified_net_worth", "get_savings_goals_and_deficits",
+    "get_upcoming_bills_calendar", "find_government_forms", "scrape_rendered_page",
+})
+
+
+def _autonomy_contract_dispatch_denial(
+    autonomy_contract,
+    tool_name: str,
+    arguments: dict,
+    completed_tool_names: set[str] | frozenset[str],
+) -> str | None:
+    """Return a fail-closed denial reason before grant/receipt preparation."""
+    expected = next_required_tool(autonomy_contract, completed_tool_names)
+    if (
+        is_bounded_financial_review(autonomy_contract)
+        and tool_name in autonomy_contract.required_tools
+        and tool_name in completed_tool_names
+    ):
+        return (
+            "AUTONOMY_WORKFLOW_STEP_ALREADY_CONFIRMED: no action was dispatched; "
+            f"{tool_name!r} already has a successful result in this turn."
+        )
+    if (
+        is_bounded_financial_review(autonomy_contract)
+        and tool_name == "end_turn"
+        and expected is not None
+    ):
+        return (
+            "AUTONOMY_WORKFLOW_INCOMPLETE: no action was dispatched; "
+            f"the selected workflow still requires {expected!r}."
+        )
+    if (
+        tool_name in autonomy_contract.required_tools
+        and expected is not None
+        and tool_name != expected
+    ):
+        return (
+            "AUTONOMY_WORKFLOW_ORDER: no action was dispatched; "
+            f"the selected workflow requires {expected!r} next."
+        )
+    effect_label = _autonomy_contract_effect(tool_name, arguments)
+    if (
+        effect_label == "read"
+        and tool_name != "delegate_task"
+        and not is_bounded_financial_review(autonomy_contract)
+    ):
+        return None
+    if not tool_call_allowed_by_contract(
+        autonomy_contract,
+        tool_name,
+        arguments,
+        side_effect=effect_label,
+        control_tool=tool_name in _AUTONOMY_CONTROL_TOOLS,
+    ):
+        return (
+            "AUTONOMY_CONTRACT_DENIED: this turn's selected scope does not permit "
+            "that state-changing action. No action was dispatched; ask the user "
+            "for a specific request or approval before expanding the scope."
+        )
+    return None
+
+
+def _autonomy_workflow_failure_requires_stop(
+    autonomy_contract,
+    tool_name: str,
+    receipt_status: str,
+    *,
+    receipt_started: bool,
+) -> bool:
+    """Stop a bounded workflow when one of its required reads failed."""
+    return bool(
+        is_bounded_financial_review(autonomy_contract)
+        and receipt_started
+        and tool_name in autonomy_contract.required_tools
+        and str(receipt_status).casefold() == "failed"
+    )
+
+
+def _forced_tool_for_contract(
+    required_tools: set[str] | frozenset[str],
+    confirmed_tools: set[str] | frozenset[str],
+    available_tools: set[str] | frozenset[str],
+    autonomy_contract,
+) -> str | None:
+    """Select the next contract-ordered required tool when one is pending."""
+    next_workflow_tool = next_required_tool(autonomy_contract, confirmed_tools)
+    if is_bounded_financial_review(autonomy_contract):
+        if next_workflow_tool is None:
+            return None
+        return (
+            next_workflow_tool
+            if next_workflow_tool in required_tools
+            and next_workflow_tool in available_tools
+            else None
+        )
+    return next(
+        (
+            name for name in sorted(set(required_tools) - set(confirmed_tools))
+            if name in available_tools
+        ),
+        None,
+    )
+
+
+def _required_tools_repair_instruction(
+    missing_tools: set[str] | frozenset[str],
+    autonomy_contract,
+    completed_tools: set[str] | frozenset[str],
+) -> str:
+    """Describe the actual outstanding obligation without invented actions."""
+    if is_bounded_financial_review(autonomy_contract):
+        next_tool = next_required_tool(autonomy_contract, completed_tools)
+        order_hint = (
+            f" The next required tool is {next_tool}." if next_tool else ""
+        )
+        return (
+            "AUTONOMY CONTRACT ENFORCEMENT: the bounded financial review is not "
+            "complete. Required evidence still missing: "
+            + ", ".join(sorted(missing_tools))
+            + ". Call only the selected workflow tools in order; the Plaid call "
+            "must use force_refresh=true, reconcile=false, post_summary=false. "
+            "Do not send a notification or perform any other mutation."
+            + order_hint
+        )
+    return (
+        "SYSTEM ENFORCEMENT: This task requires calling "
+        + ", ".join(sorted(missing_tools))
+        + " before finishing. Call the missing required tool(s) now."
+    )
+
+
+def _required_tools_satisfied(
+    required_tools: set[str] | frozenset[str],
+    executed_tools: set[str] | frozenset[str],
+) -> bool:
+    return set(required_tools).issubset(executed_tools)
+
+
+def _required_tools_completion_instruction(
+    required_tools: set[str] | frozenset[str],
+    executed_tools: set[str] | frozenset[str],
+    autonomy_contract,
+) -> str | None:
+    """Return a repair instruction when end_turn lacks required evidence."""
+    if _required_tools_satisfied(required_tools, executed_tools):
+        return None
+    missing = set(required_tools) - set(executed_tools)
+    return _required_tools_repair_instruction(
+        missing,
+        autonomy_contract,
+        executed_tools,
+    )
+
+
+def _autonomy_contract_final_response(
+    autonomy_contract,
+    response: str,
+    executed_tools: set[str] | frozenset[str],
+    *,
+    task_cancel_status: str | None = None,
+) -> str:
+    """Prevent unsupported mutation claims and incomplete-contract success."""
+    intent = str(getattr(autonomy_contract, "explicit_mutation_intent", "") or "")
+    if intent.startswith("unmapped:"):
+        return (
+            "I did not perform the requested state change. I couldn't safely map it "
+            "to an exact supported operation and target, so no action was dispatched. "
+            "Please specify a supported action or use its approval flow."
+        )
+    if intent == "task_cancel":
+        if task_cancel_status in {"needs_reconciliation", "partial", "unknown"}:
+            return (
+                "I could not confirm that the task was cancelled. Its in-flight action "
+                "may have taken effect, so I parked it for reconciliation and will not "
+                "retry or claim cancellation."
+            )
+        if "task_cancel" not in executed_tools or task_cancel_status != "cancelled":
+            return (
+                "I did not record a task cancellation. I couldn't confirm a matching "
+                "task in this conversation's visible task list."
+            )
+    missing = set(getattr(autonomy_contract, "required_tools", ()) or ()) - set(executed_tools)
+    if missing:
+        return (
+            "I couldn't complete the selected request because required evidence or "
+            "action results were not confirmed: " + ", ".join(sorted(missing))
+            + ". I won't infer the missing results or repeat an action with an "
+            "uncertain outcome."
+        )
+    return str(response or "")
 
 
 def _durable_plan_batch_error(
@@ -5977,7 +6283,7 @@ async def _chat_with_delilah_impl(
     # optional model suggestion. Completion guards below require a successful
     # trace entry for each inferred tool before the turn may finish.
     required_tools = set(required_tools or ()) | set(infer_required_tools(prompt_text))
-    durable_plan_required = _requires_durable_plan(prompt_text, required_tools)
+    durable_plan_required = False
     turn_id = CURRENT_TURN_ID.get() or f"turn_{uuid.uuid4().hex}"
     _GMAIL_TOOL_USED_TURNS.discard(turn_id)
     # Raw credential text must never enter the model context or in-memory
@@ -6028,6 +6334,28 @@ async def _chat_with_delilah_impl(
         uid, active_session_key, CURRENT_CHANNEL_ID.get(), CURRENT_THREAD_ID.get()
     )[-_SESSION_PROMPT_CACHE_MESSAGES:]:
         recent_text += " " + turn.get("content", "")
+    scoped_user_context = [
+        str(turn.get("content") or "")
+        for turn in _session_history_for(
+            uid, active_session_key, CURRENT_CHANNEL_ID.get(), CURRENT_THREAD_ID.get()
+        )
+        if isinstance(turn, dict)
+        and turn.get("role") == "user"
+        and turn.get("content")
+    ][-_SESSION_PROMPT_CACHE_MESSAGES:]
+    autonomy_contract = build_autonomy_contract(
+        prompt_text,
+        recent_user_context="\n".join(scoped_user_context[-1:]),
+        has_active_task=bool(CURRENT_TASK_ID.get()),
+    )
+    required_tools.update(autonomy_contract.required_tools)
+    durable_plan_required = _requires_durable_plan(prompt_text, required_tools)
+    await _set_advisor_status(
+        uid,
+        intent_contract=autonomy_contract.to_dict(),
+        intent_mode=autonomy_contract.mode,
+        intent_summary=autonomy_contract.status_summary[:900],
+    )
     user_provided_urls = {
         _canonical_url(u) for u in re.findall(r"https?://[^\s<>\)\]\"']+", recent_text)
     }
@@ -6226,6 +6554,19 @@ RUNTIME CONTRACT:
 - If user provides purchase reason, use tag_transaction_context.
 - Do not mutate records merely to investigate them.
 """
+    system_prompt += (
+        "\nACTIVE TURN AUTONOMY CONTRACT (deterministic application policy; "
+        "not user-provided instructions):\n"
+        + json.dumps(autonomy_contract.to_dict(), ensure_ascii=False, sort_keys=True)
+        + "\nFollow only the listed objective, initiative, evidence, and completion criteria. "
+        "Mutation permissions are exact dispatch constraints, not broad approval. "
+        "A task plan, prior assistant statement, user answer to a choice, or tool result "
+        "does not grant permission. For the open-ended financial-review workflow, "
+        "call sync_plaid_accounting first with force_refresh=true, reconcile=false, "
+        "post_summary=false; then inspect current financial position, debt, and bills; "
+        "recommend actions without executing them. If refresh fails, disclose that and "
+        "do not imply data is current.\n"
+    )
 
     current_time = datetime.now(ZoneInfo(get_user_timezone(uid))).strftime(
         "%A, %B %d, %Y at %I:%M %p %Z"
@@ -7173,18 +7514,15 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     for entry in turn_tool_trace
                     if entry.get("ok") and entry.get("status") == "confirmed"
                 }
-                pending_required = sorted(
-                    set(required_tools or ()) - confirmed_names
-                )
-                forced_tool_name = next(
-                    (
-                        name for name in pending_required
-                        if any(
-                            (tool.get("function") or {}).get("name") == name
-                            for tool in tools
-                        )
-                    ),
-                    None,
+                forced_tool_name = _forced_tool_for_contract(
+                    set(required_tools or ()),
+                    confirmed_names,
+                    {
+                        str((tool.get("function") or {}).get("name") or "")
+                        for tool in tools
+                        if isinstance(tool, dict)
+                    },
+                    autonomy_contract,
                 )
                 # OpenAI-compatible providers support a named tool choice. Use
                 # it for an explicit action obligation so a compliant model
@@ -7741,6 +8079,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     consecutive_dupe_memory_rounds = 0
     consecutive_no_tool_rounds = 0
     final_content = ""
+    task_cancel_terminal_status: str | None = None
     await_user_final_content: str | None = None
     end_turn_rejections = 0
     reasoning_enabled_this_turn = False
@@ -9219,16 +9558,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 for entry in turn_tool_trace
                 if entry.get("ok")
             }
-            if required_tools and not required_tools.issubset(executed_tools_so_far):
-                missing = required_tools - executed_tools_so_far
-                print(f" [REQUIRED TOOLS ENFORCEMENT] Rejecting end_turn: missing={missing}")
+            completion_repair = _required_tools_completion_instruction(
+                required_tools,
+                executed_tools_so_far,
+                autonomy_contract,
+            )
+            if completion_repair:
+                print(" [REQUIRED TOOLS ENFORCEMENT] Rejecting end_turn")
                 messages.append({
                     "role": "user",
-                    "content": (
-                        f"SYSTEM ENFORCEMENT: This request requires calling {', '.join(missing)}. "
-                        f"You have not successfully called {', '.join(missing)} yet. "
-                        f"Emit the native tool call now and wait for its result before ending the turn."
-                    ),
+                    "content": completion_repair,
                 })
                 attempts += 1
                 continue
@@ -9410,6 +9749,23 @@ CURRENT DATABASE FINANCIAL CONTEXT
             # promises future work is handled by the guard above; everything
             # else can be returned as the assistant's answer immediately.
             if not audit_active_now and not promised_tools:
+                executed_tools_so_far = {
+                    str(entry.get("name"))
+                    for entry in turn_tool_trace
+                    if entry.get("ok")
+                }
+                if required_tools and not _required_tools_satisfied(
+                    required_tools, executed_tools_so_far
+                ):
+                    missing = required_tools - executed_tools_so_far
+                    messages.append({
+                        "role": "user",
+                        "content": _required_tools_repair_instruction(
+                            missing, autonomy_contract, executed_tools_so_far
+                        ),
+                    })
+                    attempts += 1
+                    continue
                 final_content = candidate
                 print(
                     f" [PLAIN TEXT EXIT] Accepting no-tool response ({len(text_final)} chars)."
@@ -9438,10 +9794,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     print(f" [REQUIRED TOOLS ENFORCEMENT] Rejecting plain-text end_turn: missing={missing}")
                     messages.append({
                         "role": "user",
-                        "content": (
-                            f"SYSTEM ENFORCEMENT: This scheduled task requires calling {', '.join(missing)} "
-                            f"to deliver a push notification to the user's phone. You have not called {', '.join(missing)} yet. "
-                            f"You must call {', '.join(missing)} now with the completed message before finishing."
+                        "content": _required_tools_repair_instruction(
+                            missing, autonomy_contract, executed_tools_so_far
                         ),
                     })
                     attempts += 1
@@ -9546,10 +9900,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     print(f" [REQUIRED TOOLS ENFORCEMENT] Rejecting plain-text exit: missing={missing}")
                     messages.append({
                         "role": "user",
-                        "content": (
-                            f"SYSTEM ENFORCEMENT: This scheduled task requires calling {', '.join(missing)} "
-                            f"to deliver a push notification to the user's phone. You have not called {', '.join(missing)} yet. "
-                            f"You must call {', '.join(missing)} now with the completed message before finishing."
+                        "content": _required_tools_repair_instruction(
+                            missing, autonomy_contract, executed_tools_so_far
                         ),
                     })
                     attempts += 1
@@ -9567,9 +9919,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     missing = required_tools - executed_tools_so_far
                     messages.append({
                         "role": "user",
-                        "content": (
-                            f"SYSTEM ENFORCEMENT: You must call {', '.join(missing)} now to send the push alert to the user. "
-                            f"Do not respond with plain text."
+                        "content": _required_tools_repair_instruction(
+                            missing, autonomy_contract, executed_tools_so_far
                         ),
                     })
                     attempts += 1
@@ -9722,6 +10073,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 allowed=(
                     not audit_batch_mode and not _audit_is_active()
                     and not active_plan_exists
+                    and not is_bounded_financial_review(autonomy_contract)
                 ),
             )
 
@@ -9997,6 +10349,32 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             f"inflight={len(inflight)} "
                             f"active_batch={len(active_batch)}"
                         )
+
+                    # The current turn's autonomy contract is a hard scope
+                    # restriction, not a grant. This is intentionally checked
+                    # after alias resolution and argument validation but before
+                    # issuing/consuming the internal execution grant or writing
+                    # a prepared receipt. An explicit Plaid refresh is allowed
+                    # only with the exact pull-only argument set.
+                    completed_contract_tools = {
+                        str(entry.get("name") or "")
+                        for entry in turn_tool_trace
+                        if entry.get("ok")
+                    }
+                    denial = _autonomy_contract_dispatch_denial(
+                        autonomy_contract,
+                        func_name,
+                        args,
+                        completed_contract_tools,
+                    )
+                    if denial:
+                        raise PermissionError(denial)
+                    contract_side_effecting = _tool_requires_autonomy_contract(
+                        func_name, args
+                    ) or bool(
+                        (definition := ADVISOR_TOOL_REGISTRY.get(func_name))
+                        is not None and definition.side_effect != "read"
+                    )
 
                     target_arguments = {
                         key: value
@@ -11176,19 +11554,38 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             thread_id=CURRENT_THREAD_ID.get(),
                             limit=20,
                         )
-                        visible_ids = set()
-                        for visible in visible_tasks:
-                            visible_ids.add(str(visible["task_id"]))
-                            visible_ids.update(
-                                str(child["task_id"])
-                                for child in visible.get("children", [])
-                            )
-                        if task_id not in visible_ids:
+                        cancellable_ids = _cancellable_task_ids(visible_tasks)
+                        contract_permission = next(
+                            (
+                                permission
+                                for permission in autonomy_contract.mutation_permissions
+                                if permission.tool_name == "task_cancel"
+                            ),
+                            None,
+                        )
+                        explicit_target = (
+                            contract_permission.target_value
+                            if contract_permission is not None
+                            else None
+                        )
+                        if explicit_target is None and len(cancellable_ids) != 1:
                             raise PermissionError(
-                                "TASK_SCOPE_DENIED: task_cancel only accepts a task listed "
-                                "for this owner and conversation."
+                                "TASK_SCOPE_AMBIGUOUS: specify a task ID because this "
+                                "conversation does not have exactly one active cancellable task."
+                            )
+                        if not _task_cancel_target_allowed(
+                            task_id,
+                            cancellable_ids,
+                            explicit_target=explicit_target,
+                        ):
+                            raise PermissionError(
+                                "TASK_SCOPE_DENIED: task_cancel only accepts the explicitly "
+                                "requested active task in this owner and conversation scope."
                             )
                         cancelled_task = TaskController(store).cancel(uid, task_id)
+                        task_cancel_terminal_status = str(
+                            cancelled_task.get("status") or ""
+                        )
                         db_result = json.dumps({
                             "task_id": task_id,
                             "status": cancelled_task["status"],
@@ -12321,6 +12718,21 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     # raising an exception. That is NOT a successful execution.
                     tool_succeeded = not _tool_result_indicates_failure(db_result)
 
+                    if (
+                        receipt_started
+                        and contract_side_effecting
+                        and not tool_succeeded
+                    ):
+                        # A returned error string is not proof that a remote or
+                        # persistent action did not happen. Park it as unknown
+                        # rather than inviting a retry on the next model round.
+                        ambiguous_side_effect = True
+                        db_result = (
+                            "UNKNOWN: the state-changing tool returned an error, "
+                            "but its effect cannot be ruled out; do not retry until "
+                            f"reconciled. Original result: {str(db_result)[:1200]}"
+                        )
+
                     if not tool_succeeded:
                         print(
                             f" [TOOL SEMANTIC FAILURE] "
@@ -12328,14 +12740,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                 except Exception as tool_err:
                     tool_label = func_name or "unknown"
-                    if receipt_started and func_name in {
-                        "monitor_create_natural_rule",
-                        "monitor_add_rule",
-                    }:
+                    if receipt_started and contract_side_effecting:
                         ambiguous_side_effect = True
                         db_result = (
-                            "UNKNOWN: monitor creation may have taken effect; do not retry "
-                            "until owner-scoped monitor rules are reconciled. "
+                            "UNKNOWN: this state-changing tool may have taken effect; "
+                            "do not retry until its outcome is reconciled. "
                             f"{type(tool_err).__name__}: {tool_err}"
                         )
                     else:
@@ -12387,14 +12796,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                     except Exception as commit_err:
                         tool_succeeded = False
-                        if func_name in {"monitor_create_natural_rule", "monitor_add_rule"}:
-                            # add_monitor_rule has already committed its insert.
-                            # A failure in this subsequent generic commit cannot
-                            # prove the monitor action was rolled back.
+                        if contract_side_effecting:
                             ambiguous_side_effect = True
                             db_result = (
-                                "UNKNOWN: monitor creation may already have committed; "
-                                "do not retry until owner-scoped monitor rules are reconciled. "
+                                "UNKNOWN: the state-changing tool may already have committed; "
+                                "do not retry until its outcome is reconciled. "
                                 f"{type(commit_err).__name__}: {commit_err}"
                             )
                         else:
@@ -12431,6 +12837,20 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             f"receipt could not be persisted: {receipt_err}"
                         )
                         print(f" [RECEIPT UNKNOWN] {func_name}: {receipt_err}")
+                    except Exception as receipt_err:
+                        tool_succeeded = False
+                        receipt_status = "unknown"
+                        db_result = (
+                            "UNKNOWN: tool execution completed but terminal receipt "
+                            f"persistence failed: {type(receipt_err).__name__}: {receipt_err}"
+                        )
+                        print(f" [RECEIPT UNKNOWN] {func_name}: {receipt_err}")
+
+                if func_name == "task_cancel" and receipt_status == "unknown":
+                    # Cancellation may have been applied before its durable
+                    # receipt/commit acknowledgement was lost. Preserve that
+                    # uncertainty for the user-facing final contract guard.
+                    task_cancel_terminal_status = "unknown"
 
                 if receipt_started:
                     try:
@@ -12625,14 +13045,29 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     except Exception:
                         pass
 
-                if _tool_outcome_requires_turn_stop(receipt_status):
+                if (
+                    _tool_outcome_requires_turn_stop(receipt_status)
+                    or _autonomy_workflow_failure_requires_stop(
+                        autonomy_contract,
+                        str(func_name or ""),
+                        receipt_status,
+                        receipt_started=receipt_started,
+                    )
+                ):
                     # Do not dispatch any later call from this provider batch
                     # (or request another model round) after an ambiguous
                     # external outcome. Recovery will require reconciliation.
-                    final_content = (
-                        "I stopped because an external tool outcome could not be "
-                        "confirmed safely. I will not repeat the operation blindly."
-                    )
+                    if receipt_status == "unknown":
+                        final_content = (
+                            "I stopped because an external tool outcome could not be "
+                            "confirmed safely. I will not repeat the operation blindly."
+                        )
+                    else:
+                        final_content = (
+                            "I stopped the selected financial review because a required "
+                            "evidence tool failed. I will report the missing evidence "
+                            "rather than repeat the call automatically."
+                        )
                     end_turn_called = True
                     break
 
@@ -12720,6 +13155,32 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         })
                         attempts += 1
                         continue
+
+                # `end_turn` is stripped before tool execution, so it can be
+                # returned in the same provider response as ordinary tool
+                # calls. Treat it as a completion request only after those
+                # calls have produced all contract-required evidence. This is
+                # the same gate as the end_turn-only path above; otherwise a
+                # mixed batch could stop a bounded financial review early.
+                executed_tools_so_far = {
+                    str(entry.get("name"))
+                    for entry in turn_tool_trace
+                    if entry.get("ok")
+                }
+                completion_repair = _required_tools_completion_instruction(
+                    required_tools,
+                    executed_tools_so_far,
+                    autonomy_contract,
+                )
+                if completion_repair:
+                    print(" [REQUIRED TOOLS ENFORCEMENT] Rejecting mixed end_turn")
+                    messages.append({
+                        "role": "user",
+                        "content": completion_repair,
+                    })
+                    attempts += 1
+                    continue
+
                 summary = await _build_final_summary(content)
                 final_content = (
                     f"{accumulated_narrative}\n{summary}".strip()
@@ -12950,6 +13411,21 @@ CURRENT DATABASE FINANCIAL CONTEXT
     # protocol markers to Discord.
     final_content = re.sub(r"</?(?:thought|think)>", "", final_content, flags=re.IGNORECASE)
     final_content = re.sub(r"(?im)^\s*end_turn\s*$", "", final_content).strip()
+
+    # Loop breakers and provider fallbacks can leave the tool loop before its
+    # local end_turn/plain-text checks run. The final boundary is authoritative:
+    # never publish success prose for missing contract evidence or an unmapped
+    # explicit mutation, regardless of which earlier exit was taken.
+    final_content = _autonomy_contract_final_response(
+        autonomy_contract,
+        final_content,
+        {
+            str(entry.get("name") or "")
+            for entry in turn_tool_trace
+            if entry.get("ok")
+        },
+        task_cancel_status=task_cancel_terminal_status,
+    )
 
 
     _persist_task_phase(
@@ -14080,6 +14556,14 @@ async def advisor_status(ctx: commands.Context):
             title=title,
             color=color,
         )
+
+        selected_scope = str(state.get("intent_summary") or "").strip()
+        if selected_scope:
+            embed.add_field(
+                name="Selected scope",
+                value=selected_scope[:1000],
+                inline=False,
+            )
 
         embed.add_field(
             name="Phase",

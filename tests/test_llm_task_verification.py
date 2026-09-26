@@ -11,13 +11,24 @@ from src.agent.task_controller import TaskController
 from src.agent.runtime import CURRENT_TASK_ID
 from src.db.session_store import SessionStore
 from src.services.llm import (
+    _cancellable_task_ids,
+    _task_cancel_target_allowed,
+    _autonomy_contract_dispatch_denial,
+    _autonomy_contract_final_response,
+    _autonomy_workflow_failure_requires_stop,
+    _forced_tool_for_contract,
+    _required_tools_repair_instruction,
+    _required_tools_completion_instruction,
+    _required_tools_satisfied,
     _chat_with_delilah_impl,
     _run_read_only_task_review,
     _should_track_task_step,
+    _tool_requires_autonomy_contract,
     _tool_outcome_requires_turn_stop,
     _verify_task_final_output,
 )
 from src.services.tool_receipts import ReceiptStore
+from src.services.autonomy_contract import build_autonomy_contract
 
 
 def _make_verifying_task(objective="summarize task"):
@@ -104,9 +115,275 @@ def test_all_non_control_tool_calls_are_linked_before_task_dispatch():
         ) is False, control_name
 
 
+def test_autonomy_contract_catches_conditional_legacy_mutation_tools():
+    assert _tool_requires_autonomy_contract("canonicalize_transactions", {})
+    assert not _tool_requires_autonomy_contract(
+        "canonicalize_transactions", {"dry_run": True}
+    )
+    assert not _tool_requires_autonomy_contract("scan_and_auto_tag_deductions", {})
+    assert _tool_requires_autonomy_contract(
+        "scan_and_auto_tag_deductions", {"auto_apply": True}
+    )
+    assert not _tool_requires_autonomy_contract(
+        "scan_and_auto_tag_deductions", {"auto_apply": False}
+    )
+    assert _tool_requires_autonomy_contract("future_unclassified_tool", {})
+    assert not _tool_requires_autonomy_contract("fetch_webpage", {"save_only": False})
+    assert _tool_requires_autonomy_contract("fetch_webpage", {"save_only": True})
+
+
+def test_autonomy_dispatch_gate_denies_unrequested_mutation_and_enforces_order():
+    contract = build_autonomy_contract("review my financial situation")
+
+    assert _autonomy_contract_dispatch_denial(
+        contract, "delete_transaction", {"transaction_row_id": 123}, set()
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+    assert _autonomy_contract_dispatch_denial(
+        contract, "get_current_financial_position", {}, set()
+    ).startswith("AUTONOMY_WORKFLOW_ORDER")
+    assert _autonomy_contract_dispatch_denial(
+        contract, "search_gmail", {"query": "recent"}, set()
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+    assert _autonomy_contract_dispatch_denial(
+        contract, "future_unclassified_tool", {}, set()
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+    assert _autonomy_contract_dispatch_denial(
+        contract, "task_plan", {"steps": []}, set()
+    ) is None
+    assert _autonomy_contract_dispatch_denial(
+        contract, "task_list", {}, set()
+    ) is None
+    assert _autonomy_contract_dispatch_denial(
+        contract, "end_turn", {}, set()
+    ).startswith("AUTONOMY_WORKFLOW_INCOMPLETE")
+    assert _autonomy_contract_dispatch_denial(
+        contract,
+        "end_turn",
+        {},
+        set(contract.required_tools),
+    ) is None
+    assert _autonomy_contract_dispatch_denial(
+        contract,
+        "sync_plaid_accounting",
+        {"force_refresh": True, "reconcile": False, "post_summary": False},
+        {"sync_plaid_accounting"},
+    ).startswith("AUTONOMY_WORKFLOW_STEP_ALREADY_CONFIRMED")
+
+
+def test_dispatch_boundary_limits_delegation_in_narrow_intent_modes():
+    for message in (
+        "Monitor my balance",
+        "Should I proceed with the transfer?",
+    ):
+        contract = build_autonomy_contract(message)
+        assert _autonomy_contract_dispatch_denial(
+            contract,
+            "delegate_task",
+            {"objective": "Do unrelated research"},
+            set(),
+        ).startswith("AUTONOMY_CONTRACT_DENIED")
+
+    ordinary = build_autonomy_contract("Research options and summarize them")
+    assert _autonomy_contract_dispatch_denial(
+        ordinary,
+        "delegate_task",
+        {"objective": "Research a requested option"},
+        set(),
+    ) is None
+
+
+def test_task_cancellation_requires_one_active_conversation_task_without_target():
+    tasks = [
+        {"task_id": "task-active", "status": "running", "children": [
+            {"task_id": "child-active", "status": "queued"},
+            {"task_id": "child-done", "status": "succeeded"},
+        ]},
+        {"task_id": "task-done", "status": "succeeded", "children": []},
+    ]
+
+    assert _cancellable_task_ids(tasks) == {"task-active", "child-active"}
+    assert len(_cancellable_task_ids(tasks)) == 2
+    assert not _task_cancel_target_allowed(
+        "task-active", _cancellable_task_ids(tasks), explicit_target=None
+    )
+    assert not _task_cancel_target_allowed(
+        "child-active", _cancellable_task_ids(tasks), explicit_target=None
+    )
+    assert _cancellable_task_ids([
+        {"task_id": "task-active", "status": "running", "children": []},
+    ]) == {"task-active"}
+    assert _task_cancel_target_allowed(
+        "task-active", {"task-active"}, explicit_target=None
+    )
+    assert not _task_cancel_target_allowed(
+        "task-other", {"task-active"}, explicit_target="task-active"
+    )
+
+
+def test_autonomy_dispatch_gate_distinguishes_conditional_read_and_write_modes():
+    contract = build_autonomy_contract("What is my balance?")
+
+    assert _autonomy_contract_dispatch_denial(
+        contract, "canonicalize_transactions", {"dry_run": True}, set()
+    ) is None
+    assert _autonomy_contract_dispatch_denial(
+        contract, "canonicalize_transactions", {"dry_run": False}, set()
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+    assert _autonomy_contract_dispatch_denial(
+        contract, "scan_and_auto_tag_deductions", {"auto_apply": False}, set()
+    ) is None
+    assert _autonomy_contract_dispatch_denial(
+        contract, "scan_and_auto_tag_deductions", {"auto_apply": True}, set()
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+    assert _autonomy_contract_dispatch_denial(
+        contract,
+        "sync_plaid_accounting",
+        {"force_refresh": True, "reconcile": False, "post_summary": False},
+        set(),
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+
+
 @pytest.mark.parametrize("status", ["unknown", "UNKNOWN"])
 def test_ambiguous_receipt_stops_dispatch_and_retry(status):
     assert _tool_outcome_requires_turn_stop(status) is True
+
+
+def test_required_financial_read_failure_stops_the_bounded_workflow():
+    contract = build_autonomy_contract("review my financial situation")
+
+    assert _autonomy_workflow_failure_requires_stop(
+        contract,
+        "get_debt_overview",
+        "failed",
+        receipt_started=True,
+    )
+    assert not _autonomy_workflow_failure_requires_stop(
+        contract,
+        "get_debt_overview",
+        "failed",
+        receipt_started=False,
+    )
+    assert not _autonomy_workflow_failure_requires_stop(
+        contract,
+        "search_gmail",
+        "failed",
+        receipt_started=True,
+    )
+
+
+def test_forced_tool_selection_follows_financial_workflow_order():
+    contract = build_autonomy_contract("review my financial situation")
+    available = set(contract.required_tools)
+    expected = (
+        "sync_plaid_accounting",
+        "get_current_financial_position",
+        "get_debt_overview",
+        "get_upcoming_bills_calendar",
+    )
+
+    confirmed = set()
+    for tool_name in expected:
+        assert _forced_tool_for_contract(
+            contract.required_tools, confirmed, available, contract
+        ) == tool_name
+        confirmed.add(tool_name)
+    assert _forced_tool_for_contract(
+        contract.required_tools, confirmed, available, contract
+    ) is None
+    assert _forced_tool_for_contract(
+        contract.required_tools, set(), available - {expected[0]}, contract
+    ) is None
+    assert _forced_tool_for_contract(
+        contract.required_tools | {"send_push_alert"},
+        set(contract.required_tools),
+        available | {"send_push_alert"},
+        contract,
+    ) is None
+
+
+def test_required_tool_repair_message_matches_financial_contract():
+    contract = build_autonomy_contract("review my financial situation")
+
+    message = _required_tools_repair_instruction(
+        contract.required_tools,
+        contract,
+        set(),
+    )
+
+    assert "bounded financial review" in message
+    assert "sync_plaid_accounting" in message
+    assert "reconcile=false" in message
+    assert "push notification" not in message
+    assert not _required_tools_satisfied(contract.required_tools, set())
+    assert _required_tools_satisfied(contract.required_tools, set(contract.required_tools))
+
+
+def test_mixed_end_turn_cannot_complete_bounded_review_before_required_evidence():
+    contract = build_autonomy_contract("review my financial situation")
+    executed = {"sync_plaid_accounting"}
+
+    repair = _required_tools_completion_instruction(
+        contract.required_tools,
+        executed,
+        contract,
+    )
+
+    assert repair is not None
+    assert "bounded financial review is not complete" in repair
+    assert "get_current_financial_position" in repair
+    assert "reconcile=false" in repair
+    assert _required_tools_completion_instruction(
+        contract.required_tools,
+        set(contract.required_tools),
+        contract,
+    ) is None
+
+
+def test_final_boundary_rejects_false_success_after_denied_mutation():
+    contract = build_autonomy_contract("Delete transaction 12345")
+
+    response = _autonomy_contract_final_response(
+        contract,
+        "I deleted the transaction successfully.",
+        set(),
+    )
+
+    assert "did not perform" in response
+    assert "no action was dispatched" in response
+    assert "deleted the transaction successfully" not in response
+
+
+def test_final_boundary_reports_missing_required_financial_evidence():
+    contract = build_autonomy_contract("review my financial situation")
+
+    response = _autonomy_contract_final_response(
+        contract,
+        "Your finances look great.",
+        {"sync_plaid_accounting"},
+    )
+
+    assert "couldn't complete the selected request" in response
+    assert "get_current_financial_position" in response
+    assert "get_debt_overview" in response
+    assert "Your finances look great" not in response
+
+
+@pytest.mark.parametrize(
+    "status", ["needs_reconciliation", "partial", "unknown"]
+)
+def test_final_boundary_does_not_claim_success_when_task_cancel_needs_reconciliation(status):
+    contract = build_autonomy_contract("Please cancel my task")
+
+    response = _autonomy_contract_final_response(
+        contract,
+        "The task was cancelled successfully.",
+        {"task_cancel"},
+        task_cancel_status=status,
+    )
+
+    assert "could not confirm that the task was cancelled" in response
+    assert "parked it for reconciliation" in response
+    assert "cancelled successfully" not in response
 
 
 @pytest.mark.parametrize("status", ["confirmed", "failed", "started", "prepared"])

@@ -9,3 +9,5 @@ def test_explicit_plaid_sync_requires_the_sync_tool():
 def test_plaid_mention_or_negated_request_does_not_force_sync():
     assert infer_required_tools("What is Plaid?") == frozenset()
     assert infer_required_tools("Don't run a Plaid sync") == frozenset()
+    assert infer_required_tools("What does 'run a Plaid sync' mean?") == frozenset()
+    assert infer_required_tools("I saw the phrase run a Plaid sync in an email") == frozenset()

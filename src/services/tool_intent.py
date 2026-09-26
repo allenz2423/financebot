@@ -6,12 +6,12 @@ import re
 
 
 _PLAID_SYNC_REQUEST = re.compile(
-    r"\b(?:"
+    r"^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:"
     r"(?:run|start|perform|do|execute|initiate|trigger|launch|refresh|update|pull)"
     r"\s+(?:a\s+)?plaid\s+sync"
-    r"|sync\s+(?:my\s+)?plaid"
-    r"|plaid\s+sync\s+(?:now|please|today)?"
-    r")\b",
+    r"|sync\s+(?:my\s+)?plaid(?:\s+accounts?)?(?:\s+(?:now|please|today))?"
+    r"|plaid\s+sync(?:\s+(?:now|please|today))?"
+    r")\s*[.!?]*$",
     re.IGNORECASE,
 )
 _NEGATED_PLAID_SYNC = re.compile(
