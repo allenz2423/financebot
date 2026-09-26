@@ -2,12 +2,12 @@
 
 Date: 2026-09-19
 Branch: `feat/semantic-memory-rag`
-Status: **shadow instrumentation implemented, off by default; live promotion
-implemented behind `TOOL_ROUTER_LIVE=1`.** The default path remains
-counterfactual. The promoted path applies a bounded eligibility set only inside
-the current controller-offered schema, records the decision durably, and fails
-open if retrieval is unavailable. Existing controller, grant, receipt, and
-claim gates remain authoritative.
+Status: **shadow instrumentation and opt-in live narrowing are implemented;
+model-callable semantic discovery is also available on ordinary turns.** Shadow
+remains off by default and live narrowing remains behind `TOOL_ROUTER_LIVE=1`.
+`search_tools` reuses the same router for registry-owned retrieval and may add a
+bounded set of controller-permitted schemas to the next round. Existing
+controller, grant, receipt, and claim gates remain authoritative.
 
 Companion documents:
 
@@ -97,6 +97,26 @@ Delilah's loop is `while True` in `_chat_with_delilah_impl` (`llm.py:6143`).
   interruption (`USER_INTERRUPTS`), `end_turn`, and an optional
   `MAX_TOTAL_TOOL_CALLS` limit (`llm.py:6158`, default 100 at
   `state.py:70`).
+
+## Model-callable semantic discovery (Item 5)
+
+`search_tools(query, task_context)` is a model-facing control tool on the
+ordinary path. It delegates retrieval and response shaping to
+`ADVISOR_TOOL_REGISTRY.search_tools`; the registry invokes the existing
+hybrid/lexical router, intersects results with the controller-provided scope,
+and returns at most six canonical schemas with declared examples only. The
+selected names are added to the dynamic schema offering for the next round.
+
+The model-supplied context is search text only and cannot widen the allowed
+name set. Delegated turns use `CURRENT_ALLOWED_TOOLS`; input-only replies use
+their existing read-only allowlist; audit, fresh-verification, and Gmail-only
+modes intersect with their fixed schemas. Missing dependency/credential checks
+are reported as unknown availability, and unclassified effects are `unknown`—
+neither discovery nor metadata is approval. The ordinary tool loop still
+performs argument validation, grant/authorization checks, receipt recording,
+and side-effect execution. Retrieval failure returns an explicit unavailable
+result and preserves the existing `explore_domain` / `load_tool_schemas`
+fallback.
 
 Therefore the router should seed the ordinary path and leave the loop's
 per-round recomputation and discovery escape hatch intact.

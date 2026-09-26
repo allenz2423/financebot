@@ -23,6 +23,9 @@ from src.services.tool_results import ToolResultEnvelope
 
 
 ToolHandler = Callable[..., Any]
+_DISCOVERY_SIDE_EFFECT_LABELS = frozenset({
+    "read", "read_only", "mutation", "conditional", "external", "none", "unknown",
+})
 
 
 class ToolRegistryError(RuntimeError):
@@ -261,11 +264,69 @@ class ToolRegistry:
 
     list_schemas = schemas
 
+    async def search_tools(
+        self,
+        query: str,
+        task_context: str | None = None,
+        *,
+        canonical_catalog_schemas: Iterable[Mapping[str, Any]],
+        allowed_names: Iterable[str],
+        ranker: Callable[[str], Any],
+        side_effect_labels: Mapping[str, str] | None = None,
+        availability_reasons: Mapping[str, Any] | None = None,
+        limit: int = 6,
+    ) -> dict[str, Any]:
+        """Retrieve and describe tools within a caller-provided policy scope.
+
+        The registry owns query construction, ranking invocation, canonical
+        schema lookup, result bounding, and metadata shaping. The injected
+        ranker supplies retrieval only; ``allowed_names`` remains the
+        authoritative controller scope and model-provided context can never
+        enlarge it. This method does not dispatch tools or grant permissions.
+        """
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if task_context is not None and not isinstance(task_context, str):
+            raise TypeError("task_context must be a string when provided")
+        clean_query = query.strip()[:600]
+        clean_context = str(task_context or "").strip()[:600]
+        retrieval_query = "\n".join(
+            part for part in (clean_query, clean_context) if part
+        )[:1200]
+        proposal = ranker(retrieval_query)
+        if inspect.isawaitable(proposal):
+            proposal = await proposal
+        if not isinstance(proposal, Mapping):
+            raise TypeError("tool ranker must return a mapping")
+        raw_candidates = proposal.get("raw_topk") or ()
+        ranked_names = [
+            str(item.get("name"))
+            for item in raw_candidates
+            if isinstance(item, Mapping) and item.get("name")
+        ]
+        tools = search_tool_definitions(
+            clean_query,
+            canonical_catalog_schemas,
+            ranked_names,
+            allowed_names,
+            side_effect_labels=side_effect_labels,
+            availability_reasons=availability_reasons,
+            task_context={"text": clean_context} if clean_context else None,
+            limit=limit,
+        )
+        return {
+            "method": proposal.get("method"),
+            "fallback_reason": proposal.get("fallback_reason"),
+            "tools": tools,
+        }
+
     def __contains__(self, name: object) -> bool:
         return str(name).strip() in self._definitions
 
     def __len__(self) -> int:
         return len(self._definitions)
+
 
     def _prepare(
         self,
@@ -538,6 +599,142 @@ class ToolRegistry:
         return {}
 
 
+def search_tool_definitions(
+    query: str,
+    canonical_catalog_schemas: Iterable[Mapping[str, Any]],
+    retrieval_ordered_names: Iterable[str],
+    allowed_names: Iterable[str],
+    *,
+    side_effect_labels: Mapping[str, str] | None = None,
+    availability_reasons: Mapping[str, Any] | None = None,
+    task_context: Mapping[str, Any] | None = None,
+    limit: int = 5,
+    max_schema_chars: int = 12000,
+    max_total_chars: int = 32000,
+) -> list[dict[str, Any]]:
+    """Build bounded discovery records from canonical schemas.
+
+    Retrieval and authorization are deliberately inputs: this function does
+    not rank candidates, infer permissions, or dispatch tools. ``task_context``
+    is accepted only as retrieval metadata and never affects the allowed-name
+    intersection. Results retain retrieval order and contain defensive copies
+    of the original schemas under ``schema``.
+
+    An availability value may be a reason string (marking the tool
+    unavailable), or ``{"available": bool, "reason": str}``. Omitted
+    availability data is represented as unknown, never as a positive claim.
+    """
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+    if task_context is not None and not isinstance(task_context, Mapping):
+        raise TypeError("task_context must be a mapping when provided")
+    if isinstance(limit, bool):
+        raise TypeError("limit must be an integer")
+    try:
+        bounded_limit = max(1, min(20, int(limit)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError("limit must be an integer") from exc
+    if isinstance(max_schema_chars, bool) or isinstance(max_total_chars, bool):
+        raise TypeError("schema size limits must be integers")
+    try:
+        max_schema_chars = max(256, min(50000, int(max_schema_chars)))
+        max_total_chars = max(256, min(100000, int(max_total_chars)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError("schema size limits must be integers") from exc
+
+    catalog: dict[str, Mapping[str, Any]] = {}
+    for schema in canonical_catalog_schemas:
+        if not isinstance(schema, Mapping):
+            continue
+        function = schema.get("function")
+        raw_name = function.get("name") if isinstance(function, Mapping) else schema.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) else ""
+        if name and name not in catalog:
+            catalog[name] = schema
+
+    allowed = {
+        name.strip()
+        for name in allowed_names
+        if isinstance(name, str) and name.strip()
+    }
+    labels = side_effect_labels or {}
+    reasons = availability_reasons or {}
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    total_chars = 0
+
+    for raw_name in retrieval_ordered_names:
+        name = raw_name.strip() if isinstance(raw_name, str) else ""
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        schema = catalog.get(name)
+        if schema is None or name not in allowed:
+            continue
+        try:
+            schema_chars = len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError):
+            continue
+        if schema_chars > max_schema_chars or total_chars + schema_chars > max_total_chars:
+            continue
+
+        availability_value = reasons.get(name)
+        available: bool | None = None
+        reason = "availability not provided"
+        if isinstance(availability_value, Mapping):
+            if isinstance(availability_value.get("available"), bool):
+                available = availability_value["available"]
+            raw_reason = availability_value.get("reason", "")
+            reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+        elif isinstance(availability_value, str):
+            reason = availability_value.strip()
+            if reason:
+                available = False
+            else:
+                reason = "availability not provided"
+
+        raw_side_effect = labels.get(name)
+        side_effect = (
+            raw_side_effect.strip()
+            if isinstance(raw_side_effect, str)
+            and raw_side_effect.strip() in _DISCOVERY_SIDE_EFFECT_LABELS
+            else "unknown"
+        )
+        copied_schema = copy.deepcopy(dict(schema))
+        record: dict[str, Any] = {
+            "name": name,
+            "schema": copied_schema,
+            "availability": available,
+            "reason": reason,
+            "side_effect": side_effect,
+        }
+        examples = _declared_schema_examples(copied_schema)
+        if examples is not None:
+            record["examples"] = examples
+        results.append(record)
+        total_chars += schema_chars
+        if len(results) >= bounded_limit:
+            break
+    return results
+
+
+def _declared_schema_examples(schema: Mapping[str, Any]) -> Any | None:
+    """Return examples only from an explicit schema declaration."""
+
+    function = schema.get("function")
+    candidates: list[Mapping[str, Any]] = [schema]
+    if isinstance(function, Mapping):
+        candidates.append(function)
+        parameters = function.get("parameters")
+        if isinstance(parameters, Mapping):
+            candidates.append(parameters)
+    for candidate in candidates:
+        if "examples" in candidate:
+            return copy.deepcopy(candidate["examples"])
+    return None
+
+
 __all__ = [
     "DuplicateToolError",
     "NormalizedToolCall",
@@ -547,4 +744,5 @@ __all__ = [
     "ToolRegistry",
     "ToolRegistryError",
     "normalize_tool_call",
+    "search_tool_definitions",
 ]

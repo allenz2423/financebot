@@ -165,11 +165,11 @@ _STEP2_MIGRATED_TOOLS = frozenset({
 })
 _PLAN_CONTROL_TOOLS = frozenset({
     "task_plan", "task_list", "task_cancel", "await_user", "end_turn", "enable_reasoning",
-    "explore_domain", "load_tool_schemas",
+    "explore_domain", "load_tool_schemas", "search_tools",
 })
 _DELEGATION_CONTROL_TOOLS = frozenset({
     "end_turn", "enable_reasoning", "task_plan", "task_list", "task_cancel",
-    "search_session_history", "await_user",
+    "search_session_history", "await_user", "search_tools",
 })
 
 
@@ -2518,6 +2518,22 @@ BOT_TOOLS_SCHEMA = [
 
 
 
+    {
+        "type": "function",
+        "function": {
+            "name": "search_tools",
+            "description": "Search Delilah's full callable tool catalog by meaning. Returns up to six matching schemas with availability and side-effect metadata. Discovery does not grant approval or permission; normal controller, grant, and receipt checks still apply when a tool is called.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Brief capability needed, in plain language. Do not include account data, credentials, tool arguments, or tool results."},
+                    "task_context": {"type": "string", "description": "Optional brief task goal to improve matching. Never include secrets, account data, tool arguments/results, or quoted page/email content. Search text only; it does not grant authority."},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -4978,6 +4994,7 @@ EXPECTED_TOOL_NAMES = {
     "remove_subscription",
     "scan_and_auto_tag_deductions",
     "explore_domain",
+    "search_tools",
 
     "load_tool_schemas",
     "enable_reasoning",
@@ -5151,7 +5168,7 @@ _INPUT_ONLY_REPLY_ALLOWED_TOOLS = frozenset({
     # A resumed answer is data, not consent. Fail closed unless a tool is
     # explicitly classified here as read-only (or an internal control).
     "await_user", "end_turn", "enable_reasoning", "explore_domain",
-    "load_tool_schemas", "verify_claim", "search_session_history", "task_list",
+    "load_tool_schemas", "search_tools", "verify_claim", "search_session_history", "task_list",
     "search_gmail", "read_gmail_message", "read_gmail_thread",
     "search_web", "fetch_webpage", "scrape_rendered_page", "crawl_deeper",
     "research_topic", "find_government_forms", "list_workspace_files",
@@ -5219,6 +5236,22 @@ def _build_advisor_tool_registry() -> ToolRegistry:
 # legacy schema remains available for compatibility until all tool families
 # move to this registry.
 ADVISOR_TOOL_REGISTRY = _build_advisor_tool_registry()
+
+
+def _tool_discovery_side_effect_label(
+    definition: ToolDefinition | None, catalog_class: str,
+) -> str:
+    """Return conservative discovery metadata, never a dispatch decision."""
+    if definition is not None:
+        label = str(definition.side_effect or "").strip().lower()
+        if label in {"mutation", "conditional", "external", "read_only", "none"}:
+            return label
+        if label not in {"", "read"}:
+            return "unknown"
+    return {
+        "mutate": "mutation",
+        "conditional": "conditional",
+    }.get(str(catalog_class or "").strip().lower(), "unknown")
 
 
 def _input_only_reply_blocks_tool(
@@ -6018,7 +6051,7 @@ USER-CONTENT BOUNDARY:
 
 DISCOVERY & CONCURRENT BATCHING:
 - Batch only disjoint tools that are actually needed for the user's request; never batch a default finance checklist.
-- Dynamic discovery is a bounded fallback, not a workflow: use at most one relevant domain exploration, then immediately batch one load_tool_schemas([...]) call and use the loaded tools. Never repeat an exploration or invent a domain label that was not returned by discovery. For saved/uploaded files, prefer the already available workspace and sandbox tools; do not fetch or rediscover the artifact again.
+- Tool discovery is a bounded fallback, not a workflow. If no suitable capability is in the offered schemas, call search_tools(query, task_context) once using only a brief capability description; never include credentials, account data, tool arguments/results, or quoted email/page content in retrieval text. It returns up to six canonical schemas. Use a returned schema on the next round without calling load_tool_schemas again. Discovery results are not approval or authorization: obey dispatch-time grants and controller denials, and never claim a returned tool ran until its receipt confirms it. If search_tools is unavailable or finds no match, use at most one relevant explore_domain call and then batch one load_tool_schemas([...]) call. Never repeat an exploration or invent a domain label that was not returned by discovery. For saved/uploaded files, prefer the already available workspace and sandbox tools; do not fetch or rediscover the artifact again.
 - Use the minimum sufficient set of tools for the user's actual question. Do not turn a narrow question into a full audit just because additional analysis tools are available.
 - Stop as soon as the requested answer is supported by authoritative results. Do not call more financial diagnostics after the answer is already decidable.
 
@@ -6655,7 +6688,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
             ]
 
         core_tools = {
-            "explore_domain", "load_tool_schemas", "enable_reasoning", "verify_claim", "end_turn",
+            "explore_domain", "load_tool_schemas", "search_tools", "enable_reasoning", "verify_claim", "end_turn",
             "await_user",
             "delegate_task",
             "task_cancel",
@@ -8124,6 +8157,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
     ]
     # Pre-seed dynamically loaded tools from intent mapping
     dynamically_loaded_tools: set[str] = set()
+    search_discovered_tool_names: set[str] = set()
     for kw_tuple, tool_set in _INTENT_TOOL_MAP:
         if any(re.search(rf"\b{re.escape(kw)}\b", _prompt_lower) for kw in kw_tuple):
             dynamically_loaded_tools.update(tool_set)
@@ -8241,8 +8275,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     offered_names=offered,
                     required_tools=set(required_tools or ()),
                     always_allow={
-                        "end_turn", "load_tool_schemas", "enable_reasoning",
-                    },
+                        "end_turn", "load_tool_schemas", "search_tools", "enable_reasoning",
+                    } | search_discovered_tool_names,
                 )
                 decision["top1_score"] = proposal.get("top1_score")
                 decision["latency_ms"] = proposal.get("latency_ms")
@@ -10140,6 +10174,95 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             valid_from=datetime.date.today().isoformat(),
                         )
                         db_result = json.dumps({"status": "SUCCESS", "claim_id": cid, "migrated_to": "Active World Model"}, separators=(',', ':'))
+                    elif func_name == "search_tools":
+                        discovery_query = str(args.get("query") or "").strip()
+                        if not discovery_query:
+                            raise ValueError("query is required for search_tools")
+                        discovery_query = discovery_query[:600]
+                        task_context_text = str(args.get("task_context") or "").strip()[:600]
+
+                        # Retrieval may find tools outside the lexical seed, but
+                        # it is not an authorization source. Restrictive modes
+                        # expose only their controller allowlist; delegated and
+                        # input-only turns are additionally narrowed here.
+                        if CURRENT_ALLOWED_TOOLS.get() is not None:
+                            discovery_allowed = set(CURRENT_ALLOWED_TOOLS.get() or ())
+                        else:
+                            discovery_allowed = set(KNOWN_TOOLS)
+                        active_task_id = CURRENT_TASK_ID.get()
+                        if active_task_id:
+                            discovery_store = _durable_session_store()
+                            if discovery_store is None:
+                                discovery_allowed.clear()
+                            elif TaskController(discovery_store).reply_is_input_only(
+                                uid, active_task_id
+                            ):
+                                discovery_allowed.intersection_update(
+                                    _INPUT_ONLY_REPLY_ALLOWED_TOOLS
+                                )
+                        if _audit_is_active() or require_fresh_verification or context_policy.get("gmail_only"):
+                            discovery_allowed.intersection_update(
+                                t["function"]["name"] for t in _tool_schema_for_mode()
+                            )
+
+                        try:
+                            from src.services import tool_router as _discovery_router
+                            side_effect_labels = {}
+                            availability_reasons = {}
+                            discovery_categories = {
+                                card["name"]: card["class"]
+                                for card in _discovery_router.tool_cards()
+                            }
+                            for candidate_name in KNOWN_TOOLS:
+                                definition = ADVISOR_TOOL_REGISTRY.get(candidate_name)
+                                category = discovery_categories.get(candidate_name, "unknown")
+                                side_effect_labels[candidate_name] = _tool_discovery_side_effect_label(
+                                    definition, category
+                                )
+                                availability_reasons[candidate_name] = {
+                                    "available": None,
+                                    "reason": "canonical schema is in the current discovery scope; live dependencies and credentials are not probed, and dispatch still enforces controller and grant checks",
+                                }
+                            async def _rank_tool_discovery(text: str):
+                                return await asyncio.wait_for(
+                                    _discovery_router.propose(
+                                        text,
+                                        _discovery_router.mode_signature("ordinary", False),
+                                        top_k=len(TOOL_SCHEMAS_BY_NAME),
+                                    ),
+                                    timeout=_discovery_router.PROPOSE_TIMEOUT_S,
+                                )
+
+                            discovery_result = await ADVISOR_TOOL_REGISTRY.search_tools(
+                                discovery_query,
+                                task_context=task_context_text,
+                                canonical_catalog_schemas=BOT_TOOLS_SCHEMA,
+                                allowed_names=discovery_allowed,
+                                ranker=_rank_tool_discovery,
+                                side_effect_labels=side_effect_labels,
+                                availability_reasons=availability_reasons,
+                                limit=6,
+                            )
+                            discovered_names = [
+                                item["name"] for item in discovery_result["tools"]
+                            ]
+                            dynamically_loaded_tools.update(discovered_names)
+                            search_discovered_tool_names.update(discovered_names)
+                            db_result = json.dumps({
+                                "status": "ok",
+                                **discovery_result,
+                                "notice": "Discovery does not grant approval or bypass dispatch-time controller, grant, or receipt checks.",
+                            }, separators=(",", ":"))
+                        except Exception as discovery_error:
+                            # Discovery failure must not strand existing
+                            # explore_domain/load_tool_schemas paths or prevent
+                            # the model from completing the user's request.
+                            db_result = json.dumps({
+                                "status": "unavailable",
+                                "reason": f"semantic tool search unavailable ({type(discovery_error).__name__})",
+                                "fallback": "Use explore_domain once, then load_tool_schemas with exact catalog names.",
+                                "tools": [],
+                            }, separators=(",", ":"))
                     elif func_name == "explore_domain":
                         requested_domain = str(args.get("domain", "")).strip()
                         normalized_domain = re.sub(r"\s+", " ", requested_domain).strip().lower()
