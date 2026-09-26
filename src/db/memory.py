@@ -1,7 +1,8 @@
 import sqlite3
 import json
 import math
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 from src.core.state import DB_PATH
@@ -17,7 +18,10 @@ def init_epistemic_memory_schema():
             "provenance_type": "TEXT DEFAULT 'llm_inferred'", # user_stated, llm_inferred, deterministic_calculation
             "confidence": "REAL DEFAULT 0.5",
             "evidence_refs": "TEXT", # JSON array of strings
-            "embedding": "TEXT" # JSON array of floats
+            "embedding": "TEXT", # JSON array of floats
+            "expires_at": "TEXT",
+            "sensitivity": "TEXT",
+            "dedupe_key": "TEXT",
         }
         
         c.execute("PRAGMA table_info(delilah_memories)")
@@ -26,14 +30,57 @@ def init_epistemic_memory_schema():
         for col, col_def in columns.items():
             if col not in existing_cols:
                 c.execute(f"ALTER TABLE delilah_memories ADD COLUMN {col} {col_def}")
+
+        # NULL dedupe keys intentionally do not participate: existing callers
+        # retain append-only behavior, while keyed writes are unique per owner.
+        c.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_delilah_memories_owner_dedupe
+            ON delilah_memories(user_id, dedupe_key)
+            WHERE dedupe_key IS NOT NULL
+        """)
         
         conn.commit()
 
 async def _get_embedding(text: str) -> List[float]:
-    """Get text embedding from the shared embedding stack."""
+    """Embed using the configured provider without implicit cloud fallback.
+
+    The shared Qdrant helper supports local-to-cloud fallback. This memory
+    store deliberately does not: cloud is used only when explicitly selected
+    as EMBEDDING_BACKEND. Local/auto modes make a local-only request and
+    degrade to a zero vector on failure.
+    """
     try:
-        from src.services.qdrant_client import get_embedding
-        return await get_embedding(text)
+        from src.services import qdrant_client
+
+        backend = qdrant_client._get_embedding_backend()
+        if backend in ("cloud", "openai", "openrouter"):
+            # A remote embedding provider is allowed when it is an explicit
+            # operator choice, and shares the app's endpoint/model config.
+            return await qdrant_client.get_embedding(text)
+        if backend not in ("local", "ollama", "auto"):
+            raise ValueError(f"Unsupported EMBEDDING_BACKEND for memory: {backend!r}")
+
+        import httpx
+        from src.agent.scheduler import provider_capacity
+
+        local_model = os.getenv(
+            "EMBEDDING_LOCAL_MODEL", qdrant_client.DEFAULT_LOCAL_EMBED_MODEL
+        ).strip()
+        embed_url = qdrant_client._get_ollama_embed_url()
+        async with provider_capacity("ollama"), httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                embed_url,
+                json={
+                    "model": local_model,
+                    "input": text.strip()[:8000],
+                    "keep_alive": qdrant_client.EMBED_KEEP_ALIVE,
+                },
+            )
+        response.raise_for_status()
+        vectors = response.json().get("embeddings", [])
+        if not vectors:
+            raise RuntimeError("Local embedding endpoint returned no vector")
+        return vectors[0]
     except Exception as e:
         print(f"Embedding failed: {e}")
 
@@ -60,9 +107,28 @@ async def save_epistemic_memory(
     importance: str = "normal",
     provenance_type: str = "llm_inferred",
     confidence: float = 0.5,
-    evidence_refs: List[str] = None
+    evidence_refs: List[str] = None,
+    expires_at: Optional[str] = None,
+    sensitivity: Optional[str] = None,
+    dedupe_key: Optional[str] = None,
 ) -> str:
     """Saves a structured epistemic memory with provenance and confidence."""
+    if dedupe_key is not None and not user_id:
+        raise ValueError("dedupe_key requires a non-empty owner user_id")
+    normalized_expiry = _normalize_expiry(expires_at)
+
+    # Avoid unnecessary embedding work for the common restart/repeat case.
+    # The partial unique index and ON CONFLICT clause below remain the
+    # concurrency-safe source of truth for simultaneous writers.
+    if dedupe_key is not None:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM delilah_memories WHERE user_id = ? AND dedupe_key = ? LIMIT 1",
+                (user_id, dedupe_key),
+            ).fetchone()
+        if existing:
+            return "Memory successfully saved."
+
     evidence_json = json.dumps(evidence_refs or [])
     embedding = await _get_embedding(content)
     embedding_json = json.dumps(embedding)
@@ -71,27 +137,65 @@ async def save_epistemic_memory(
         c = conn.cursor()
         c.execute("""
             INSERT INTO delilah_memories 
-            (user_id, content, category, importance, memory_type, provenance_type, confidence, evidence_refs, embedding, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-        """, (user_id, content, category, importance, memory_type, provenance_type, confidence, evidence_json, embedding_json))
+            (user_id, content, category, importance, memory_type, provenance_type, confidence, evidence_refs, embedding, expires_at, sensitivity, dedupe_key, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+        """, (
+            user_id, content, category, importance, memory_type, provenance_type,
+            confidence, evidence_json, embedding_json, normalized_expiry,
+            sensitivity, dedupe_key,
+        ))
         conn.commit()
     return "Memory successfully saved."
 
-async def semantic_search_memory(user_id: str, query: str, top_k: int = 5, min_confidence: float = 0.0) -> str:
+
+def _normalize_expiry(expires_at: Optional[str]) -> Optional[str]:
+    """Normalize ISO expiry timestamps to comparable UTC SQLite text."""
+    if expires_at is None:
+        return None
+    if not isinstance(expires_at, str) or not expires_at.strip():
+        raise ValueError("expires_at must be an ISO-8601 timestamp or None")
+    try:
+        parsed = datetime.fromisoformat(expires_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("expires_at must be an ISO-8601 timestamp or None") from None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.isoformat(sep=" ")
+
+async def semantic_search_memory(
+    user_id: str,
+    query: str,
+    top_k: int = 5,
+    min_confidence: float = 0.0,
+    *,
+    memory_type: Optional[str] = None,
+) -> str:
     """Retrieve memories using semantic similarity and strict provenance metadata."""
     query_emb = await _get_embedding(query)
+    type_clause = ""
+    parameters: list[Any] = [user_id, min_confidence]
+    if memory_type is not None:
+        normalized_type = str(memory_type).strip().lower()
+        if not normalized_type or len(normalized_type) > 64:
+            raise ValueError("memory_type must be a non-empty string of at most 64 characters")
+        type_clause = " AND LOWER(memory_type) = ?"
+        parameters.append(normalized_type)
     
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute("""
-            SELECT id, content, memory_type, provenance_type, confidence, evidence_refs, created_at, embedding
+            SELECT id, content, memory_type, provenance_type, confidence, evidence_refs, created_at, embedding, sensitivity
             FROM delilah_memories
             WHERE user_id = ? AND is_active = 1 AND confidence >= ?
-        """, (user_id, min_confidence))
+              AND (expires_at IS NULL OR (
+                  julianday(expires_at) IS NOT NULL AND julianday(expires_at) > julianday('now')
+              ))
+        """ + type_clause, parameters)
         
         results = []
         for row in c.fetchall():
-            mem_id, content, m_type, prov, conf, ev, created, emb_json = row
+            mem_id, content, m_type, prov, conf, ev, created, emb_json, sensitivity = row
             try:
                 emb = json.loads(emb_json) if emb_json else []
                 sim = _cosine_similarity(query_emb, emb) if emb else 0.0
@@ -115,6 +219,7 @@ async def semantic_search_memory(user_id: str, query: str, top_k: int = 5, min_c
                 "type": m_type,
                 "provenance": prov,
                 "confidence": conf,
+                "sensitivity": sensitivity,
                 "created_at": created
             })
             
@@ -127,7 +232,8 @@ async def semantic_search_memory(user_id: str, query: str, top_k: int = 5, min_c
             
         output = [f"Found {len(top)} memories for query: '{query}'\n"]
         for r in top:
-            output.append(f"[{r['type'].upper()} | Prov: {r['provenance']} | Conf: {r['confidence']}] {r['content']} (Date: {r['created_at']})")
+            sensitivity_label = f" | Sensitivity: {r['sensitivity']}" if r["sensitivity"] else ""
+            output.append(f"[{r['type'].upper()} | Prov: {r['provenance']} | Conf: {r['confidence']}{sensitivity_label}] {r['content']} (Date: {r['created_at']})")
             
         return "\n".join(output)
 
