@@ -2,17 +2,27 @@
 
 ## Current stopping summary
 
-- **Passed:** Steps 0–4 and roadmap items 1, 2, 3, 4, 7, and 9. Item 3 is gated for one bot process per local task database, with configurable in-process workers. The Step 4 gate is pushed as `93cd834` on `agentic-roadmap/full-run`; `main` was not changed.
-- **In progress / next:** Roadmap item 11 — deterministic verification and repair gates. Item 3 does not support simultaneous bot processes or hosts sharing the task database/provider.
-- **Remaining in recommended order:** group 4 item 11, then items 5 and 6; group 5 items 8 and 12; group 6 items 10, 13, 14, and 15.
+- **Passed:** Step-by-step Steps 0–4 and roadmap items 1, 2, 3, 4, 7, 9, and 11. Item 3 is gated for one bot process per local task database, with configurable in-process workers. All work is on `agentic-roadmap/full-run`; `main` was not changed.
+- **In progress / next:** Roadmap item 5 — semantic tool discovery. Item 3 does not support simultaneous bot processes or hosts sharing the task database/provider.
+- **Remaining in recommended order:** items 5 and 6; group 5 items 8 and 12; group 6 items 10, 13, 14, and 15.
 - **Human decisions recorded:** (1) affirmative choice replies resume into planning as input-only; affirmative approvals require human grant confirmation before dispatch (fail-closed); (2) reconciliation notice delivery uses migration 008's atomic single-claim index `ux_task_reconciliation_notice_claimed_once`; (3) scheduler defaults are one worker, one active task per owner, and eight queued tasks per lane; model inference is scheduled at unit granularity; (4) children inherit a strict subset of parent tools, cannot delegate recursively, parents yield while awaiting children, and cancellation cascades. None of these decisions was reversed.
-- **Verification:** Item 3 focused recovery/store/delegation/process-lock suite: 73 passed. Full isolated suite: 721 passed, 1 skipped, 10 known clean-database/seed-data failures (budgeting, intelligence, reconciliation, rewards, and world-model fixtures); `.env` was disabled, dummy Discord credentials were used, and the live `data/finances.db` was not accessed.
-- **Latest pushed code gate:** `93cd834 [gate] Step 4 bounded delegation; 114 focused tests pass`. Item 3's gate is local and pending commit/push.
+- **Verification:** Item 11 focused suite: 135 passed. Latest full isolated suite: 853 passed, 1 skipped, and the same 10 clean-database/seed-data failures (budgeting, intelligence, reconciliation, rewards, and world-model fixtures). `.env` was disabled, dummy Discord credentials were used, and the live `data/finances.db` was not accessed.
+- **Latest pushed code gate:** `ae9fd15 [gate] Item 11 deterministic verification and repair gates`; Item 3 remains `83073b1` and Step 4 remains `93cd834`.
 - **Human decision needed:** whether to support simultaneous bot processes/hosts sharing a task database/provider. “Leases” is underspecified (topology, expiry, renewal, fencing, and shared provider-capacity semantics). Keep distributed execution disabled; do not invent a TTL.
-- **Deferred suggestions / constraints:** add an integration test showing direct delegation and startup recovery contending for the same owner's active-child cap. The per-owner semaphore is used in both paths and direct dispatch is tested. Delegation defaults are configurable via `DELEGATION_MAX_STEPS=5`, `DELEGATION_MAX_TIMEOUT_SECONDS=60`, and `DELEGATION_MAX_TOKENS=4096` (per generated response); independent model review and browser automation remain off by default.
-- **Review first:** inspect Item 3's recovery, reconciliation parking, and completion at-most-once paths, then begin Item 11.
+- **Deferred suggestions / constraints:** add an integration test proving a mocked multi-tool provider response does not dispatch later calls after an unknown receipt; add dispatcher-level persistence-failure coverage proving no tool body runs; add typed freshness/arithmetic adapters for financial tools beyond `get_current_financial_position`; and define semantic content validators for arbitrary artifacts beyond JSON syntax and CSV structure. Optional model review uses the configured advisor provider, is off by default, and never replaces deterministic checks. Distributed task leases remain disabled; do not invent expiry/fencing semantics.
+- **Review first:** inspect Item 11's receipt linking, unknown-outcome stop, financial evidence, and artifact byte validation, then begin item 5.
 
 ## Progress
+
+### Item 11 — deterministic verification and repair gates — passed
+
+- Added a pure bounded verifier for linked receipts, per-source freshness, exact-decimal arithmetic, allowed-tool policy, required deliverables, financial numeric claims, and file identity/format evidence. Failed checks atomically transition a verifying task to partial, append a bounded task event, and create one ready manual repair step; ambiguous effects are never retried.
+- Every non-control tool call in a durable task now links to a task step and receipt before dispatch. A missing durable task context stops the advisor before model/tool execution. An unknown receipt stops both the current tool batch and subsequent provider-split batches/rounds.
+- Typed current-position snapshots provide the only current financial freshness/arithmetic proof today; unsupported financial sources and untyped reconciliations fail closed. JSON exports are validated from exact delivered bytes with duplicate keys and nonstandard constants rejected; CSV exports require bounded UTF-8 parsing, consistent row widths, and reject JSON documents/scalars mislabeled as CSV. Missing canonical sandbox paths fail before sending.
+- Added an optional `DELILAH_TASK_MODEL_REVIEWER` pass (default off) for multi-step tasks after deterministic checks pass. It receives bounded objective/response/check summaries, runs with tools disabled, and cannot replace deterministic checks. Invalid/unavailable review fails closed.
+- Verification: focused Item 11 suite: 135 passed; latest full isolated suite: 853 passed, 1 skipped, 10 known clean-seed failures. `py_compile` and `git diff --check` passed. Fresh adversarial review: no blockers.
+- Deferred suggestion: add a full mocked provider-loop integration test proving no later call executes after an unknown receipt. Other deferred constraints and the clean-database failures are listed in the current stopping summary above.
+- Gate commit: `[gate] Item 11 deterministic verification and repair gates` (`ae9fd15`), pushed to `agentic-roadmap/full-run`.
 
 ### Item 3 — durable background execution and completion delivery — passed for single-process deployments
 
