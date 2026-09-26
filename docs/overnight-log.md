@@ -3,14 +3,33 @@
 ## Current stopping summary
 
 - **Passed:** Steps 0 (workflow action contracts), 1 (durable task/step/event records), 2 (resumable task execution state machine & workflow migration), and 3 (capacity-aware scheduler & provider limiter); and roadmap items 1 (durable task plans), 4 (bounded session recall), 7 (durable phase recovery), and 9 (await/resume). Commits are pushed on `agentic-roadmap/full-run`; no changes were made to `main`.
-- **In progress / next:** Step 4 — Bounded delegation as child tasks (Roadmap Item 2).
-- **Remaining roadmap items:** 1 — passed; 2 — in progress (Step 4); 3 — ready (Item 3 delegation budgets); 4 — passed; 5 — blocked (group 4); 6 — blocked (group 4); 7 — passed; 8 — blocked (group 5); 9 — passed; 10 — blocked (group 6); 11 — blocked (group 4); 12 — blocked (group 5); 13 — blocked (group 6); 14 — blocked; 15 — blocked (group 6).
-- **Human decisions recorded:** (1) affirmative choice replies resume into planning as input-only; affirmative approvals require human grant confirmation before dispatch (fail-closed); (2) reconciliation notice delivery uses atomic single-claim migration 008 index (`ux_task_reconciliation_notice_claimed_once`) to guarantee at-most-once surfacing without duplicate Discord alerts; (3) scheduler defaults strictly follow doc: 1 worker, 1 active task per owner, 8 queue limit per lane; model inference scheduled at unit level rather than locking coarse turns.
+- **In progress / checkpointed:** Step 4 — Bounded delegation as child tasks (Roadmap Item 2). Core delegation controller, owner-scoped child task queries, cascading cancellation, budget boundaries, and scheduler release implemented; wrapped up as checkpoint `95ba09e`.
+- **Remaining roadmap items:** 1 — passed; 2 — in progress (Step 4 checkpointed); 3 — ready (Item 3 delegation budgets); 4 — passed; 5 — blocked (group 4); 6 — blocked (group 4); 7 — passed; 8 — blocked (group 5); 9 — passed; 10 — blocked (group 6); 11 — blocked (group 4); 12 — blocked (group 5); 13 — blocked (group 6); 14 — blocked; 15 — blocked (group 6).
+- **Human decisions recorded:** (1) affirmative choice replies resume into planning as input-only; affirmative approvals require human grant confirmation before dispatch (fail-closed); (2) reconciliation notice delivery uses atomic single-claim migration 008 index (`ux_task_reconciliation_notice_claimed_once`) to guarantee at-most-once surfacing without duplicate Discord alerts; (3) scheduler defaults strictly follow doc: 1 worker, 1 active task per owner, 8 queue limit per lane; model inference scheduled at unit level rather than locking coarse turns; (4) child delegation enforces child permissions $\subseteq$ parent permissions at validation time, recursive child delegation is strictly disallowed, parent in `awaiting_child` phase yields its worker slot, and cancellation cascades to active child tasks.
 - **Verification baseline:** Full test suite passes: 657 passed, 1 skipped (0 failures; sandbox credentials only; real finances.db untouched).
-- **Latest pushed checkpoint:** Step 3 gate code/tests at commit `c0771ec` on `agentic-roadmap/full-run`.
-- **Review first:** Step 3's scheduler and provider limiter gate passed cleanly with zero adversarial blockers; proceed with Step 4 (Bounded delegation as child tasks).
+- **Latest pushed checkpoint:** Step 4 WIP core controller and store queries at commit `95ba09e` on `agentic-roadmap/full-run`.
+- **Next steps to complete Step 4 gate:**
+  1. Wire model-facing `delegate_task` tool schema and execution dispatch in `src/services/llm.py` calling `DelegationController.delegate(...)`.
+  2. Add `awaiting_child` recovery in `TaskController.recover_incomplete` (resume parent to `planning` if children terminal or none created; retain `awaiting_child` if child running/queued).
+  3. Write comprehensive Step 4 acceptance tests in `tests/test_delegation.py` (parent/child inspection, cascading cancellation, restart recovery across crashes, permission narrowing, recursive delegation rejection, receipt linkage, 1-worker sequential vs multi-worker provider limits).
+  4. Run fresh adversarial critic review, address any blocking findings, and commit `[gate] Step 4 bounded delegation as child tasks`.
 
 ## Progress
+
+### Step 4 — bounded delegation as child tasks — in progress / checkpointed
+
+- Built `DelegationController`, `DelegationBudget`, and `DelegationResult` (`src/agent/delegation.py`):
+  - Child tasks represented as normal durable `task_runs` with `parent_task_id`, inherited owner scoping, and `lane="background"`.
+  - Permission scoping: child permissions strictly cannot exceed parent permissions (`PermissionError` raised for unauthorized tools).
+  - Anti-recursion protection: recursive delegation is disabled initially (`ValueError` raised if parent has a `parent_task_id` or child attempts to call `delegate_task`).
+  - Worker slot conservation: parent task transitions to `awaiting_child` phase with `wait_reason="awaiting_child:<child_id>"`, yielding its scheduler worker slot while the child task executes in background lane.
+  - Bounded budgets: explicit limits on `max_steps`, `timeout_seconds`, `max_tokens`, provider, and model.
+  - Return structure: returns typed `DelegationResult` with task status, summary, structured data, steps executed, receipt IDs, and error message.
+- SessionStore integration (`src/db/session_store.py`):
+  - Added `SessionStore.get_child_tasks(user_id, parent_task_id)` querying child task runs with session scoping.
+- Cascading cancellation (`src/agent/task_controller.py`):
+  - Updated `TaskController.cancel` to cooperatively cascade cancellation down to all active child tasks before marking the parent cancelled.
+- Verification baseline: full test suite passes cleanly with 657 passed, 1 skipped. Checkpoint committed as `[wip] Step 4 bounded delegation core controller and store queries` (commit `95ba09e`).
 
 ### Step 3 — scheduler and capacity controller — passed
 
