@@ -239,7 +239,9 @@ async def get_embedding(text: str, instruction: Optional[str] = None) -> List[fl
 
     for model_name in candidate_models:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            from src.agent.scheduler import provider_capacity
+
+            async with provider_capacity("ollama"), httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     ollama_url,
                     json={"model": model_name, "input": embed_input, "keep_alive": EMBED_KEEP_ALIVE},
@@ -334,7 +336,9 @@ async def get_embeddings(
             payload_input = inputs
             if instruction:
                 payload_input = [instruction.format(q=t) for t in inputs]
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            from src.agent.scheduler import provider_capacity
+
+            async with provider_capacity("ollama"), httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     ollama_url,
                     json={

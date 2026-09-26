@@ -2319,12 +2319,26 @@ async def _ollama_installed_models() -> list[str]:
 async def _ollama_unload_model(model_name: str) -> None:
     if not model_name:
         return
+    import uuid
+    from src.agent.scheduler import provider_capacity, schedule_work
+
     payload = {"model": model_name, "prompt": "", "stream": False, "keep_alive": 0}
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(f"{_ollama_base_url()}/api/generate", json=payload)
-        response.raise_for_status()
+
+    async def _do_unload():
+        async with provider_capacity("ollama"):
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(f"{_ollama_base_url()}/api/generate", json=payload)
+                response.raise_for_status()
+
+    await schedule_work(
+        f"unload_{uuid.uuid4().hex[:8]}", "system", "background", _do_unload,
+        unit_type="inference", provider="ollama"
+    )
 
 async def _ollama_warm_model(model_name: str) -> None:
+    import uuid
+    from src.agent.scheduler import provider_capacity, schedule_work
+
     payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": "ping"}],
@@ -2333,9 +2347,17 @@ async def _ollama_warm_model(model_name: str) -> None:
         "keep_alive": MODEL_KEEP_ALIVE,
         "options": {"num_ctx": ADVISOR_NUM_CTX},
     }
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        response = await client.post(OLLAMA_URL, json=payload)
-        response.raise_for_status()
+
+    async def _do_warm():
+        async with provider_capacity("ollama"):
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                response = await client.post(OLLAMA_URL, json=payload)
+                response.raise_for_status()
+
+    await schedule_work(
+        f"warm_{uuid.uuid4().hex[:8]}", "system", "background", _do_warm,
+        unit_type="inference", provider="ollama"
+    )
 
 @bot.group(name="model", invoke_without_command=True)
 @commands.has_permissions(administrator=True)
@@ -4768,9 +4790,19 @@ async def preload_advisor_model():
         "options": {"num_ctx": ADVISOR_NUM_CTX},
     }
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            await client.post(OLLAMA_URL, json=payload)
-            print(f" {src.core.state.ADVISOR_MODEL} warm-up completed.")
+        import uuid
+        from src.agent.scheduler import provider_capacity, schedule_work
+
+        async def _do_preload():
+            async with provider_capacity("ollama"):
+                async with httpx.AsyncClient(timeout=180.0) as client:
+                    await client.post(OLLAMA_URL, json=payload)
+                    print(f" {src.core.state.ADVISOR_MODEL} warm-up completed.")
+
+        await schedule_work(
+            f"preload_{uuid.uuid4().hex[:8]}", "system", "background", _do_preload,
+            unit_type="inference", provider="ollama"
+        )
     except Exception as e:
         print(f" Failed to warm up model: {e}")
 
@@ -5193,6 +5225,14 @@ async def on_ready():
         print(" [DEBUG] on_ready: skipping task creation (already started)", flush=True)
         return
     BACKGROUND_TASKS_STARTED = True
+
+    try:
+        from src.agent.scheduler import get_global_scheduler
+        await get_global_scheduler().start()
+        print(" [SCHEDULER] Capacity-aware scheduler background worker started.")
+    except Exception as sched_err:
+        print(f" [SCHEDULER] Failed to start background worker: {sched_err}")
+
     print(" [DEBUG] Creating queue_worker task...", flush=True)
     t1 = bot.loop.create_task(queue_worker())
     _PERSISTENT_TASKS.add(t1)
@@ -5553,6 +5593,11 @@ async def _run_queued_advisor_item(uid: str, item: dict) -> None:
 
 
 def _queue_advisor_item(uid: str, item: dict) -> int | None:
+    from src.agent.scheduler import get_global_scheduler
+
+    owner_queue = get_global_scheduler().get_owner_queue(uid)
+    if len(owner_queue.interactive_lane) >= MAX_PENDING_ADVISOR_MESSAGES:
+        return None
     queue = PENDING_ADVISOR_MESSAGES.setdefault(uid, [])
     if len(queue) >= MAX_PENDING_ADVISOR_MESSAGES:
         return None

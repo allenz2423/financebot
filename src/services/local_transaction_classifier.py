@@ -124,24 +124,39 @@ async def classify_with_local_llm(
         return []
     effective_url = url or os.getenv("OLLAMA_URL", OLLAMA_URL)
     effective_model = model or os.getenv("CLASSIFIER_MODEL", CLASSIFIER_MODEL)
-    system, user = _prompt(items)
+    owner_id = "system"
+    for item in items:
+        if isinstance(item, dict) and item.get("user_id"):
+            owner_id = str(item["user_id"])
+            break
+
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(
-                effective_url,
-                json={
-                    "model": effective_model,
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    "format": "json",
-                    "stream": False,
-                    "keep_alive": os.getenv("MODEL_KEEP_ALIVE", MODEL_KEEP_ALIVE),
-                    "options": {"temperature": float(os.getenv("CLASSIFY_TEMPERATURE", "0.1")), "num_ctx": ADVISOR_NUM_CTX},
-                    "think": False,
-                },
-            )
-            response.raise_for_status()
-            raw = str(response.json().get("message", {}).get("content", ""))
-            return _parse(raw, items, effective_model)
+        import uuid
+        from src.agent.scheduler import provider_capacity, schedule_work
+
+        async def _do_classify():
+            async with provider_capacity("ollama"):
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                    response = await client.post(
+                        effective_url,
+                        json={
+                            "model": effective_model,
+                            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                            "format": "json",
+                            "stream": False,
+                            "keep_alive": os.getenv("MODEL_KEEP_ALIVE", MODEL_KEEP_ALIVE),
+                            "options": {"temperature": float(os.getenv("CLASSIFY_TEMPERATURE", "0.1")), "num_ctx": ADVISOR_NUM_CTX},
+                            "think": False,
+                        },
+                    )
+                    response.raise_for_status()
+                    raw = str(response.json().get("message", {}).get("content", ""))
+                    return _parse(raw, items, effective_model)
+
+        task_id = f"classify_{uuid.uuid4().hex[:8]}"
+        return await schedule_work(
+            task_id, owner_id, "background", _do_classify, unit_type="inference"
+        )
     except Exception as exc:
         return [LocalClassification(str(item.get("id") or item.get("transaction_row_id") or ""), None, "error", model=effective_model, error=f"{type(exc).__name__}: {exc}") for item in items]
 

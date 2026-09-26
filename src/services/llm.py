@@ -76,6 +76,7 @@ from src.agent.runtime import (
 )
 from src.db.session_store import SessionStore
 from src.agent.task_controller import TaskController
+from src.agent.scheduler import provider_capacity, schedule_work
 
 import os
 import re
@@ -689,21 +690,27 @@ async def maybe_flag_spending_concern(*,user_id: str):
     )
     user_msg = f"CURRENT CONTEXT:\n{financial_context}"
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            res = await client.post(
-                OLLAMA_URL,
-                json={
-                    "model": src.core.state.ADVISOR_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "stream": False,
-                    "think": False,
-                    "options": {"temperature": float(os.getenv("NUDGE_TEMPERATURE", 0.3)), "num_ctx": ADVISOR_NUM_CTX},
-                },
-            )
-            content = res.json().get("message", {}).get("content", "").strip()
+        async def _do_nudge():
+            async with provider_capacity("ollama"):
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    res = await client.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": src.core.state.ADVISOR_MODEL,
+                            "messages": [
+                                {"role": "system", "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "stream": False,
+                            "think": False,
+                            "options": {"temperature": float(os.getenv("NUDGE_TEMPERATURE", 0.3)), "num_ctx": ADVISOR_NUM_CTX},
+                        },
+                    )
+                    return res.json().get("message", {}).get("content", "").strip()
+
+        content = await schedule_work(
+            f"concern_{uuid.uuid4().hex[:8]}", str(user_id), "background", _do_nudge, unit_type="inference"
+        )
     except Exception as e:
         print(f" [maybe_flag_spending_concern] LLM call failed: {e}")
         return
@@ -1026,21 +1033,27 @@ async def maybe_flag_windfall(merchant, amount, *, user_id: str):
     user_msg = f"WINDFALL DETECTED: {merchant} for ${abs(amount):.2f}\n\nCURRENT CONTEXT:\n{financial_context}"
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            res = await client.post(
-                OLLAMA_URL,
-                json={
-                    "model": src.core.state.ADVISOR_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "stream": False,
-                    "think": False,
-                    "options": {"temperature": 0.1, "num_ctx": ADVISOR_NUM_CTX},
-                },
-            )
-            llm_response = res.json().get("message", {}).get("content", "").strip()
+        async def _do_windfall():
+            async with provider_capacity("ollama"):
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    res = await client.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": src.core.state.ADVISOR_MODEL,
+                            "messages": [
+                                {"role": "system", "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "stream": False,
+                            "think": False,
+                            "options": {"temperature": 0.1, "num_ctx": ADVISOR_NUM_CTX},
+                        },
+                    )
+                    return res.json().get("message", {}).get("content", "").strip()
+
+        llm_response = await schedule_work(
+            f"windfall_{uuid.uuid4().hex[:8]}", str(user_id), "background", _do_windfall, unit_type="inference"
+        )
     except Exception as e:
         print(f" [maybe_flag_windfall] LLM call failed: {e}")
         return
@@ -1252,35 +1265,47 @@ async def classify_transaction_batch(
     ]
     user_msg = "Transactions:\n" + json.dumps(txn_payload, indent=2)
     num_predict = min(16384, 400 + 500 * len(batch_items))
+    owner_id = "system"
+    for item in batch_items:
+        if isinstance(item, dict) and item.get("user_id"):
+            owner_id = str(item["user_id"])
+            break
+
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            res = await client.post(
-                OLLAMA_URL,
-                json={
-                    "model": src.core.state.CLASSIFIER_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "format": "json",
-                    "stream": False,
-                    "keep_alive": MODEL_KEEP_ALIVE,
-                    "options": {
-                        "temperature": float(os.getenv("CLASSIFY_TEMPERATURE", 0.1)),
-                        "num_predict": num_predict,
-                        "num_ctx": ADVISOR_NUM_CTX,
-                "stop": ["<end_of_turn>", "<|im_end|>", "<|endoftext|>"]
-                    },
-                    "think": False,
-                },
-            )
-            if res.status_code != 200:
-                print(f" [Ollama HTTP Error {res.status_code}]: {res.text}")
-                return {}
-            raw_content = res.json().get("message", {}).get("content", "").strip()
-            if not raw_content:
-                print(" [LLM Error] Ollama returned an empty message content field.")
-                return {}
+        async def _do_batch_classify():
+            async with provider_capacity("ollama"):
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    res = await client.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": src.core.state.CLASSIFIER_MODEL,
+                            "messages": [
+                                {"role": "system", "content": system_msg},
+                                {"role": "user", "content": user_msg},
+                            ],
+                            "format": "json",
+                            "stream": False,
+                            "keep_alive": MODEL_KEEP_ALIVE,
+                            "options": {
+                                "temperature": float(os.getenv("CLASSIFY_TEMPERATURE", 0.1)),
+                                "num_predict": num_predict,
+                                "num_ctx": ADVISOR_NUM_CTX,
+                        "stop": ["<end_of_turn>", "<|im_end|>", "<|endoftext|>"]
+                            },
+                            "think": False,
+                        },
+                    )
+                    if res.status_code != 200:
+                        print(f" [Ollama HTTP Error {res.status_code}]: {res.text}")
+                        return ""
+                    return res.json().get("message", {}).get("content", "").strip()
+
+        raw_content = await schedule_work(
+            f"classify_batch_{uuid.uuid4().hex[:8]}", owner_id, "background", _do_batch_classify, unit_type="inference"
+        )
+        if not raw_content:
+            print(" [LLM Error] Ollama returned an empty message content field.")
+            return {}
             # Strip markdown code blocks if the model wraps the JSON
             if raw_content.startswith("```"):
                 raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content)
@@ -6206,188 +6231,202 @@ CURRENT DATABASE FINANCIAL CONTEXT
                     models_to_try.append(_extra_model)
             return True
 
-        for attempt_idx, candidate_model in enumerate(models_to_try):
-            payload["model"] = candidate_model
-            log_model = candidate_model
-            print(f" [{llm_provider.upper()} REQUEST] uid={uid} model={log_model} messages={len(api_messages)} images={image_count_for_payload} tools={len(tools) if not force_no_tools else 0} max_tokens={effective_num_predict}")
+        async def _do_stream_round():
+            nonlocal full_text, tool_calls_detected, image_count_for_payload, api_messages, payload
+            for attempt_idx, candidate_model in enumerate(models_to_try):
+                payload["model"] = candidate_model
+                log_model = candidate_model
+                print(f" [{llm_provider.upper()} REQUEST] uid={uid} model={log_model} messages={len(api_messages)} images={image_count_for_payload} tools={len(tools) if not force_no_tools else 0} max_tokens={effective_num_predict}")
 
-            full_text = ""
-            streamed_tool_calls.clear()
-            thinking_chars = 0
-            thinking_chunks = 0
-            chunk_count = 0
-            request_success = False
-            stall_abort = False
-            was_interrupted = False
-            round_started_at = time.monotonic()
-            first_content_at = None
-            reasoning_text = ""
-            finish_reason = None
+                full_text = ""
+                streamed_tool_calls.clear()
+                thinking_chars = 0
+                thinking_chunks = 0
+                chunk_count = 0
+                request_success = False
+                stall_abort = False
+                was_interrupted = False
+                round_started_at = time.monotonic()
+                first_content_at = None
+                reasoning_text = ""
+                finish_reason = None
 
-            try:
-                async with httpx.AsyncClient(timeout=600.0) as client:
-                    async with client.stream("POST", req_url, headers=req_headers, json=payload) as response:
-                        if response.status_code >= 400:
-                            body = (await response.aread()).decode("utf-8", errors="replace")
-                            print(f" [{llm_provider.upper()} HTTP ERROR] status={response.status_code} body={body[:1000]}")
-                            if response.status_code == 429 or response.status_code >= 500:
-                                cooldown_seconds = max(
-                                    1.0,
-                                    float(os.getenv("OPENROUTER_MODEL_COOLDOWN_SECONDS", "60")),
+                try:
+                    async with provider_capacity(llm_provider), httpx.AsyncClient(timeout=600.0) as client:
+                        async with client.stream("POST", req_url, headers=req_headers, json=payload) as response:
+                            if response.status_code >= 400:
+                                body = (await response.aread()).decode("utf-8", errors="replace")
+                                print(f" [{llm_provider.upper()} HTTP ERROR] status={response.status_code} body={body[:1000]}")
+                                if response.status_code == 429 or response.status_code >= 500:
+                                    cooldown_seconds = max(
+                                        1.0,
+                                        float(os.getenv("OPENROUTER_MODEL_COOLDOWN_SECONDS", "60")),
+                                    )
+                                    _OPENROUTER_MODEL_COOLDOWN_UNTIL[candidate_model] = (
+                                        time.monotonic() + cooldown_seconds
+                                    )
+                                # A route that cannot accept image input answers 404
+                                # ("No endpoints found that support image input").
+                                # Degrade to text-only and continue instead of
+                                # crashing the turn on raise_for_status().
+                                if (
+                                    image_count_for_payload > 0
+                                    and response.status_code == 404
+                                    and "image" in body.lower()
+                                    and _degrade_to_text_only()
+                                ):
+                                    continue
+                                if attempt_idx < len(models_to_try) - 1 and (response.status_code in (400, 403, 429) or response.status_code >= 500):
+                                    print(f" [RETRY] Moving to next model due to HTTP {response.status_code}")
+                                    continue
+                                response.raise_for_status()
+
+                            async for line in response.aiter_lines():
+                                if not line: continue
+                                if USER_INTERRUPTS.get(uid) is not None:
+                                    print(f"\n [STREAM INTERRUPT] User paused generation.")
+                                    full_text += "\n[SYSTEM: Generation paused by user interrupt.]"
+                                    was_interrupted = True
+                                    break
+
+                                event = parse_stream_line(line, llm_provider)
+                                if event is None:
+                                    continue
+                                if event.done and not event.delta:
+                                    break
+                                delta = event.delta
+                                if event.finish_reason:
+                                    finish_reason = event.finish_reason
+
+                                chunk = delta.get("content") or ""
+                                d_reasoning = (
+                                    delta.get("reasoning")
+                                    or delta.get("reasoning_content")
+                                    or ""
                                 )
-                                _OPENROUTER_MODEL_COOLDOWN_UNTIL[candidate_model] = (
-                                    time.monotonic() + cooldown_seconds
+                                if d_reasoning:
+                                    reasoning_text += d_reasoning
+                                if chunk:
+                                    if first_content_at is None:
+                                        first_content_at = time.monotonic()
+                                    full_text += chunk
+                                    chunk_count += 1
+                                    if chunk_count % 100 == 0:
+                                        await _set_advisor_status(uid, phase="generating", output_chars=len(full_text), stream_chunks=chunk_count)
+                                    # Self-throttled to ~1 edit/sec; skips until
+                                    # there is renderable narrative content.
+                                    _alt_preview = ""
+                                    if not full_text.strip() and reasoning_text:
+                                        _rt = re.sub(r"\s+", " ", reasoning_text).strip()
+                                        if _rt:
+                                            _alt_preview = ("🤔 …" + _rt[-450:])[:1900]
+                                    await update_live_preview(full_text, _alt_preview)
+
+                                delta_tool_calls = delta.get("tool_calls") or []
+                                for tc in delta_tool_calls:
+                                    if llm_provider == "ollama":
+                                        func = tc.get("function") or {}
+                                        name = func.get("name")
+                                        args = func.get("arguments", {})
+                                        is_dupe = False
+                                        for existing in streamed_tool_calls.values():
+                                            e_func = existing.get("function", {})
+                                            if e_func.get("name") == name and e_func.get("arguments") == args:
+                                                is_dupe = True; break
+                                        if not is_dupe:
+                                            idx = len(streamed_tool_calls)
+                                            streamed_tool_calls[idx] = {"id": f"call_{idx}", "type": "function", "function": {"name": name, "arguments": args}}
+                                    else:
+                                        index = tc.get("index", len(streamed_tool_calls))
+                                        existing = streamed_tool_calls.get(index)
+                                        if existing is None:
+                                            existing = {"id": tc.get("id") or f"call_{index}", "type": "function", "function": {"name": "", "arguments": ""}}
+                                            streamed_tool_calls[index] = existing
+                                        if tc.get("id"): existing["id"] = tc["id"]
+                                        f_delta = tc.get("function") or {}
+                                        if f_delta.get("name"): existing["function"]["name"] += f_delta["name"]
+                                        if f_delta.get("arguments"): existing["function"]["arguments"] += f_delta["arguments"]
+                            request_success = True
+                            provider_round_records.append(
+                                {
+                                    "turn_id": turn_id,
+                                    "provider": llm_provider,
+                                    "route_profile": route_profile_name or None,
+                                    "provider_order": list(route_provider_order),
+                                    "requested_model": candidate_model,
+                                    "finish_reason": finish_reason,
+                                    "tools_offered": 0 if force_no_tools else len(tools),
+                                    "native_tool_calls": len(streamed_tool_calls),
+                                    "text_chars": len(full_text),
+                                    "latency_ms": round(
+                                        (time.monotonic() - round_started_at) * 1000
+                                    ),
+                                }
+                            )
+                            try:
+                                receipt_store.record_provider_round(
+                                    provider_round_records[-1]
                                 )
-                            # A route that cannot accept image input answers 404
-                            # ("No endpoints found that support image input").
-                            # Degrade to text-only and continue instead of
-                            # crashing the turn on raise_for_status().
-                            if (
-                                image_count_for_payload > 0
-                                and response.status_code == 404
-                                and "image" in body.lower()
-                                and _degrade_to_text_only()
-                            ):
-                                continue
-                            if attempt_idx < len(models_to_try) - 1 and (response.status_code in (400, 403, 429) or response.status_code >= 500):
-                                print(f" [RETRY] Moving to next model due to HTTP {response.status_code}")
-                                continue
-                            response.raise_for_status()
-
-                        async for line in response.aiter_lines():
-                            if not line: continue
-                            if USER_INTERRUPTS.get(uid) is not None:
-                                print(f"\\n [STREAM INTERRUPT] User paused generation.")
-                                full_text += "\\n[SYSTEM: Generation paused by user interrupt.]"
-                                was_interrupted = True
-                                break
-
-                            event = parse_stream_line(line, llm_provider)
-                            if event is None:
-                                continue
-                            if event.done and not event.delta:
-                                break
-                            delta = event.delta
-                            if event.finish_reason:
-                                finish_reason = event.finish_reason
-
-                            chunk = delta.get("content") or ""
-                            d_reasoning = (
-                                delta.get("reasoning")
-                                or delta.get("reasoning_content")
-                                or ""
-                            )
-                            if d_reasoning:
-                                reasoning_text += d_reasoning
-                            if chunk:
-                                if first_content_at is None:
-                                    first_content_at = time.monotonic()
-                                full_text += chunk
-                                chunk_count += 1
-                                if chunk_count % 100 == 0:
-                                    await _set_advisor_status(uid, phase="generating", output_chars=len(full_text), stream_chunks=chunk_count)
-                                # Self-throttled to ~1 edit/sec; skips until
-                                # there is renderable narrative content.
-                                _alt_preview = ""
-                                if not full_text.strip() and reasoning_text:
-                                    _rt = re.sub(r"\s+", " ", reasoning_text).strip()
-                                    if _rt:
-                                        _alt_preview = ("🤔 …" + _rt[-450:])[:1900]
-                                await update_live_preview(full_text, _alt_preview)
-
-                            delta_tool_calls = delta.get("tool_calls") or []
-                            for tc in delta_tool_calls:
-                                if llm_provider == "ollama":
-                                    func = tc.get("function") or {}
-                                    name = func.get("name")
-                                    args = func.get("arguments", {})
-                                    is_dupe = False
-                                    for existing in streamed_tool_calls.values():
-                                        e_func = existing.get("function", {})
-                                        if e_func.get("name") == name and e_func.get("arguments") == args:
-                                            is_dupe = True; break
-                                    if not is_dupe:
-                                        idx = len(streamed_tool_calls)
-                                        streamed_tool_calls[idx] = {"id": f"call_{idx}", "type": "function", "function": {"name": name, "arguments": args}}
-                                else:
-                                    index = tc.get("index", len(streamed_tool_calls))
-                                    existing = streamed_tool_calls.get(index)
-                                    if existing is None:
-                                        existing = {"id": tc.get("id") or f"call_{index}", "type": "function", "function": {"name": "", "arguments": ""}}
-                                        streamed_tool_calls[index] = existing
-                                    if tc.get("id"): existing["id"] = tc["id"]
-                                    f_delta = tc.get("function") or {}
-                                    if f_delta.get("name"): existing["function"]["name"] += f_delta["name"]
-                                    if f_delta.get("arguments"): existing["function"]["arguments"] += f_delta["arguments"]
-                        request_success = True
-                        provider_round_records.append(
-                            {
-                                "turn_id": turn_id,
-                                "provider": llm_provider,
-                                "route_profile": route_profile_name or None,
-                                "provider_order": list(route_provider_order),
-                                "requested_model": candidate_model,
-                                "finish_reason": finish_reason,
-                                "tools_offered": 0 if force_no_tools else len(tools),
-                                "native_tool_calls": len(streamed_tool_calls),
-                                "text_chars": len(full_text),
-                                "latency_ms": round(
-                                    (time.monotonic() - round_started_at) * 1000
-                                ),
-                            }
-                        )
-                        try:
-                            receipt_store.record_provider_round(
-                                provider_round_records[-1]
-                            )
-                        except Exception as observability_err:
-                            # Observability must never turn a valid provider
-                            # response into a failed tool turn.
+                            except Exception as observability_err:
+                                # Observability must never turn a valid provider
+                                # response into a failed tool turn.
+                                print(
+                                    " [PROVIDER OBSERVABILITY FAILED] "
+                                    f"{type(observability_err).__name__}: {observability_err}"
+                                )
                             print(
-                                " [PROVIDER OBSERVABILITY FAILED] "
-                                f"{type(observability_err).__name__}: {observability_err}"
+                                f" [STREAM STATS] uid={uid} model={candidate_model} "
+                                f"first_content_after={((first_content_at - round_started_at) if first_content_at else -1):.1f}s "
+                                f"chunks={chunk_count} chars={len(full_text)} "
+                                f"reasoning_chars={len(reasoning_text)} "
+                                f"finish_reason={finish_reason or 'unspecified'} "
+                                f"round_seconds={time.monotonic() - round_started_at:.1f}s"
                             )
-                        print(
-                            f" [STREAM STATS] uid={uid} model={candidate_model} "
-                            f"first_content_after={((first_content_at - round_started_at) if first_content_at else -1):.1f}s "
-                            f"chunks={chunk_count} chars={len(full_text)} "
-                            f"reasoning_chars={len(reasoning_text)} "
-                            f"finish_reason={finish_reason or 'unspecified'} "
-                            f"round_seconds={time.monotonic() - round_started_at:.1f}s"
-                        )
-            except (httpx.TimeoutException, httpx.RequestError) as e:
-                print(f" [{llm_provider.upper()} NETWORK ERROR] {e}")
-                if attempt_idx < len(models_to_try) - 1:
-                    print(f" [RETRY] Moving to next model due to network error.")
-                    continue
-                raise
-            if request_success:
-                # Some free OpenRouter routes return HTTP 200 with an empty
-                # stream. Treat that as a failed model attempt while tools are
-                # available, so the configured fallback model gets a chance.
-                # This happens before any native tool call, therefore it
-                # cannot duplicate a browser action.
-                if (
-                    not force_no_tools
-                    and not full_text.strip()
-                    and not streamed_tool_calls
-                ):
+                except (httpx.TimeoutException, httpx.RequestError) as e:
+                    print(f" [{llm_provider.upper()} NETWORK ERROR] {e}")
                     if attempt_idx < len(models_to_try) - 1:
-                        print(
-                            f" [RETRY] Moving to next model because {candidate_model} "
-                            "returned an empty tool-enabled stream."
-                        )
+                        print(f" [RETRY] Moving to next model due to network error.")
                         continue
-                    # Vision routes are flaky on the free tier; if the last
-                    # candidate returned nothing and the request carried
-                    # images, drop them and retry the text-only chain rather
-                    # than ending the turn with no output.
-                    if _degrade_to_text_only():
-                        continue
-                break
+                    raise
+                if request_success:
+                    # Some free OpenRouter routes return HTTP 200 with an empty
+                    # stream. Treat that as a failed model attempt while tools are
+                    # available, so the configured fallback model gets a chance.
+                    # This happens before any native tool call, therefore it
+                    # cannot duplicate a browser action.
+                    if (
+                        not force_no_tools
+                        and not full_text.strip()
+                        and not streamed_tool_calls
+                    ):
+                        if attempt_idx < len(models_to_try) - 1:
+                            print(
+                                f" [RETRY] Moving to next model because {candidate_model} "
+                                "returned an empty tool-enabled stream."
+                            )
+                            continue
+                        # Vision routes are flaky on the free tier; if the last
+                        # candidate returned nothing and the request carried
+                        # images, drop them and retry the text-only chain rather
+                        # than ending the turn with no output.
+                        if _degrade_to_text_only():
+                            continue
+                    break
 
-        tool_calls_detected = [streamed_tool_calls[index] for index in sorted(streamed_tool_calls)]
-        return full_text, tool_calls_detected
+            tool_calls_detected = [streamed_tool_calls[index] for index in sorted(streamed_tool_calls)]
+            return full_text, tool_calls_detected
+
+        from src.agent.scheduler import schedule_work
+
+        task_id = f"stream_{uuid.uuid4().hex[:8]}"
+        return await schedule_work(
+            task_id,
+            str(uid),
+            "interactive",
+            _do_stream_round,
+            unit_type="inference",
+            provider=llm_provider,
+        )
 
     def _iter_json_objects(text: str):
         """Yield (obj, start, end) for every balanced JSON object in text."""
@@ -8877,6 +8916,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                     receipt_store.start(receipt_id)
                     receipt_started = True
+                    tool_started_at = time.monotonic()
 
                     tool_call_counts[func_name] = tool_call_counts.get(func_name, 0) + 1
 
@@ -11020,6 +11060,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         print(f" [RECEIPT UNKNOWN] {func_name}: {receipt_err}")
 
                 if receipt_started:
+                    try:
+                        from src.agent.scheduler import get_global_scheduler
+                        get_global_scheduler().metrics.record_tool(time.monotonic() - tool_started_at)
+                    except Exception:
+                        pass
                     _record_durable_tool_call(
                         user_id=uid,
                         tool_name=func_name or "unknown_tool",
@@ -11859,48 +11904,54 @@ async def auto_extract_and_persist_claims(prompt_text: str, user_id: str):
 
     try:
         provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-        extracted_claims = []
 
-        if provider == "openai":
-            openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
-            openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            payload = {
-                "model": openai_model,
-                "messages": [
-                    {"role": "system", "content": extract_sys},
-                    {"role": "user", "content": user_msg}
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.0,
-                "max_tokens": 400
-            }
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.post(openai_url, json=payload, headers=headers)
-                if res.status_code == 200:
-                    raw = res.json()["choices"][0]["message"]["content"]
-                    parsed = json.loads(raw)
-                    extracted_claims = parsed.get("claims", [])
-        else:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                res = await client.post(
-                    OLLAMA_URL,
-                    json={
-                        "model": src.core.state.ADVISOR_MODEL,
-                        "messages": [
-                            {"role": "system", "content": extract_sys},
-                            {"role": "user", "content": user_msg}
-                        ],
-                        "format": "json",
-                        "stream": False,
-                        "options": {"temperature": 0.0, "num_predict": 400}
-                    }
-                )
-                if res.status_code == 200:
-                    raw = res.json().get("message", {}).get("content", "")
-                    parsed = json.loads(raw)
-                    extracted_claims = parsed.get("claims", [])
+        async def _do_extract_claims():
+            claims = []
+            if provider == "openai":
+                openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
+                openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+                api_key = os.getenv("OPENAI_API_KEY", "")
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                payload = {
+                    "model": openai_model,
+                    "messages": [
+                        {"role": "system", "content": extract_sys},
+                        {"role": "user", "content": user_msg}
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.0,
+                    "max_tokens": 400
+                }
+                async with provider_capacity("openai"), httpx.AsyncClient(timeout=15.0) as client:
+                    res = await client.post(openai_url, json=payload, headers=headers)
+                    if res.status_code == 200:
+                        raw = res.json()["choices"][0]["message"]["content"]
+                        parsed = json.loads(raw)
+                        claims = parsed.get("claims", [])
+            else:
+                async with provider_capacity("ollama"), httpx.AsyncClient(timeout=20.0) as client:
+                    res = await client.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": src.core.state.ADVISOR_MODEL,
+                            "messages": [
+                                {"role": "system", "content": extract_sys},
+                                {"role": "user", "content": user_msg}
+                            ],
+                            "format": "json",
+                            "stream": False,
+                            "options": {"temperature": 0.0, "num_predict": 400}
+                        }
+                    )
+                    if res.status_code == 200:
+                        raw = res.json().get("message", {}).get("content", "")
+                        parsed = json.loads(raw)
+                        claims = parsed.get("claims", [])
+            return claims
+
+        extracted_claims = await schedule_work(
+            f"claims_{uuid.uuid4().hex[:8]}", str(user_id), "background", _do_extract_claims, unit_type="inference", provider=provider
+        )
 
         for cl in extracted_claims:
             val = str(cl.get("value", "")).strip()
@@ -11972,7 +12023,7 @@ async def _compress_session_history(uid: str):
         if not block_text:
             return
 
-        digest = await _summarize_history_block(block_text)
+        digest = await _summarize_history_block(block_text, uid=uid)
         if not digest or not digest.strip():
             print(f" [COMPRESSION] uid={uid} digest empty, keeping raw block")
             return
@@ -11998,7 +12049,7 @@ async def _compress_session_history(uid: str):
         SESSION_COMPRESSION_INFLIGHT.discard(uid)
 
 
-async def _summarize_history_block(block_text: str) -> str:
+async def _summarize_history_block(block_text: str, uid: str = "system") -> str:
     """One dense digest for a folded block. Mirrors the background claim extractor."""
     summarize_sys = (
         "You are Delilah's Session History Compactor.\n"
@@ -12011,41 +12062,47 @@ async def _summarize_history_block(block_text: str) -> str:
     user_msg = f"Conversation block:\n{block_text}"
     try:
         provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-        if provider == "openai":
-            openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
-            openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            payload = {
-                "model": openai_model,
-                "messages": [
-                    {"role": "system", "content": summarize_sys},
-                    {"role": "user", "content": user_msg}
-                ],
-                "temperature": 0.2,
-                "max_tokens": 400
-            }
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                res = await client.post(openai_url, json=payload, headers=headers)
-                if res.status_code == 200:
-                    return res.json()["choices"][0]["message"]["content"]
-        else:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                res = await client.post(
-                    OLLAMA_URL,
-                    json={
-                        "model": src.core.state.ADVISOR_MODEL,
-                        "messages": [
-                            {"role": "system", "content": summarize_sys},
-                            {"role": "user", "content": user_msg}
-                        ],
-                        "stream": False,
-                        "options": {"temperature": 0.2, "num_predict": 400}
-                    }
-                )
-                if res.status_code == 200:
-                    return res.json().get("message", {}).get("content", "")
-        return ""
+
+        async def _do_summarize():
+            if provider == "openai":
+                openai_url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
+                openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+                api_key = os.getenv("OPENAI_API_KEY", "")
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                payload = {
+                    "model": openai_model,
+                    "messages": [
+                        {"role": "system", "content": summarize_sys},
+                        {"role": "user", "content": user_msg}
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 400
+                }
+                async with provider_capacity("openai"), httpx.AsyncClient(timeout=20.0) as client:
+                    res = await client.post(openai_url, json=payload, headers=headers)
+                    if res.status_code == 200:
+                        return res.json()["choices"][0]["message"]["content"]
+            else:
+                async with provider_capacity("ollama"), httpx.AsyncClient(timeout=20.0) as client:
+                    res = await client.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": src.core.state.ADVISOR_MODEL,
+                            "messages": [
+                                {"role": "system", "content": summarize_sys},
+                                {"role": "user", "content": user_msg}
+                            ],
+                            "stream": False,
+                            "options": {"temperature": 0.2, "num_predict": 400}
+                        }
+                    )
+                    if res.status_code == 200:
+                        return res.json().get("message", {}).get("content", "")
+            return ""
+
+        return await schedule_work(
+            f"summarize_{uuid.uuid4().hex[:8]}", str(uid), "background", _do_summarize, unit_type="inference", provider=provider
+        )
     except Exception as e:
         print(f" [COMPRESSION SUMMARIZE ERROR] {e}")
         return ""
@@ -12431,7 +12488,10 @@ async def cancel_advisor(ctx: commands.Context):
         return
     # Persistent hard-cancel marker.
     USER_INTERRUPTS.pop(uid, None)
-    dropped_queue = len(PENDING_ADVISOR_MESSAGES.pop(uid, []))
+    from src.agent.scheduler import get_global_scheduler
+
+    dropped_sched = get_global_scheduler().cancel_owner_work(uid)
+    dropped_queue = len(PENDING_ADVISOR_MESSAGES.pop(uid, [])) + dropped_sched
 
     ADVISOR_STATUS.setdefault(uid, {})["cancel_requested"] = True
 
@@ -12485,7 +12545,11 @@ async def advisor_status(ctx: commands.Context):
         tools = int(state.get("tool_calls", 0) or 0)
         chars = int(state.get("output_chars", 0) or 0)
         cancelled = bool(state.get("cancelled", False))
-        queued = len(PENDING_ADVISOR_MESSAGES.get(uid, []))
+        from src.agent.scheduler import get_global_scheduler
+        queued = max(
+            len(PENDING_ADVISOR_MESSAGES.get(uid, [])),
+            len(get_global_scheduler().get_owner_queue(uid).interactive_lane),
+        )
 
         if running:
             title = " Advisor Running"

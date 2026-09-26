@@ -76,52 +76,63 @@ IMPORTANT: You are formulating empirical hypotheses. Ground every insight strict
 """
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            res = await client.post(
-                OLLAMA_URL,
-                json={
-                    "model": ADVISOR_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": tx_data}
-                    ],
-                    "format": "json",
-                    "stream": False
-                }
-            )
-            if res.status_code != 200:
-                return f"Analyst LLM failed: {res.status_code}"
-                
-            response_data = res.json()["message"]["content"]
-            insights = json.loads(response_data)
-            
-            saved_count = 0
-            for insight in insights:
-                text = insight.get("insight")
-                if text:
-                    await save_epistemic_memory(
-                        user_id=user_id,
-                        content=text,
-                        memory_type="hypothesis",
-                        provenance_type="llm_inferred",
-                        confidence=float(insight.get("confidence", 0.5)),
-                        evidence_refs=[str(e) for e in insight.get("evidence_refs", [])]
+        import uuid
+        from src.agent.scheduler import provider_capacity, schedule_work
+
+        async def _do_analyst():
+            async with provider_capacity("ollama"):
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    res = await client.post(
+                        OLLAMA_URL,
+                        json={
+                            "model": ADVISOR_MODEL,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": tx_data}
+                            ],
+                            "format": "json",
+                            "stream": False
+                        }
                     )
-                    saved_count += 1
+                    if res.status_code != 200:
+                        return f"Analyst LLM failed: {res.status_code}", None
+                    return None, res.json()["message"]["content"]
+
+        task_id = f"analyst_{uuid.uuid4().hex[:8]}"
+        err, response_data = await schedule_work(
+            task_id, str(user_id), "background", _do_analyst, unit_type="inference"
+        )
+        if err:
+            return err
+        insights = json.loads(response_data)
             
-            # Update state
-            with sqlite3.connect(DB_PATH) as conn:
-                c = conn.cursor()
-                c.execute("""
-                    INSERT INTO analyst_state (user_id, last_analyzed_tx_id, last_run_at)
-                    VALUES (?, ?, datetime('now'))
-                    ON CONFLICT(user_id) DO UPDATE SET 
-                    last_analyzed_tx_id = excluded.last_analyzed_tx_id,
-                    last_run_at = excluded.last_run_at
-                """, (user_id, max_id))
-                conn.commit()
-                
-            return f"Analyst run complete: Generated {saved_count} hypotheses from {len(txs)} transactions."
+        saved_count = 0
+        for insight in insights:
+            text = insight.get("insight")
+            if text:
+                await save_epistemic_memory(
+                    user_id=user_id,
+                    content=text,
+                    memory_type="hypothesis",
+                    provenance_type="llm_inferred",
+                    confidence=float(insight.get("confidence", 0.5)),
+                    evidence_refs=[str(e) for e in insight.get("evidence_refs", [])]
+                )
+                saved_count += 1
+        
+        # Update state
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO analyst_state (user_id, last_analyzed_tx_id, last_run_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(user_id) DO UPDATE SET 
+                last_analyzed_tx_id = excluded.last_analyzed_tx_id,
+                last_run_at = excluded.last_run_at
+            """, (user_id, max_id))
+            conn.commit()
+            
+        return f"Analyst run complete: Generated {saved_count} hypotheses from {len(txs)} transactions."
             
     except Exception as e:
         return f"Analyst run failed: {str(e)}"

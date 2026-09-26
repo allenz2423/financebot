@@ -178,14 +178,24 @@ class DecisionProvider:
             headers["Authorization"] = f"Bearer {self.cloud_api_key}"
         payload = request.as_payload(self.model)
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(
-                    self.url,
-                    headers=headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-                data = response.json()
+            import uuid
+            from src.agent.scheduler import provider_capacity, schedule_work
+
+            async def _do_kev():
+                async with provider_capacity("kev"):
+                    async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                        response = await client.post(
+                            self.url,
+                            headers=headers,
+                            json=payload,
+                        )
+                        response.raise_for_status()
+                        return response.json()
+
+            data = await schedule_work(
+                f"kev_{uuid.uuid4().hex[:8]}", "system", "background", _do_kev,
+                unit_type="inference", provider="kev"
+            )
         except Exception as exc:
             raise DecisionUnavailable(
                 f"Kev request failed: {type(exc).__name__}: {exc}"
