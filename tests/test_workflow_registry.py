@@ -54,7 +54,8 @@ def test_registration_validates_tool_names_and_rejects_unknown_tools():
 
 @pytest.mark.parametrize("control_tool", [
     "await_user", "delegate_task", "enable_reasoning", "end_turn",
-    "explore_domain", "load_tool_schemas", "search_tools", "task_cancel",
+    "explore_domain", "inspect_task", "load_tool_schemas", "search_tools",
+    "steer_task", "task_cancel",
     "task_list", "task_plan",
 ])
 def test_registration_rejects_every_plan_control_tool(control_tool):

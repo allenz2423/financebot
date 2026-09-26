@@ -191,6 +191,12 @@ _TASK_CANCEL_REQUEST = re.compile(
     r"(?:\s+(?:now|please))?\s*[.!?]*$",
     re.IGNORECASE,
 )
+_TASK_STEER_REQUEST = re.compile(
+    r"^\s*(?:please\s+)?(?:steer|correct|redirect)\s+(?:task\s+)?step\s+"
+    r"(?P<step_id>[A-Za-z0-9_.:-]{1,128})\s*:\s*"
+    r"(?P<correction>[\s\S]{2,500})\s*$",
+    re.IGNORECASE,
+)
 _PULL_ONLY_PERMISSION = MutationPermission(
     tool_name="sync_plaid_accounting",
     exact_arguments=(
@@ -335,6 +341,28 @@ def build_autonomy_contract(
             explicit_mutation_intent="task_cancel",
         )
 
+    task_steer_match = _TASK_STEER_REQUEST.fullmatch(text)
+    if task_steer_match:
+        step_id = task_steer_match.group("step_id")
+        correction = task_steer_match.group("correction").strip()
+        return _contract(
+            "execute",
+            "Apply the user's guidance only to the named unstarted task step.",
+            initiative=("Inspect the exact conversation-scoped task step before steering",),
+            evidence=("A persisted correction event linked to the exact step ID",),
+            completion=("Report whether guidance was recorded; do not claim the step ran",),
+            permissions=(
+                MutationPermission(
+                    "steer_task",
+                    (("step_id", step_id), ("correction", correction)),
+                    target_scope="task_step",
+                    target_value=step_id,
+                ),
+            ),
+            required_tools=frozenset({"steer_task"}),
+            explicit_mutation_intent="steer_task",
+        )
+
     if _MONITOR.search(text):
         if _EXPLICIT_MONITOR_CREATE.search(text):
             return _contract(
@@ -473,6 +501,20 @@ def mutation_allowed(
                     permission.target_value is None
                     or arguments.get("task_id") == permission.target_value
                 )
+            )
+        if permission.target_scope == "task_step":
+            expected = dict(permission.exact_arguments)
+            supplied = dict(arguments)
+            return (
+                tool_name == "steer_task"
+                and set(supplied) == {"task_id", "step_id", "correction"}
+                and isinstance(supplied.get("task_id"), str)
+                and bool(supplied.get("task_id", "").strip())
+                and supplied.get("step_id") == permission.target_value
+                and supplied.get("step_id") == expected.get("step_id")
+                and supplied.get("correction") == expected.get("correction")
+                and isinstance(supplied.get("correction"), str)
+                and 1 <= len(supplied["correction"]) <= 500
             )
         if permission.target_scope == "exact_instruction":
             expected = dict(permission.exact_arguments)

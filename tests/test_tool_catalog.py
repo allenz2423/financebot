@@ -82,6 +82,34 @@ def test_task_list_is_registered_as_read_only_durable_progress_lookup():
     assert "task_list" not in llm.MUTATION_TOOLS
 
 
+def test_inspect_and_steer_tools_are_bounded_control_tools():
+    import src.services.llm as llm
+
+    assert {"inspect_task", "steer_task"} <= llm.KNOWN_TOOLS
+    assert {"inspect_task", "steer_task"} <= llm.EXPECTED_TOOL_NAMES
+    assert "inspect_task" in llm._INPUT_ONLY_REPLY_ALLOWED_TOOLS
+    assert "steer_task" not in llm._INPUT_ONLY_REPLY_ALLOWED_TOOLS
+    assert not llm._tool_requires_durable_plan("inspect_task")
+    assert not llm._tool_requires_durable_plan("steer_task")
+    inspect_schema = next(
+        tool["function"] for tool in llm.BOT_TOOLS_SCHEMA
+        if tool["function"]["name"] == "inspect_task"
+    )
+    steer_schema = next(
+        tool["function"] for tool in llm.BOT_TOOLS_SCHEMA
+        if tool["function"]["name"] == "steer_task"
+    )
+    assert inspect_schema["parameters"]["required"] == ["task_id"]
+    assert inspect_schema["parameters"]["properties"]["detail_level"]["enum"] == [
+        "summary", "trace",
+    ]
+    assert steer_schema["parameters"]["required"] == [
+        "task_id", "step_id", "correction",
+    ]
+    assert steer_schema["parameters"]["properties"]["correction"]["maxLength"] == 500
+    assert "never dispatches or retries" in steer_schema["description"]
+
+
 def test_task_plan_is_bounded_and_multi_action_policy_is_deterministic():
     import src.services.llm as llm
 
@@ -203,6 +231,13 @@ def test_task_plan_selects_either_manual_steps_or_an_exact_workflow_pin():
     )
     assert llm._durable_plan_batch_error(
         ["task_plan"], required=True, has_plan=False, audit_active=False
+    ) is None
+    assert llm._durable_plan_batch_error(
+        ["steer_task", "query_spending"], required=False,
+        has_plan=True, audit_active=False,
+    )
+    assert llm._durable_plan_batch_error(
+        ["steer_task"], required=False, has_plan=True, audit_active=False,
     ) is None
     assert llm._durable_plan_batch_error(
         ["search_gmail"], required=True, has_plan=True, audit_active=False

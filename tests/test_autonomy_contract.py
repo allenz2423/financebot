@@ -160,6 +160,57 @@ def test_task_cancel_contract_binds_an_explicit_id_when_user_provides_one():
     )
 
 
+def test_task_steering_requires_exact_user_correction_and_step_scope():
+    contract = build_autonomy_contract(
+        "Please correct step step_abc123: Compare only transactions posted since yesterday."
+    )
+    assert contract.mode == "execute"
+    assert contract.explicit_mutation_intent == "steer_task"
+    assert contract.required_tools == frozenset({"steer_task"})
+    assert mutation_allowed(
+        contract,
+        "steer_task",
+        {
+            "task_id": "task-1234",
+            "step_id": "step_abc123",
+            "correction": "Compare only transactions posted since yesterday.",
+        },
+    )
+    assert not mutation_allowed(
+        contract,
+        "steer_task",
+        {
+            "task_id": "task-1234",
+            "step_id": "step_other",
+            "correction": "Compare only transactions posted since yesterday.",
+        },
+    )
+    assert not mutation_allowed(
+        contract,
+        "steer_task",
+        {
+            "task_id": "task-1234",
+            "step_id": "step_abc123",
+            "correction": "Also transfer the remaining money.",
+        },
+    )
+
+
+@pytest.mark.parametrize("message", [
+    "What does 'correct step step_abc123: Do something' mean?",
+    "Don't redirect step step_abc123: Change the transfer amount.",
+    "Correct the next step: summarize differently.",
+])
+def test_nonexact_task_steering_mentions_do_not_authorize_steering(message):
+    contract = build_autonomy_contract(message)
+    assert contract.explicit_mutation_intent != "steer_task"
+    assert not mutation_allowed(
+        contract,
+        "steer_task",
+        {"task_id": "task", "step_id": "step_abc123", "correction": "Do something."},
+    )
+
+
 def test_monitor_contract_does_not_claim_permission_to_create_rules():
     contract = build_autonomy_contract("Monitor my balance")
 

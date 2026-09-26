@@ -170,6 +170,48 @@ def test_autonomy_dispatch_gate_denies_unrequested_mutation_and_enforces_order()
     ).startswith("AUTONOMY_WORKFLOW_STEP_ALREADY_CONFIRMED")
 
 
+def test_steer_dispatch_requires_the_exact_explicit_user_correction():
+    allowed_contract = build_autonomy_contract(
+        "Correct step step-1234: Compare only transactions from the past week."
+    )
+    correct_args = {
+        "task_id": "task-1234", "step_id": "step-1234",
+        "correction": "Compare only transactions from the past week.",
+    }
+    assert _autonomy_contract_dispatch_denial(
+        allowed_contract, "steer_task", correct_args, set()
+    ) is None
+    assert _autonomy_contract_dispatch_denial(
+        allowed_contract,
+        "steer_task",
+        {**correct_args, "step_id": "another-step"},
+        set(),
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+    assert _autonomy_contract_dispatch_denial(
+        build_autonomy_contract("Continue where we left off", has_active_task=True),
+        "steer_task",
+        correct_args,
+        set(),
+    ).startswith("AUTONOMY_CONTRACT_DENIED")
+
+
+def test_final_response_for_steering_never_claims_step_execution():
+    contract = build_autonomy_contract("Correct step step-1234: Use the last 30 days.")
+    not_recorded = _autonomy_contract_final_response(
+        contract, "I fixed the task.", set(), steer_task_status=None
+    )
+    assert "did not record" in not_recorded
+    ambiguous = _autonomy_contract_final_response(
+        contract, "Done.", {"steer_task"}, steer_task_status="unknown"
+    )
+    assert "could not confirm" in ambiguous
+    recorded = _autonomy_contract_final_response(
+        contract, "The task is done.", {"steer_task"}, steer_task_status="confirmed"
+    )
+    assert "recorded your guidance" in recorded
+    assert "did not execute the step" in recorded
+
+
 def test_dispatch_boundary_limits_delegation_in_narrow_intent_modes():
     for message in (
         "Monitor my balance",

@@ -24,8 +24,8 @@ _SCHEMA_KEYS = frozenset({"type", "properties", "required", "additionalPropertie
 _MAX_SCHEMA_DEPTH = 6
 _CONTROL_TOOL_NAMES = frozenset({
     "await_user", "delegate_task", "enable_reasoning", "end_turn",
-    "explore_domain", "load_tool_schemas", "search_tools", "task_cancel",
-    "task_list", "task_plan",
+    "explore_domain", "inspect_task", "load_tool_schemas", "search_tools",
+    "steer_task", "task_cancel", "task_list", "task_plan",
 })
 
 

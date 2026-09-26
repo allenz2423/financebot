@@ -63,6 +63,7 @@ _TASK_STATUSES = {
 }
 _TASK_STEP_STATUSES = _TASK_STATUSES | {"pending", "ready", "skipped"}
 _TASK_LANES = {"interactive", "background"}
+_MAX_TASK_STEERING_CORRECTION = 2000
 _ALLOWED_TASK_EVENT_KEYS = {
     "status", "lane", "from", "to", "version", "expectedversion",
     "steporder", "dependencyids", "nextaction", "reasoncode", "waitreason",
@@ -598,6 +599,7 @@ class SessionStore:
         *,
         channel_id: str | None = None,
         thread_id: str | None = None,
+        expected_steering_event_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically persist an ordered provider tool block and its task event."""
         owner = _required(user_id, "user_id")
@@ -620,6 +622,17 @@ class SessionStore:
 
         with self._write() as conn:
             task = self._task_pk(conn, owner, task_key)
+            if expected_steering_event_id is not None:
+                latest_steering = conn.execute(
+                    """SELECT COALESCE(MAX(event_id), 0) AS event_id
+                       FROM task_events
+                       WHERE task_id=? AND event_type='task.step_steered'""",
+                    (task_key,),
+                ).fetchone()
+                if int(latest_steering["event_id"]) != int(expected_steering_event_id):
+                    raise ConcurrentTaskUpdate(
+                        "task steering changed after the model prompt snapshot"
+                    )
             session = self._ensure_session(conn, scope, None)
             session_pk = int(session["id"])
             if int(task["session_id"]) != session_pk:
@@ -1805,6 +1818,121 @@ class SessionStore:
                 conn.execute("SELECT * FROM task_events WHERE event_id=?", (event_id,)).fetchone()
             )  # type: ignore[return-value]
 
+    def steer_task_step(
+        self,
+        user_id: str,
+        task_id: str,
+        step_id: str,
+        correction: str,
+        *,
+        expected_task_version: int,
+        expected_step_version: int,
+    ) -> dict[str, Any]:
+        """Persist a bounded correction for one claimable step with task+step CAS.
+
+        Steering is intentionally metadata-only: the correction is stored in an
+        append-only task event, while tool arguments and receipt state remain
+        owned by the execution/receipt layers.
+        """
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        step_key = _required(step_id, "step_id")
+        correction_text = _required(correction, "correction")
+        if len(correction_text) > _MAX_TASK_STEERING_CORRECTION:
+            raise ValueError(
+                f"correction must be at most {_MAX_TASK_STEERING_CORRECTION} characters"
+            )
+        task_version = int(expected_task_version)
+        step_version = int(expected_step_version)
+        if task_version < 0 or step_version < 0:
+            raise ValueError("expected task and step versions must be non-negative")
+
+        now = _now()
+        with self._write() as conn:
+            task = self._task_pk(conn, owner, task_key)
+            if task["status"] not in {"queued", "running"}:
+                raise InvalidLifecycleTransition(
+                    f"cannot steer a task in {task['status']} state"
+                )
+            if task["phase"] not in {None, "received", "planning"}:
+                raise InvalidLifecycleTransition(
+                    f"cannot steer a task while it is in {task['phase']} phase"
+                )
+
+            # The owner-scoped task lookup above is part of the same write
+            # transaction, and the step predicate prevents cross-task IDs.
+            step = conn.execute(
+                "SELECT status, version, receipt_id FROM task_steps WHERE task_id=? AND step_id=?",
+                (task_key, step_key),
+            ).fetchone()
+            if step is None:
+                raise TaskNotFound("task step is not present in the requested owner scope")
+            if step["status"] not in {"pending", "ready"}:
+                raise InvalidLifecycleTransition(
+                    f"cannot steer a {step['status']} task step"
+                )
+            running_step = conn.execute(
+                "SELECT 1 FROM task_steps WHERE task_id=? AND status='running' LIMIT 1",
+                (task_key,),
+            ).fetchone()
+            if running_step is not None:
+                raise InvalidLifecycleTransition("cannot steer while a task step is running")
+            if step["receipt_id"] is not None:
+                if not self._has_table("tool_receipts"):
+                    raise InvalidLifecycleTransition("cannot verify the step receipt before steering")
+                receipt = conn.execute(
+                    "SELECT user_id, status FROM tool_receipts WHERE receipt_id=?",
+                    (str(step["receipt_id"]),),
+                ).fetchone()
+                if receipt is None or str(receipt["user_id"]) != owner:
+                    raise InvalidLifecycleTransition("cannot verify the step receipt before steering")
+                if str(receipt["status"]) in {"started", "unknown", "confirmed"}:
+                    raise InvalidLifecycleTransition(
+                        "cannot steer a step with started, unknown, or confirmed receipt evidence"
+                    )
+
+            task_cursor = conn.execute(
+                """UPDATE task_runs SET version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND version=? AND status=?""",
+                (now, task_key, owner, task_version, task["status"]),
+            )
+            if task_cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task version changed before steering")
+
+            step_cursor = conn.execute(
+                """UPDATE task_steps SET version=version+1, updated_at=?
+                   WHERE task_id=? AND step_id=? AND version=? AND status=?
+                     AND status IN ('pending', 'ready')""",
+                (now, task_key, step_key, step_version, step["status"]),
+            )
+            if step_cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("task-step version changed before steering")
+
+            event_id = self._insert_task_event(
+                conn,
+                task_id=task_key,
+                step_id=step_key,
+                event_type="task.step_steered",
+                payload={
+                    "steered_step_id": step_key,
+                    "correction": correction_text,
+                    "expected_version": task_version,
+                    "version": task_version + 1,
+                },
+            )
+            return {
+                "task": self._row(conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id=?", (task_key,)
+                ).fetchone()),
+                "step": self._row(conn.execute(
+                    "SELECT * FROM task_steps WHERE task_id=? AND step_id=?",
+                    (task_key, step_key),
+                ).fetchone()),
+                "event": self._row(conn.execute(
+                    "SELECT * FROM task_events WHERE event_id=?", (event_id,)
+                ).fetchone()),
+            }  # type: ignore[return-value]
+
     def get_task_step(self, user_id: str, task_id: str, step_id: str) -> dict[str, Any]:
         owner = _required(user_id, "user_id")
         task_key = _required(task_id, "task_id")
@@ -1838,6 +1966,123 @@ class SessionStore:
                 (task_key, bounded_limit),
             ).fetchall()
             return [self._row(row) for row in rows]  # type: ignore[misc]
+
+    def list_task_trace_steps(
+        self, user_id: str, task_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Return bounded step trace references without raw arguments/results."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        bounded_limit = max(1, min(int(limit), 20))
+        with self._lock:
+            self._task_pk(self.connection, owner, task_key)
+            rows = self.connection.execute(
+                """SELECT step_id, step_order, status, retry_count, next_action,
+                          description, completion_criteria, tool_call_id, receipt_id, version
+                   FROM task_steps WHERE task_id=?
+                   ORDER BY step_order, step_id LIMIT ?""",
+                (task_key, bounded_limit),
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
+    def list_task_steering_events(
+        self, user_id: str, task_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Return bounded owner-scoped steering audit entries, newest first."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        bounded_limit = max(1, min(int(limit), 20))
+        with self._lock:
+            self._task_pk(self.connection, owner, task_key)
+            rows = self.connection.execute(
+                """SELECT event_id, task_id, step_id, event_type, payload_json, created_at
+                   FROM task_events WHERE task_id=? AND event_type='task.step_steered'
+                   ORDER BY event_id DESC LIMIT ?""",
+                (task_key, bounded_limit),
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
+    def latest_task_step_guidance(
+        self, user_id: str, task_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Return the newest guidance event per currently steerable step."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        bounded_limit = max(1, min(int(limit), 20))
+        with self._lock:
+            self._task_pk(self.connection, owner, task_key)
+            rows = self.connection.execute(
+                """WITH ranked AS (
+                       SELECT e.event_id, e.task_id, e.step_id, e.event_type,
+                              e.payload_json, e.created_at,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY e.step_id ORDER BY e.event_id DESC
+                              ) AS rank
+                       FROM task_events e
+                       JOIN task_steps s ON s.task_id=e.task_id AND s.step_id=e.step_id
+                       WHERE e.task_id=? AND e.event_type='task.step_steered'
+                         AND s.status IN ('ready','pending')
+                   )
+                   SELECT event_id, task_id, step_id, event_type, payload_json, created_at
+                   FROM ranked WHERE rank=1 ORDER BY event_id DESC LIMIT ?""",
+                (task_key, bounded_limit),
+            ).fetchall()
+            return [self._row(row) for row in rows]  # type: ignore[misc]
+
+    def task_prompt_snapshot(self, user_id: str, task_id: str) -> dict[str, Any]:
+        """Read a task version and its latest open-step guidance atomically.
+
+        The explicit read transaction ensures the version and guidance rows
+        describe the same database snapshot, including when another SQLite
+        connection commits a steering event between these two reads.
+        """
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        with self._lock:
+            conn = self.connection
+            try:
+                conn.execute("BEGIN")
+                task = self._task_pk(conn, owner, task_key)
+                latest_event = conn.execute(
+                    """SELECT COALESCE(MAX(event_id), 0) AS event_id
+                       FROM task_events
+                       WHERE task_id=? AND event_type='task.step_steered'""",
+                    (task_key,),
+                ).fetchone()
+                rows = conn.execute(
+                    """WITH ranked AS (
+                           SELECT e.event_id, e.task_id, e.step_id, e.event_type,
+                                  e.payload_json, e.created_at,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY e.step_id ORDER BY e.event_id DESC
+                                  ) AS rank
+                           FROM task_events e
+                           JOIN task_steps s ON s.task_id=e.task_id AND s.step_id=e.step_id
+                           WHERE e.task_id=? AND e.event_type='task.step_steered'
+                             AND s.status IN ('ready','pending')
+                       )
+                       SELECT event_id, step_id, payload_json, created_at
+                       FROM ranked WHERE rank=1 ORDER BY event_id DESC LIMIT 20""",
+                    (task_key,),
+                ).fetchall()
+                result = {
+                    "task_version": int(task["version"]),
+                    "latest_steering_event_id": int(latest_event["event_id"]),
+                    "guidance": [
+                        {
+                            "step_id": str(row["step_id"]),
+                            "correction": self._row(row)["payload"]["correction"],
+                            "event_id": int(row["event_id"]),
+                            "created_at": str(row["created_at"]),
+                        }
+                        for row in rows
+                    ],
+                }
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
 
     def has_confirmed_task_call(
         self, user_id: str, task_id: str, *, tool_name: str, arguments: Any
