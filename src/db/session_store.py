@@ -80,7 +80,7 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "turnid", "delegationgrantid", "allowedtools", "budget", "maxsteps", "timeoutseconds", "maxtokens",
     "terminalchildids", "childtaskids",
     "passed", "checks", "checkid", "checkids", "failedcheckids",
-    "reasoncodes", "evidencerefs",
+    "reasoncodes", "evidencerefs", "originturnid",
 }
 _UNSET = object()
 
@@ -536,6 +536,68 @@ class SessionStore:
                 raise SessionNotFound("message is not present in the requested owner scope")
             return self._row(row)  # type: ignore[return-value]
 
+    def get_task_origin_user_messages(
+        self,
+        user_id: str,
+        task_id: str,
+        session_id: str,
+        *,
+        channel_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Return only user messages from a task's explicitly recorded origin turn.
+
+        This is an exact provenance lookup: legacy tasks without an
+        ``origin_turn_id`` return no rows, and there is deliberately no search
+        or task-id parsing fallback. The returned shape excludes internal row
+        IDs, assistant messages, metadata, and all other conversation content.
+        """
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        scope = self._scope(owner, session_id, channel_id, thread_id)
+        with self._lock:
+            task = self.connection.execute(
+                """SELECT t.session_id FROM task_runs t
+                   JOIN sessions s ON s.id=t.session_id
+                   WHERE t.task_id=? AND t.user_id=? AND s.user_id=?
+                     AND s.session_key=? AND s.channel_id=? AND s.thread_id=?""",
+                (task_key, owner, owner, *scope[1:]),
+            ).fetchone()
+            if task is None:
+                raise TaskNotFound("task is not present in the requested owner/session scope")
+
+            created = self.connection.execute(
+                """SELECT payload_json FROM task_events
+                   WHERE task_id=? AND event_type='task.created'
+                   ORDER BY event_id LIMIT 1""",
+                (task_key,),
+            ).fetchone()
+            if created is None:
+                return []
+            payload = _decode(created["payload_json"], {})
+            origin_turn_key = payload.get("origin_turn_id") if isinstance(payload, Mapping) else None
+            if not isinstance(origin_turn_key, str) or not origin_turn_key.strip():
+                return []
+
+            rows = self.connection.execute(
+                """SELECT m.message_key, tr.turn_key, m.content
+                   FROM messages m
+                   JOIN turns tr ON tr.id=m.turn_id AND tr.session_id=m.session_id
+                   JOIN sessions s ON s.id=m.session_id
+                   WHERE m.session_id=? AND tr.turn_key=? AND m.role='user'
+                     AND s.user_id=? AND s.session_key=? AND s.channel_id=? AND s.thread_id=?
+                   ORDER BY m.id""",
+                (int(task["session_id"]), origin_turn_key, owner, *scope[1:]),
+            ).fetchall()
+            return [
+                {
+                    "message_key": str(row["message_key"]),
+                    "turn_key": str(row["turn_key"]),
+                    "content": str(row["content"]),
+                }
+                for row in rows
+            ]
+
     def record_tool_call(
         self, user_id: str, session_id: str, *, tool_name: str, arguments: Any = None,
         call_id: str | None = None, turn_id: str | None = None, status: str = "pending",
@@ -756,6 +818,7 @@ class SessionStore:
         lane: str = "interactive",
         channel_id: str | None = None,
         thread_id: str | None = None,
+        origin_turn_id: str | None = None,
     ) -> dict[str, Any]:
         scope = self._scope(user_id, session_id, channel_id, thread_id)
         task_key = _required(task_id or f"task_{uuid.uuid4().hex}", "task_id")
@@ -787,7 +850,12 @@ class SessionStore:
             )
             self._insert_task_event(
                 conn, task_id=task_key, event_type="task.created",
-                payload={"status": task_status, "lane": task_lane},
+                payload={
+                    "status": task_status,
+                    "lane": task_lane,
+                    **({"origin_turn_id": _required(origin_turn_id, "origin_turn_id")}
+                       if origin_turn_id is not None else {}),
+                },
             )
             return self._row(
                 conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()

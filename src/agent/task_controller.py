@@ -75,6 +75,7 @@ class TaskController:
             return self.store.create_task_run(
                 user_id, session_id, objective[:2000], task_id=task_id,
                 channel_id=channel_id, thread_id=thread_id,
+                origin_turn_id=turn_id,
             )
         except Exception:
             # Idempotent runtime-hook re-entry may encounter a task already
