@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import contextvars
 from dataclasses import dataclass, field
 import os
@@ -256,7 +257,9 @@ class CapacityAwareScheduler:
         self.max_workers = max(1, int(max_workers))
         self.max_active_tasks_per_owner = max(1, int(max_active_tasks_per_owner))
         self.max_queue_per_owner = max(1, int(max_queue_per_owner))
-        self.limiter = get_provider_limiter(self.provider_name, self.max_workers)
+        # Worker count is an upper bound; provider-specific operator limits
+        # remain authoritative even when the scheduler has more workers.
+        self.limiter = get_provider_limiter(self.provider_name)
         self.metrics = SchedulerMetrics()
 
         self._owners: dict[str, OwnerQueue] = {}
@@ -266,6 +269,12 @@ class CapacityAwareScheduler:
         self._condition = asyncio.Condition(self._lock)
         self._running = False
         self._worker_tasks: list[asyncio.Task] = []
+        # Child orchestration is not itself a worker unit because each child
+        # must release capacity while awaiting its scheduled inference. This
+        # separate admission semaphore bounds whole child turns (including
+        # unscheduled tool execution) to the configured worker ceiling.
+        child_limit = min(self.max_workers, self.limiter.max_concurrency)
+        self._child_execution_semaphore = asyncio.Semaphore(child_limit)
 
     @property
     def is_running(self) -> bool:
@@ -275,6 +284,15 @@ class CapacityAwareScheduler:
         if owner_id not in self._owners:
             self._owners[owner_id] = OwnerQueue(owner_id, self.max_queue_per_owner)
         return self._owners[owner_id]
+
+    @contextlib.asynccontextmanager
+    async def child_execution_slot(self):
+        """Bound active child turns without occupying a scheduler worker."""
+        await self._child_execution_semaphore.acquire()
+        try:
+            yield
+        finally:
+            self._child_execution_semaphore.release()
 
     async def submit(
         self,

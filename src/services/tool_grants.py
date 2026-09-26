@@ -32,6 +32,61 @@ class TargetBoundGrant:
     used: bool = False
 
 
+@dataclass(frozen=True)
+class DelegationCapabilityGrant:
+    """Parent-issued tool scope for one child task; not a replacement for action receipts."""
+
+    grant_id: str
+    user_id: str
+    parent_task_id: str
+    child_task_id: str
+    allowed_tools: frozenset[str]
+
+
+def issue_delegation_capability_grant(
+    *,
+    user_id: str,
+    parent_task_id: str,
+    child_task_id: str,
+    allowed_tools: set[str] | frozenset[str] | list[str] | tuple[str, ...],
+    grant_id: str | None = None,
+) -> DelegationCapabilityGrant:
+    tools = frozenset(str(name) for name in allowed_tools)
+    if not str(user_id).strip() or not str(parent_task_id).strip() or not str(child_task_id).strip():
+        raise ValueError("delegation grant requires owner, parent, and child task IDs")
+    if not tools or tools.intersection({"delegate_task", "await_user", "task_cancel"}):
+        raise PermissionError("delegation grant has an empty or control-capable child scope")
+    return DelegationCapabilityGrant(
+        grant_id=(
+            str(grant_id) if grant_id is not None
+            else f"delegation_grant_{uuid.uuid4().hex}"
+        ),
+        user_id=str(user_id),
+        parent_task_id=str(parent_task_id),
+        child_task_id=str(child_task_id),
+        allowed_tools=tools,
+    )
+
+
+def validate_delegation_capability_grant(
+    grant: DelegationCapabilityGrant,
+    *,
+    user_id: str,
+    parent_task_id: str,
+    task_id: str,
+    tool_name: str,
+) -> None:
+    """Enforce that child execution remains within the parent's durable grant."""
+    if (
+        str(user_id) != grant.user_id
+        or str(parent_task_id) != grant.parent_task_id
+        or str(task_id) != grant.child_task_id
+    ):
+        raise PermissionError("delegation grant belongs to another owner or child task")
+    if str(tool_name) not in grant.allowed_tools:
+        raise PermissionError("delegated action exceeds the parent-issued child tool grant")
+
+
 def issue_grant(
     *,
     turn_id: str,
@@ -87,4 +142,7 @@ def consume_grant(
     return replace(grant, used=True)
 
 
-__all__ = ["TargetBoundGrant", "consume_grant", "issue_grant"]
+__all__ = [
+    "DelegationCapabilityGrant", "TargetBoundGrant", "consume_grant", "issue_grant",
+    "issue_delegation_capability_grant", "validate_delegation_capability_grant",
+]

@@ -36,6 +36,18 @@ CURRENT_CHANNEL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 CURRENT_THREAD_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "delilah_current_thread_id", default=None
 )
+CURRENT_ALLOWED_TOOLS: contextvars.ContextVar[frozenset[str] | None] = contextvars.ContextVar(
+    "delilah_current_allowed_tools", default=None
+)
+CURRENT_DELEGATION_GRANT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "delilah_current_delegation_grant", default=None
+)
+CURRENT_MAX_TOOL_STEPS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "delilah_current_max_tool_steps", default=None
+)
+CURRENT_DELEGATION_MAX_TOKENS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "delilah_current_delegation_max_tokens", default=None
+)
 
 
 @dataclass
@@ -161,6 +173,10 @@ class AgentRuntime:
 __all__ = [
     "AgentRuntime",
     "CURRENT_CHANNEL_ID",
+    "CURRENT_ALLOWED_TOOLS",
+    "CURRENT_DELEGATION_MAX_TOKENS",
+    "CURRENT_DELEGATION_GRANT",
+    "CURRENT_MAX_TOOL_STEPS",
     "CURRENT_SESSION_KEY",
     "CURRENT_TURN_ID",
     "CURRENT_THREAD_ID",

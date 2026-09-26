@@ -48,7 +48,11 @@ from src.services.tool_execution_evidence import tool_result_indicates_failure
 from src.services.browser_evidence import browser_tool_ran, observed_page
 from src.services.progress_policy import ProgressPolicy
 from src.services.result_contracts import contract_for, extract_facts
-from src.services.tool_grants import consume_grant, issue_grant
+from src.services.tool_grants import (
+    consume_grant,
+    issue_grant,
+    validate_delegation_capability_grant,
+)
 from src.services.world_model import (
     build_world_model_context,
     build_semantic_world_model_context,
@@ -65,9 +69,19 @@ from src.services.world_model import (
     retract_world_model_claim
 )
 from src.agent.events import MessageEvent, TurnRequest
+from src.agent.delegation import (
+    MAX_CHILD_STEPS,
+    MAX_CHILD_TIMEOUT_SECONDS,
+    MAX_CHILD_TOKENS,
+    DelegationResult,
+)
 from src.agent.runtime import (
     AgentRuntime,
+    CURRENT_ALLOWED_TOOLS,
     CURRENT_CHANNEL_ID,
+    CURRENT_DELEGATION_GRANT,
+    CURRENT_DELEGATION_MAX_TOKENS,
+    CURRENT_MAX_TOOL_STEPS,
     CURRENT_SESSION_KEY,
     CURRENT_THREAD_ID,
     CURRENT_TASK_ID,
@@ -102,14 +116,79 @@ from html import unescape
 _OPENROUTER_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
 _DURABLE_SESSION_STORE: SessionStore | None = None
 _GMAIL_TOOL_USED_TURNS: set[str] = set()
+_RECOVERED_CHILD_RESUMPTIONS: set[str] = set()
+_RECOVERED_CHILD_TASKS: set[asyncio.Task] = set()
 _STEP2_MIGRATED_TOOLS = frozenset({
     "search_gmail", "read_gmail_message", "monitor_create_natural_rule",
-    "monitor_add_rule", "monitor_list_rules",
+    "monitor_add_rule", "monitor_list_rules", "delegate_task",
 })
 _PLAN_CONTROL_TOOLS = frozenset({
-    "task_plan", "task_list", "await_user", "end_turn", "enable_reasoning",
+    "task_plan", "task_list", "task_cancel", "await_user", "end_turn", "enable_reasoning",
     "explore_domain", "load_tool_schemas",
 })
+_DELEGATION_CONTROL_TOOLS = frozenset({
+    "end_turn", "enable_reasoning", "task_plan", "task_list", "task_cancel",
+    "search_session_history", "await_user",
+})
+
+
+def _should_track_task_step(
+    task_id: str | None,
+    tool_name: str,
+    *,
+    has_plan: bool,
+    delegated: bool,
+) -> bool:
+    """Persist execution evidence for every delegated tool, planned or migrated action."""
+    if not task_id or tool_name == "task_plan":
+        return False
+    return bool(
+        tool_name in _STEP2_MIGRATED_TOOLS
+        or (has_plan and tool_name not in _PLAN_CONTROL_TOOLS)
+        or (delegated and tool_name not in _PLAN_CONTROL_TOOLS)
+    )
+
+
+def _validate_delegated_task_grant(store, user_id: str, task_id: str, tool_name: str, grant) -> None:
+    """Match runtime capability to the owner-scoped durable parent delegation event."""
+    if grant is None:
+        raise PermissionError("DELEGATION_GRANT_REQUIRED: no parent-issued child capability")
+    child_record = store.get_task(
+        user_id, task_id, include_steps=False, include_events=False
+    )
+    parent_id = child_record.get("parent_task_id")
+    if not parent_id:
+        raise PermissionError("DELEGATION_GRANT_REQUIRED: task has no durable parent")
+    spec = store.get_child_delegation_spec(user_id, task_id)
+    if (
+        spec["delegation_grant_id"] != grant.grant_id
+        or frozenset(spec["allowed_tools"]) != grant.allowed_tools
+    ):
+        raise PermissionError("DELEGATION_GRANT_REQUIRED: runtime grant differs from durable scope")
+    validate_delegation_capability_grant(
+        grant,
+        user_id=user_id,
+        parent_task_id=str(parent_id),
+        task_id=task_id,
+        tool_name=tool_name,
+    )
+
+
+def _delegated_batch_budget_error(
+    tool_calls: list[dict], *, max_steps: int, used_steps: int
+) -> str | None:
+    """Reject an over-budget batch before any child action in it is dispatched."""
+    requested = sum(
+        1 for call in tool_calls
+        if str((call.get("function") or {}).get("name") or "")
+        not in _DELEGATION_CONTROL_TOOLS
+    )
+    if max(0, int(used_steps)) + requested > max(0, int(max_steps)):
+        return (
+            "DELEGATED_STEP_BUDGET: this batch exceeds the child tool-step budget. "
+            "No calls in this batch were executed; retry within the remaining budget."
+        )
+    return None
 
 
 def _durable_session_store() -> SessionStore | None:
@@ -366,6 +445,7 @@ def _list_durable_tasks(
     results = []
     for task in rows:
         steps = store.list_task_steps(user_id, task["task_id"], limit=20)
+        children = store.get_child_tasks(user_id, task["task_id"])
         results.append({
             "task_id": task["task_id"],
             "objective": str(task.get("objective") or "")[:500],
@@ -385,6 +465,27 @@ def _list_durable_tasks(
                     ),
                 }
                 for step in steps
+            ],
+            "children": [
+                {
+                    "task_id": child["task_id"],
+                    "objective": str(child.get("objective") or "")[:500],
+                    "status": child["status"],
+                    "lane": child.get("lane"),
+                    "wait_reason": str(child.get("wait_reason") or "")[:200] or None,
+                    "steps": [
+                        {
+                            "step_id": step["step_id"],
+                            "status": step["status"],
+                            "next_action": str(step.get("next_action") or "")[:200] or None,
+                            "receipt_id": step.get("receipt_id"),
+                        }
+                        for step in store.list_task_steps(
+                            user_id, child["task_id"], limit=20
+                        )
+                    ],
+                }
+                for child in children[:20]
             ],
         })
     return results
@@ -409,6 +510,8 @@ def _requires_durable_plan(prompt: str, required_tools: set[str]) -> bool:
 
 
 def _tool_requires_durable_plan(tool_name: str, arguments: dict | None = None) -> bool:
+    if tool_name == "task_cancel":
+        return False
     if tool_name == "fetch_webpage" and isinstance(arguments, dict) and arguments.get("save_only"):
         return True
     action_prefixes = (
@@ -2708,6 +2811,47 @@ BOT_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "delegate_task",
+            "description": (
+                "Run one bounded child task under this durable task. The child receives an "
+                "isolated conversation, only tools explicitly selected from this parent's "
+                "current tool set, and a finite execution budget. It cannot delegate "
+                "recursively. The returned status and receipts are evidence; do not claim "
+                "success when the child is queued, failed, or needs reconciliation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "allowed_tools": {
+                        "type": "array", "minItems": 1, "maxItems": 32,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 100},
+                    },
+                    "budget": {
+                        "type": "object",
+                        "properties": {
+                            "max_steps": {
+                                "type": "integer", "minimum": 1, "maximum": MAX_CHILD_STEPS,
+                            },
+                            "timeout_seconds": {
+                                "type": "number", "exclusiveMinimum": 0,
+                                "maximum": MAX_CHILD_TIMEOUT_SECONDS,
+                            },
+                            "max_tokens": {
+                                "type": "integer", "minimum": 1, "maximum": MAX_CHILD_TOKENS,
+                                "description": "Maximum generated tokens per model response; the step and time limits bound total work.",
+                            },
+                        },
+                        "required": ["max_steps", "timeout_seconds", "max_tokens"],
+                    },
+                },
+                "required": ["goal", "allowed_tools", "budget"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_session_history",
             "description": (
                 "Search older messages in this user's current conversation when they refer to "
@@ -2783,6 +2927,24 @@ BOT_TOOLS_SCHEMA = [
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_cancel",
+            "description": (
+                "Cancel one durable task or delegated child visible in task_list for this exact "
+                "owner and conversation. Cancellation cascades to active children. An in-flight "
+                "side effect may instead become needs_reconciliation; never claim it was undone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1, "maxLength": 200}
+                },
+                "required": ["task_id"],
             },
         },
     },
@@ -4101,6 +4263,8 @@ SCHEMA_TOOL_NAMES = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
 EXPECTED_TOOL_NAMES = {
     "scrape_rendered_page",
     "await_user",
+    "delegate_task",
+    "task_cancel",
     "task_plan",
     "find_government_forms",
     "fill_pdf_form",
@@ -4314,6 +4478,8 @@ def _bind_bare_argument_shape(obj: dict) -> tuple[str, dict] | None:
 
 # Set of all mutation tools that should always commit to the database
 MUTATION_TOOLS = {
+    "delegate_task",
+    "task_cancel",
     "set_portfolio_holding",
     "delete_category_budget",
     "add_recurring_bill",
@@ -4863,6 +5029,129 @@ def _observed_live_browser(trace) -> bool:
 
 def _browser_tool_ran(trace) -> bool:
     return browser_tool_ran(trace)
+
+
+class _DelegatedMessageSink:
+    """No-op Discord message facade so a child result is returned to its parent."""
+
+    def __init__(self, channel_id: str | None = None) -> None:
+        self.channel = self
+        self.id = f"delegated:{channel_id or 'private'}"
+        self.messages: list[str] = []
+
+    async def send(self, content=None, **kwargs):
+        self.messages.append(str(content or kwargs.get("content") or ""))
+        return self
+
+    async def edit(self, content=None, **kwargs):
+        self.messages.append(str(content or kwargs.get("content") or ""))
+        return self
+
+    async def delete(self):
+        return None
+
+
+async def _run_delegated_child_runtime(
+    child_id, child_uid, child_goal, child_tools, context, child_budget
+):
+    """Run a durable child against the isolated session/context prepared by its controller."""
+    store = _durable_session_store()
+    if store is None:
+        raise RuntimeError("durable session store unavailable for delegated child")
+    child_text = await _chat_with_delilah_impl(
+        child_goal,
+        child_uid,
+        _DelegatedMessageSink(channel_id=CURRENT_CHANNEL_ID.get()),
+        required_tools=set(infer_required_tools(child_goal)),
+    )
+    child_record = store.get_task(
+        child_uid, child_id, include_steps=True, include_events=False
+    )
+    child_steps = child_record.get("steps", [])
+    child_receipts = [
+        str(step["receipt_id"]) for step in child_steps if step.get("receipt_id")
+    ]
+    child_status = str(child_record.get("status") or "running")
+    if child_status in {"needs_reconciliation", "partial"}:
+        result_status = "needs_reconciliation"
+    elif child_status in {"failed", "cancelled"}:
+        result_status = child_status
+    elif child_status in {"queued", "waiting_user", "waiting_approval"}:
+        result_status = child_status
+    elif child_status in {"running", "succeeded"}:
+        result_status = "succeeded"
+    else:
+        result_status = "needs_reconciliation"
+    return DelegationResult(
+        task_id=child_id,
+        parent_task_id=str(child_record.get("parent_task_id") or ""),
+        status=result_status,
+        summary=str(child_text or "Child task completed."),
+        data={"task_status": child_status},
+        steps_executed=sum(
+            1 for step in child_steps
+            if step.get("status") in {"running", "succeeded", "failed"}
+        ),
+        receipt_ids=child_receipts,
+    )
+
+
+def _schedule_recovered_delegated_children(
+    store: SessionStore,
+    user_id: str,
+    *,
+    session_id: str,
+    channel_id: str | None,
+    thread_id: str | None,
+) -> list[asyncio.Task]:
+    """Rehydrate safe queued children only in their original conversation scope."""
+    scheduled: list[asyncio.Task] = []
+    for listed in store.list_tasks(user_id, statuses=["queued"], limit=500):
+        parent = store.get_task(
+            user_id, listed["task_id"], include_steps=False, include_events=False
+        )
+        if (
+            parent.get("phase") != "awaiting_child"
+            or parent.get("session_key") != session_id
+            or str(parent.get("channel_id") or "") != str(channel_id or "")
+            or str(parent.get("thread_id") or "") != str(thread_id or "")
+        ):
+            continue
+        for child in store.get_child_tasks(user_id, parent["task_id"]):
+            child_id = str(child["task_id"])
+            if child.get("status") != "queued" or child_id in _RECOVERED_CHILD_RESUMPTIONS:
+                continue
+            try:
+                store.get_child_delegation_spec(user_id, child_id)
+            except Exception as spec_err:
+                print(f" [DELEGATION RECOVERY] invalid child {child_id}: {spec_err}")
+                continue
+            _RECOVERED_CHILD_RESUMPTIONS.add(child_id)
+
+            async def _resume_child(owner=user_id, task_key=child_id, session_store=store):
+                try:
+                    from src.agent.delegation import DelegationController
+
+                    await DelegationController(
+                        session_store,
+                        TaskController(session_store),
+                        receipt_store=ReceiptStore(session_store.connection),
+                    ).resume_queued_child(
+                        owner, task_key, runner_fn=_run_delegated_child_runtime
+                    )
+                except Exception as resume_err:
+                    print(
+                        f" [DELEGATION RECOVERY] child={task_key} "
+                        f"failed safely: {type(resume_err).__name__}: {resume_err}"
+                    )
+                finally:
+                    _RECOVERED_CHILD_RESUMPTIONS.discard(task_key)
+
+            task = asyncio.create_task(_resume_child())
+            _RECOVERED_CHILD_TASKS.add(task)
+            task.add_done_callback(_RECOVERED_CHILD_TASKS.discard)
+            scheduled.append(task)
+    return scheduled
 
 
 async def _chat_with_delilah_impl(
@@ -5596,6 +5885,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
         core_tools = {
             "explore_domain", "load_tool_schemas", "enable_reasoning", "verify_claim", "end_turn",
             "await_user",
+            "delegate_task",
+            "task_cancel",
             "task_plan",
             "list_world_model_claims",
             # Persistence tools stay offered every round: the prompt tells the
@@ -5976,6 +6267,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
             raise asyncio.CancelledError()
 
         effective_num_predict = max(256, min(int(num_predict or (ADVISOR_FINAL_NUM_PREDICT if force_no_tools else ADVISOR_TOOL_NUM_PREDICT)), ADVISOR_NUM_PREDICT))
+        delegated_token_limit = CURRENT_DELEGATION_MAX_TOKENS.get()
+        if delegated_token_limit is not None:
+            effective_num_predict = min(effective_num_predict, delegated_token_limit)
 
         api_messages = []
         for msg in messages_payload:
@@ -6418,11 +6712,12 @@ CURRENT DATABASE FINANCIAL CONTEXT
 
         from src.agent.scheduler import schedule_work
 
-        task_id = f"stream_{uuid.uuid4().hex[:8]}"
+        task_id = CURRENT_TASK_ID.get() or f"stream_{uuid.uuid4().hex[:8]}"
+        work_lane = "background" if CURRENT_ALLOWED_TOOLS.get() is not None else "interactive"
         return await schedule_work(
             task_id,
             str(uid),
-            "interactive",
+            work_lane,
             _do_stream_round,
             unit_type="inference",
             provider=llm_provider,
@@ -7487,6 +7782,12 @@ CURRENT DATABASE FINANCIAL CONTEXT
         tools = _tool_schema_for_mode()
         tools = await _apply_live_router(tools)
         tools = await _apply_kev_decision(tools)
+        child_tool_allowlist = CURRENT_ALLOWED_TOOLS.get()
+        if child_tool_allowlist is not None:
+            tools = [
+                item for item in tools
+                if (item.get("function") or {}).get("name") in child_tool_allowlist
+            ]
 
         # Optional total tool-call guard. 0 = unlimited.
         total_calls_so_far = sum(tool_call_counts.values()) if isinstance(tool_call_counts, dict) else 0
@@ -7604,6 +7905,36 @@ CURRENT DATABASE FINANCIAL CONTEXT
             })
             attempts += 1
             continue
+
+        if any(
+            isinstance(call, dict)
+            and (call.get("function") or {}).get("name") == "delegate_task"
+            for call in tool_calls
+        ) and len(tool_calls) != 1:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "delegate_task must be the only call in its batch. No calls were executed; "
+                    "retry it alone so the parent can wait for and inspect the child result."
+                ),
+            })
+            attempts += 1
+            continue
+
+        delegated_max_steps = CURRENT_MAX_TOOL_STEPS.get()
+        if child_tool_allowlist is not None and delegated_max_steps is not None:
+            used_child_steps = sum(
+                count for name, count in tool_call_counts.items()
+                if name not in _DELEGATION_CONTROL_TOOLS
+            )
+            budget_error = _delegated_batch_budget_error(
+                tool_calls, max_steps=delegated_max_steps,
+                used_steps=used_child_steps,
+            )
+            if budget_error:
+                messages.append({"role": "user", "content": budget_error})
+                attempts += 1
+                continue
 
         tool_names = [
             str((call.get("function") or {}).get("name") or "")
@@ -8645,6 +8976,37 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                     func_name = func_name.strip()
 
+                    child_tool_allowlist = CURRENT_ALLOWED_TOOLS.get()
+                    if child_tool_allowlist is not None and func_name not in child_tool_allowlist:
+                        raise PermissionError(
+                            f"DELEGATED_TOOL_SCOPE: child task is not authorized to call {func_name!r}"
+                        )
+                    if child_tool_allowlist is not None:
+                        delegation_grant = CURRENT_DELEGATION_GRANT.get()
+                        active_child_id = CURRENT_TASK_ID.get()
+                        if not active_child_id:
+                            raise PermissionError(
+                                "DELEGATION_GRANT_REQUIRED: delegated execution has no parent-issued capability grant"
+                            )
+                        child_store = _durable_session_store()
+                        if child_store is None:
+                            raise PermissionError(
+                                "DELEGATION_GRANT_REQUIRED: durable child scope cannot be verified"
+                            )
+                        _validate_delegated_task_grant(
+                            child_store, uid, active_child_id, func_name, delegation_grant
+                        )
+                    delegated_max_steps = CURRENT_MAX_TOOL_STEPS.get()
+                    if delegated_max_steps is not None and func_name not in _DELEGATION_CONTROL_TOOLS:
+                        used_steps = sum(
+                            count for name, count in tool_call_counts.items()
+                            if name not in _DELEGATION_CONTROL_TOOLS
+                        )
+                        if used_steps >= delegated_max_steps:
+                            raise PermissionError(
+                                "DELEGATED_STEP_BUDGET: child tool-step budget is exhausted"
+                            )
+
                     # Replaying an already executed provider call ID is not a
                     # fresh request. Reject it before preparing a second
                     # receipt or invoking a side effect a second time.
@@ -8738,7 +9100,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 "DURABLE_PLAN_REQUIRED: no action was dispatched. Save an "
                                 "ordered task_plan with observable completion criteria first."
                             )
-                    if active_task_id and func_name in _STEP2_MIGRATED_TOOLS:
+                    if active_task_id and (
+                        func_name in _STEP2_MIGRATED_TOOLS
+                        or child_tool_allowlist is not None
+                    ):
                         task_controller.validate_tool_dispatch(
                             uid, active_task_id, tool_name=func_name, arguments=args
                         )
@@ -8868,13 +9233,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         task_id and task_controller
                         and task_controller.has_plan(uid, task_id)
                     )
-                    track_task_step = bool(
-                        task_id
-                        and func_name != "task_plan"
-                        and (
-                            func_name in _STEP2_MIGRATED_TOOLS
-                            or (task_has_plan and func_name not in _PLAN_CONTROL_TOOLS)
-                        )
+                    track_task_step = _should_track_task_step(
+                        task_id,
+                        func_name,
+                        has_plan=task_has_plan,
+                        delegated=child_tool_allowlist is not None,
                     )
                     task_step_id = None
                     if track_task_step:
@@ -9906,6 +10269,41 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = json.dumps(
                             {"tasks": tasks}, ensure_ascii=False, separators=(",", ":")
                         )
+                    elif func_name == "task_cancel":
+                        task_id = str(args.get("task_id") or "").strip()
+                        store = _durable_session_store()
+                        if not task_id or store is None:
+                            raise ValueError("task_cancel requires a task ID and durable task store")
+                        visible_tasks = _list_durable_tasks(
+                            uid,
+                            session_id=CURRENT_SESSION_KEY.get(),
+                            channel_id=CURRENT_CHANNEL_ID.get(),
+                            thread_id=CURRENT_THREAD_ID.get(),
+                            limit=20,
+                        )
+                        visible_ids = set()
+                        for visible in visible_tasks:
+                            visible_ids.add(str(visible["task_id"]))
+                            visible_ids.update(
+                                str(child["task_id"])
+                                for child in visible.get("children", [])
+                            )
+                        if task_id not in visible_ids:
+                            raise PermissionError(
+                                "TASK_SCOPE_DENIED: task_cancel only accepts a task listed "
+                                "for this owner and conversation."
+                            )
+                        cancelled_task = TaskController(store).cancel(uid, task_id)
+                        db_result = json.dumps({
+                            "task_id": task_id,
+                            "status": cancelled_task["status"],
+                            "wait_reason": cancelled_task.get("wait_reason"),
+                            "message": (
+                                "Cancellation requested; an in-flight side effect may require reconciliation."
+                                if cancelled_task["status"] == "needs_reconciliation"
+                                else "Task cancellation recorded."
+                            ),
+                        }, ensure_ascii=False, separators=(",", ":"))
                     elif func_name == "task_plan":
                         task_id = CURRENT_TASK_ID.get()
                         store = _durable_session_store()
@@ -9919,6 +10317,70 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         db_result = json.dumps(
                             {"status": "saved", "task_id": task_id, "steps": plan},
                             ensure_ascii=False, separators=(",", ":"),
+                        )
+                    elif func_name == "delegate_task":
+                        parent_task_id = CURRENT_TASK_ID.get()
+                        store = _durable_session_store()
+                        if not parent_task_id or store is None:
+                            raise RuntimeError(
+                                "delegate_task requires an active durable parent task"
+                            )
+                        from src.agent.delegation import (
+                            DelegationBudget,
+                            DelegationController,
+                            DelegationResult,
+                        )
+
+                        goal = str(args.get("goal") or "").strip()
+                        selected_tools = args.get("allowed_tools")
+                        raw_budget = args.get("budget")
+                        if (
+                            not goal
+                            or not isinstance(selected_tools, list)
+                            or not isinstance(raw_budget, dict)
+                        ):
+                            raise ValueError(
+                                "delegate_task requires goal, allowed_tools, and budget"
+                            )
+                        parent_tools = {
+                            str((item.get("function") or {}).get("name") or "")
+                            for item in tools if isinstance(item, dict)
+                        }
+                        parent_tools.discard("")
+                        required_child_tools = set(infer_required_tools(goal))
+                        omitted_required_tools = required_child_tools - set(map(str, selected_tools))
+                        if (
+                            _requires_durable_plan(goal, required_child_tools)
+                            and "task_plan" not in selected_tools
+                        ):
+                            omitted_required_tools.add("task_plan")
+                        if omitted_required_tools:
+                            raise PermissionError(
+                                "DELEGATED_TOOL_SCOPE: allowed_tools omits required tools: "
+                                + ", ".join(sorted(omitted_required_tools))
+                            )
+                        budget = DelegationBudget(
+                            max_steps=raw_budget.get("max_steps"),
+                            timeout_seconds=raw_budget.get("timeout_seconds"),
+                            max_tokens=raw_budget.get("max_tokens"),
+                        )
+                        controller = DelegationController(
+                            store,
+                            TaskController(store),
+                            receipt_store=receipt_store,
+                        )
+
+                        child_result = await controller.delegate(
+                            uid,
+                            parent_task_id,
+                            goal,
+                            allowed_tools=selected_tools,
+                            parent_allowed_tools=parent_tools,
+                            budget=budget,
+                            runner_fn=_run_delegated_child_runtime,
+                        )
+                        db_result = json.dumps(
+                            child_result.to_dict(), ensure_ascii=False, separators=(",", ":")
                         )
                     elif func_name == "await_user":
                         task_id = CURRENT_TASK_ID.get()
@@ -12277,6 +12739,15 @@ async def chat_with_delilah(
                                 )
                             except Exception as notify_err:
                                 print(f" [TASK NOTICE] delivery failed: {notify_err}")
+            # Safe queued children are rehydrated from the durable delegation
+            # manifest; receipt recovery has already parked ambiguous work.
+            _schedule_recovered_delegated_children(
+                store,
+                scope["user_id"],
+                session_id=scope["session_id"],
+                channel_id=scope["channel_id"],
+                thread_id=scope["thread_id"],
+            )
             if resume_task_id:
                 prior = store.get_task(scope["user_id"], resume_task_id)
                 if prior["session_key"] != scope["session_id"]:

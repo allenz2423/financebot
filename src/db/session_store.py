@@ -74,7 +74,9 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "toolname", "operation", "risk", "summary", "approvalexpiresat",
     "approvalstatus", "approvedby", "decidedat",
     "plannedstepids", "stepcount",
-    "phase", "callcount", "toolnames", "providercallids",
+    "phase", "callcount", "toolnames", "providercallids", "childtaskid", "parenttaskid",
+    "turnid", "delegationgrantid", "allowedtools", "budget", "maxsteps", "timeoutseconds", "maxtokens",
+    "terminalchildids", "childtaskids",
 }
 _UNSET = object()
 
@@ -767,6 +769,106 @@ class SessionStore:
             return self._row(
                 conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_key,)).fetchone()
             )  # type: ignore[return-value]
+
+    def create_child_task_and_await_parent(
+        self,
+        user_id: str,
+        parent_task_id: str,
+        *,
+        child_task_id: str,
+        child_session_id: str,
+        objective: str,
+        expected_parent_status: str,
+        expected_parent_version: int,
+        expected_parent_phase: str,
+        next_action: str,
+        allowed_tools: list[str],
+        budget: Mapping[str, Any],
+        delegation_grant_id: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Atomically create a child run and put its parent into awaiting_child."""
+        owner = _required(user_id, "user_id")
+        parent_key = _required(parent_task_id, "parent_task_id")
+        child_key = _required(child_task_id, "child_task_id")
+        goal = _required(objective, "objective")
+        status = self._validate_task_status(expected_parent_status)
+        phase = _required(expected_parent_phase, "expected_parent_phase").casefold()
+        if status not in {"queued", "running"}:
+            raise ValueError("only an active parent task can delegate")
+        if phase not in {"planning", "executing"}:
+            raise ValueError("parent must be planning or executing before delegation")
+        version = int(expected_parent_version)
+        now = _now()
+        with self._write() as conn:
+            parent = self._task_pk(conn, owner, parent_key)
+            if (
+                parent["status"] != status
+                or int(parent["version"]) != version
+                or str(parent["phase"] or "received") != phase
+            ):
+                raise ConcurrentTaskUpdate("parent changed before child delegation")
+            active_child = conn.execute(
+                """SELECT 1 FROM task_runs WHERE user_id=? AND parent_task_id=?
+                   AND status IN ('queued','running','waiting_user','waiting_approval') LIMIT 1""",
+                (owner, parent_key),
+            ).fetchone()
+            if active_child is not None:
+                raise ValueError("parent already has an active child task")
+            child_scope = (
+                owner,
+                _required(child_session_id, "child_session_id"),
+                str(parent["channel_id"] or ""),
+                str(parent["thread_id"] or ""),
+            )
+            child_session_pk = int(self._ensure_session(conn, child_scope, None)["id"])
+            conn.execute(
+                """INSERT INTO task_runs(
+                       task_id, user_id, session_id, parent_task_id, objective,
+                       status, lane, enqueued_at, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 'queued', 'background', ?, ?, ?)""",
+                (child_key, owner, child_session_pk, parent_key, goal, now, now, now),
+            )
+            self._insert_task_event(
+                conn, task_id=child_key, event_type="task.created",
+                payload={"status": "queued", "lane": "background"},
+            )
+            cursor = conn.execute(
+                """UPDATE task_runs SET status='queued', phase='awaiting_child',
+                          phase_next_action=?, wait_reason=?, version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND status=? AND phase=? AND version=?""",
+                (str(next_action)[:500], f"awaiting_child:{child_key}", now,
+                 parent_key, owner, status, phase, version),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("parent changed while creating child task")
+            self._insert_task_event(
+                conn, task_id=parent_key, event_type="task.delegated",
+                payload={
+                    "child_task_id": child_key,
+                    "delegation_grant_id": _required(delegation_grant_id, "delegation_grant_id"),
+                    "allowed_tools": list(allowed_tools),
+                    "budget": dict(budget),
+                },
+            )
+            self._insert_task_event(
+                conn, task_id=parent_key, event_type="task.awaiting_child",
+                payload={"child_task_id": child_key},
+            )
+            self._insert_task_event(
+                conn, task_id=parent_key, event_type="task.phase_transitioned",
+                payload={
+                    "phase": "awaiting_child",
+                    "next_action": str(next_action)[:500],
+                    "child_task_id": child_key,
+                },
+            )
+            return {
+                "parent": self._row(self._task_pk(conn, owner, parent_key)),
+                "child": self._row(conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id=? AND user_id=?",
+                    (child_key, owner),
+                ).fetchone()),
+            }  # type: ignore[return-value]
 
     def _task_pk(self, conn: sqlite3.Connection, user_id: str, task_id: str) -> sqlite3.Row:
         row = conn.execute(
@@ -1561,6 +1663,113 @@ class SessionStore:
                 (parent_key, owner, owner),
             ).fetchall()
             return [self._row(r) for r in rows]
+
+    def get_child_delegation_spec(self, user_id: str, child_task_id: str) -> dict[str, Any]:
+        """Return the unique parent-issued execution scope for an owner-scoped child."""
+        owner = _required(user_id, "user_id")
+        child_key = _required(child_task_id, "child_task_id")
+        with self._lock:
+            child = self._task_pk(self.connection, owner, child_key)
+            parent_id = _required(child["parent_task_id"], "parent_task_id")
+            parent = self._task_pk(self.connection, owner, parent_id)
+            rows = self.connection.execute(
+                """SELECT payload_json FROM task_events
+                   WHERE task_id=? AND event_type='task.delegated'
+                   ORDER BY event_id""",
+                (parent_id,),
+            ).fetchall()
+            matching = []
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(payload, dict) and payload.get("child_task_id") == child_key:
+                    matching.append(payload)
+            if len(matching) != 1:
+                raise ValueError("child must have exactly one durable parent delegation event")
+            payload = matching[0]
+            tools = payload.get("allowed_tools")
+            budget = payload.get("budget")
+            grant_id = payload.get("delegation_grant_id")
+            if (
+                not isinstance(tools, list)
+                or not tools
+                or not all(isinstance(name, str) and name for name in tools)
+                or len(set(tools)) != len(tools)
+                or not isinstance(budget, dict)
+                or not isinstance(grant_id, str)
+                or not grant_id.startswith("delegation_grant_")
+            ):
+                raise ValueError("durable child delegation scope is incomplete or malformed")
+            return {
+                "user_id": owner,
+                "parent_task_id": parent_id,
+                "child_task_id": child_key,
+                "parent": self._row(parent),
+                "child": self._row(child),
+                "allowed_tools": list(tools),
+                "budget": dict(budget),
+                "delegation_grant_id": grant_id,
+            }
+
+    def claim_child_task_for_resume(
+        self, user_id: str, child_task_id: str, *, expected_child_version: int,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        """CAS-claim a queued child only while its durable parent still awaits it."""
+        owner = _required(user_id, "user_id")
+        child_key = _required(child_task_id, "child_task_id")
+        turn_key = _required(turn_id, "turn_id")
+        now = _now()
+        with self._write() as conn:
+            child = self._task_pk(conn, owner, child_key)
+            parent_key = _required(child["parent_task_id"], "parent_task_id")
+            parent = self._task_pk(conn, owner, parent_key)
+            if (
+                child["status"] != "queued"
+                or int(child["version"]) != int(expected_child_version)
+                or parent["phase"] != "awaiting_child"
+                or parent["status"] not in {"queued", "running"}
+                or parent["wait_reason"] != f"awaiting_child:{child_key}"
+            ):
+                raise ConcurrentTaskUpdate("parent/child state changed before resume claim")
+            cursor = conn.execute(
+                """UPDATE task_runs SET status='running', wait_reason='resuming_child_after_restart',
+                          version=version+1, updated_at=?
+                   WHERE task_id=? AND user_id=? AND status='queued' AND version=?""",
+                (now, child_key, owner, int(expected_child_version)),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentTaskUpdate("child changed before resume claim")
+            self._insert_task_event(
+                conn, task_id=child_key, event_type="task.resumed",
+                payload={"turn_id": turn_key, "parent_task_id": parent_key},
+            )
+            return self._row(self._task_pk(conn, owner, child_key))  # type: ignore[return-value]
+
+    def count_task_tool_calls(
+        self, user_id: str, task_id: str, *, exclude_tool_names: Sequence[str] = ()
+    ) -> int:
+        """Derive a task's consumed tool budget from its isolated call records."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        excluded = tuple(dict.fromkeys(str(name) for name in exclude_tool_names))
+        with self._lock:
+            task = self._task_pk(self.connection, owner, task_key)
+            if excluded:
+                placeholders = ",".join("?" for _ in excluded)
+                row = self.connection.execute(
+                    f"SELECT COUNT(*) FROM tool_calls WHERE session_id=? "
+                    f"AND tool_name NOT IN ({placeholders})",
+                    (int(task["session_id"]), *excluded),
+                ).fetchone()
+            else:
+                row = self.connection.execute(
+                    "SELECT COUNT(*) FROM tool_calls WHERE session_id=?",
+                    (int(task["session_id"]),),
+                ).fetchone()
+            return int(row[0] or 0)
 
     def list_assistant_tool_call_blocks(
         self, user_id: str, task_id: str, *, limit: int = 500

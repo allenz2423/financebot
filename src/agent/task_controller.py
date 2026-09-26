@@ -105,6 +105,50 @@ class TaskController:
     def has_plan(self, user_id: str, task_id: str) -> bool:
         return self.store.task_has_plan(user_id, task_id)
 
+    def _load_parent_delegation_receipt(
+        self, user_id: str, step: Mapping[str, Any], receipt_store: Any,
+        *, child_task_id: str | None = None,
+    ):
+        call_id = step.get("tool_call_id")
+        receipt_id = step.get("receipt_id")
+        if call_id is None or not receipt_id:
+            raise ValueError("parent delegation step is missing call or receipt linkage")
+        call = self.store.get_tool_call(user_id, int(call_id))
+        receipt = receipt_store.get(str(receipt_id))
+        call_arguments = call.get("arguments")
+        if not isinstance(call_arguments, Mapping):
+            raise ValueError("parent delegation call arguments are malformed")
+        if (
+            call.get("tool_name") != "delegate_task"
+            or receipt.call_id != call.get("call_key")
+            or receipt.user_id != str(user_id)
+            or receipt.tool_name != "delegate_task"
+            or receipt.turn_id != call.get("turn_key")
+            or receipt.arguments_hash != arguments_hash(call_arguments)
+        ):
+            raise ValueError("parent delegation call and receipt evidence do not match")
+        if child_task_id is not None:
+            spec = self.store.get_child_delegation_spec(user_id, child_task_id)
+            requested_tools = call_arguments.get("allowed_tools")
+            requested_budget = call_arguments.get("budget")
+            child_goal = str(call_arguments.get("goal") or "").strip()
+            if not isinstance(requested_tools, list) or not isinstance(requested_budget, Mapping):
+                raise ValueError("parent delegation call is missing its child scope or budget")
+            normalized_tools = list(dict.fromkeys(
+                str(name) for name in requested_tools
+                if str(name) not in {"delegate_task", "await_user", "task_cancel"}
+            ))
+            if (
+                child_goal != str(spec["child"].get("objective") or "")
+                or normalized_tools != spec["allowed_tools"]
+                or any(
+                    requested_budget.get(key) != spec["budget"].get(key)
+                    for key in ("max_steps", "timeout_seconds", "max_tokens")
+                )
+            ):
+                raise ValueError("parent delegation call differs from the persisted child manifest")
+        return receipt
+
     def validate_tool_dispatch(
         self,
         user_id: str,
@@ -119,6 +163,10 @@ class TaskController:
             ValueError: If the exact tool action was already confirmed for this task.
         """
         task = self.store.get_task(user_id, task_id)
+        if task.get("phase") == "awaiting_child":
+            raise PermissionError(
+                "TASK_WAITING_FOR_CHILD: parent dispatch is paused until its child reaches a safe terminal state."
+            )
         if task["status"] not in {"queued", "running"}:
             raise PermissionError(
                 "TASK_NOT_DISPATCHABLE: task is waiting, terminal, or needs reconciliation; "
@@ -301,6 +349,183 @@ class TaskController:
         recovered: list[dict[str, Any]] = []
         for listed in self.store.list_tasks(user_id, statuses=["running", "queued"], limit=500):
             task = self.store.get_task(user_id, listed["task_id"])
+            if task.get("phase") == "awaiting_child":
+                children = self.store.get_child_tasks(user_id, task["task_id"])
+                delegation_step = None
+                for candidate in task.get("steps", []):
+                    if candidate.get("status") not in {"pending", "running"}:
+                        continue
+                    if candidate.get("tool_call_id") is None:
+                        continue
+                    call = self.store.get_tool_call(
+                        user_id, int(candidate["tool_call_id"])
+                    )
+                    if call.get("tool_name") == "delegate_task":
+                        delegation_step = candidate
+                        break
+                if any(child.get("status") in {"needs_reconciliation", "partial"} for child in children):
+                    updated = self.store.transition_task_run(
+                        user_id, task["task_id"], expected_status=task["status"],
+                        expected_version=int(task["version"]),
+                        new_status="needs_reconciliation",
+                        wait_reason="child_needs_reconciliation",
+                        event_type="task.child_reconciliation_required",
+                        event_payload={"child_task_ids": [
+                            child["task_id"] for child in children
+                            if child.get("status") in {"needs_reconciliation", "partial"}
+                        ]},
+                    )
+                    self.transition_phase(
+                        user_id, task["task_id"], "partial",
+                        next_action="reconcile_child_task",
+                    )
+                    recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                    continue
+                active_children = [
+                    child for child in children
+                    if child.get("status") in {"queued", "running", "waiting_user", "waiting_approval"}
+                ]
+                if active_children:
+                    try:
+                        if delegation_step is None:
+                            raise ValueError("active child has no linked parent delegate_task receipt")
+                        parent_receipt = self._load_parent_delegation_receipt(
+                            user_id, delegation_step, receipt_store,
+                            child_task_id=str(active_children[0]["task_id"]),
+                        )
+                        if parent_receipt.status not in {"started", "confirmed"}:
+                            raise ValueError("parent delegate_task receipt is not safely resumable")
+                    except Exception:
+                        latest = self.store.get_task(
+                            user_id, task["task_id"], include_steps=False, include_events=False
+                        )
+                        updated = self.store.transition_task_run(
+                            user_id, task["task_id"], expected_status=latest["status"],
+                            expected_version=int(latest["version"]),
+                            new_status="needs_reconciliation",
+                            wait_reason="delegation_receipt_reconciliation_required",
+                            event_type="task.reconciliation_required",
+                            event_payload={"reason_code": "delegation_receipt_reconciliation_required"},
+                        )
+                        self.transition_phase(
+                            user_id, task["task_id"], "partial",
+                            next_action="manual_delegation_reconciliation",
+                        )
+                        recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                        continue
+                    if task["status"] != "queued":
+                        updated = self.store.transition_task_run(
+                            user_id, task["task_id"], expected_status=task["status"],
+                            expected_version=int(task["version"]), new_status="queued",
+                            wait_reason=f"awaiting_child:{active_children[0]['task_id']}",
+                            event_type="task.child_wait_recovered",
+                            event_payload={"child_task_ids": [c["task_id"] for c in active_children]},
+                        )
+                    else:
+                        updated = task
+                    recovered.append({"task_id": task["task_id"], "status": updated["status"],
+                                      "phase": "awaiting_child"})
+                    continue
+                awaited_id = str(task.get("wait_reason") or "").removeprefix("awaiting_child:")
+                terminal_children = [
+                    child for child in children
+                    if child.get("status") in {"succeeded", "failed", "cancelled"}
+                    and (not awaited_id or child["task_id"] == awaited_id)
+                ]
+                if terminal_children and delegation_step:
+                    # The durable child row proves the internal delegation
+                    # request committed. Reconcile that parent tool receipt as
+                    # completed, never by redispatching it. A failed child is
+                    # still a completed delegation tool call; its child status
+                    # remains separate evidence.
+                    try:
+                        receipt = self._load_parent_delegation_receipt(
+                            user_id, delegation_step, receipt_store,
+                            child_task_id=str(terminal_children[0]["task_id"]),
+                        )
+                        if receipt.status == "started":
+                            receipt_store.finish(
+                                receipt.receipt_id, status="confirmed", ok=True, complete=True,
+                                result_summary=(
+                                    f"Delegated child {terminal_children[0]['task_id']} "
+                                    f"reached terminal status {terminal_children[0]['status']}; "
+                                    "inspect the durable child result."
+                                ),
+                            )
+                        elif receipt.status != "confirmed":
+                            raise ValueError("delegation receipt is not safely confirmable")
+                        if delegation_step.get("status") == "running":
+                            self.finish_step(
+                                user_id, task["task_id"], delegation_step["step_id"],
+                                outcome="confirmed",
+                            )
+                    except Exception:
+                        latest = self.store.get_task(
+                            user_id, task["task_id"], include_steps=False, include_events=False
+                        )
+                        if latest["status"] not in {"queued", "running"}:
+                            recovered.append({"task_id": task["task_id"], "status": latest["status"]})
+                            continue
+                        updated = self.store.transition_task_run(
+                            user_id, task["task_id"], expected_status=latest["status"],
+                            expected_version=int(latest["version"]),
+                            new_status="needs_reconciliation",
+                            wait_reason="delegation_receipt_reconciliation_required",
+                            event_type="task.reconciliation_required",
+                            event_payload={"reason_code": "delegation_receipt_reconciliation_required"},
+                        )
+                        self.transition_phase(
+                            user_id, task["task_id"], "partial",
+                            next_action="manual_delegation_reconciliation",
+                        )
+                        recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                        continue
+                    task = self.store.get_task(user_id, task["task_id"])
+                elif not terminal_children or not delegation_step:
+                    # A persisted awaiting_child phase without a live/terminal
+                    # child or linked delegation step is inconsistent with
+                    # the atomic create-child transaction. Never guess whether
+                    # to replay the delegate call.
+                    updated = self.store.transition_task_run(
+                        user_id, task["task_id"], expected_status=task["status"],
+                        expected_version=int(task["version"]),
+                        new_status="needs_reconciliation",
+                        wait_reason=(
+                            "delegation_child_missing_after_dispatch"
+                            if not children else "delegation_receipt_reconciliation_required"
+                        ),
+                        event_type="task.reconciliation_required",
+                        event_payload={
+                            "reason_code": (
+                                "delegation_child_missing_after_dispatch"
+                                if not children else "delegation_receipt_reconciliation_required"
+                            )
+                        },
+                    )
+                    self.transition_phase(
+                        user_id, task["task_id"], "partial",
+                        next_action="manual_delegation_reconciliation",
+                    )
+                    recovered.append({"task_id": task["task_id"], "status": updated["status"]})
+                    continue
+                # No child was committed, or all committed children are
+                # terminal. Resume parent planning only; never redispatch the
+                # delegation call or infer that an external child effect ran.
+                updated = self.store.transition_task_run(
+                    user_id, task["task_id"], expected_status=task["status"],
+                    expected_version=int(task["version"]), new_status="queued",
+                    wait_reason="resume_after_child" if children else "resume_delegation_not_created",
+                    event_type="task.child_wait_recovered",
+                    event_payload={"terminal_child_ids": [c["task_id"] for c in children]},
+                )
+                self.transition_phase(
+                    user_id, task["task_id"], "planning",
+                    next_action="resume_after_child" if children else "retry_delegation_after_recovery",
+                    event_payload={"terminal_child_ids": [c["task_id"] for c in children]},
+                )
+                recovered.append({"task_id": task["task_id"], "status": updated["status"],
+                                  "phase": "planning"})
+                continue
             if self._has_ambiguous_unlinked_call(user_id, task, receipt_store):
                 updated = self.store.transition_task_run(
                     user_id, task["task_id"], expected_status=task["status"],
@@ -594,6 +819,10 @@ class TaskController:
 
     def finish_turn(self, user_id: str, task_id: str, *, failed: bool = False) -> dict[str, Any]:
         task = self.store.get_task(user_id, task_id)
+        if task.get("phase") == "awaiting_child":
+            # A completed Discord/model turn does not complete the parent task
+            # while its durable child is still queued or running.
+            return task
         if task["status"] in {
             "needs_reconciliation", "waiting_user", "waiting_approval",
             "succeeded", "partial", "failed", "cancelled",
@@ -964,22 +1193,113 @@ class TaskController:
             } for e in task["events"]
         )
 
+    def _project_child_cancellation(self, user_id: str, child_task: Mapping[str, Any]) -> None:
+        parent_id = child_task.get("parent_task_id")
+        if not parent_id:
+            return
+        try:
+            parent = self.store.get_task(
+                user_id, str(parent_id), include_steps=False, include_events=False
+            )
+            if parent.get("phase") != "awaiting_child" or parent["status"] not in {"queued", "running"}:
+                return
+            if child_task["status"] in {"needs_reconciliation", "partial"}:
+                updated = self.store.transition_task_run(
+                    user_id, str(parent_id), expected_status=parent["status"],
+                    expected_version=int(parent["version"]),
+                    new_status="needs_reconciliation",
+                    wait_reason=f"child_needs_reconciliation:{child_task['task_id']}",
+                    event_type="task.child_reconciliation_required",
+                    event_payload={"child_task_id": child_task["task_id"]},
+                )
+                self.transition_phase(
+                    user_id, str(parent_id), "partial",
+                    next_action="reconcile_child_task",
+                    event_payload={"child_task_id": child_task["task_id"]},
+                )
+            elif child_task["status"] == "cancelled":
+                # Let recovery validate the parent's linked delegate_task
+                # receipt before resuming it. Without that evidence, resuming
+                # could let the model issue the delegation again.
+                from src.services.tool_receipts import ReceiptStore
+
+                self.recover_incomplete(
+                    user_id, ReceiptStore(self.store.connection)
+                )
+        except Exception:
+            # The parent remains in awaiting_child and will be reconciled by
+            # recover_incomplete; do not guess around a concurrent update.
+            return
+
     def cancel(self, user_id: str, task_id: str) -> dict[str, Any]:
         task = self.store.get_task(user_id, task_id)
         if task["status"] in {"succeeded", "partial", "failed", "cancelled"}:
             return task
+
+        # Stop future model work at the scheduler boundary. In-flight model
+        # calls are cooperative and may finish, but validate_tool_dispatch
+        # below will reject any subsequent tool action after the durable
+        # cancellation transition.
+        try:
+            from src.agent.scheduler import get_global_scheduler
+            get_global_scheduler().request_cancellation(task_id)
+        except Exception:
+            pass
 
         # Cascade cancellation to any active child tasks
         child_tasks = self.store.get_child_tasks(user_id, task_id)
         for child in child_tasks:
             if child["status"] not in {"succeeded", "partial", "failed", "cancelled"}:
                 self.cancel(user_id, child["task_id"])
+        task = self.store.get_task(user_id, task_id)
+        if task["status"] in {"needs_reconciliation", "partial"}:
+            return task
+        unresolved_child_ids = [
+            child["task_id"]
+            for child in self.store.get_child_tasks(user_id, task_id)
+            if child["status"] in {"needs_reconciliation", "partial"}
+        ]
+        if unresolved_child_ids:
+            updated = self.store.transition_task_run(
+                user_id, task_id, expected_status=task["status"],
+                expected_version=int(task["version"]),
+                new_status="needs_reconciliation",
+                wait_reason="child_cancellation_needs_reconciliation",
+                event_type="task.child_reconciliation_required",
+                event_payload={"child_task_ids": unresolved_child_ids},
+            )
+            self.transition_phase(
+                user_id, task_id, "partial", next_action="reconcile_child_task",
+                event_payload={"child_task_ids": unresolved_child_ids},
+            )
+            return self.store.get_task(user_id, task_id)
 
-        return self.store.transition_task_run(
+        if any(step.get("status") == "running" for step in task.get("steps", [])):
+            # A running tool step can be between receipt.start and the actual
+            # external call. Cancellation cannot prove it was not dispatched;
+            # keep it visibly ambiguous instead of hiding it as cancelled.
+            step = next(step for step in task["steps"] if step.get("status") == "running")
+            self.finish_step(
+                user_id, task_id, step["step_id"], outcome="unknown",
+                reason="cancel_requested_during_tool_dispatch",
+            )
+            self.transition_phase(
+                user_id, task_id, "partial", next_action="manual_tool_reconciliation"
+            )
+            result = self.store.get_task(user_id, task_id)
+            self._project_child_cancellation(user_id, result)
+            return result
+
+        cancelled = self.store.transition_task_run(
             user_id, task_id, expected_status=task["status"],
             expected_version=int(task["version"]), new_status="cancelled",
             cancellation_requested=True,
         )
+        self.transition_phase(
+            user_id, task_id, "failed", next_action="task_cancelled"
+        )
+        self._project_child_cancellation(user_id, cancelled)
+        return self.store.get_task(user_id, task_id)
 
 
 __all__ = ["TaskController"]
