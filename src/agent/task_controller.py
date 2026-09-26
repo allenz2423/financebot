@@ -99,9 +99,109 @@ class TaskController:
         )
 
     def create_plan(
-        self, user_id: str, task_id: str, steps: list[Mapping[str, Any]]
+        self,
+        user_id: str,
+        task_id: str,
+        steps: list[Mapping[str, Any]],
+        *,
+        workflow_ref: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
-        return self.store.create_task_plan(user_id, task_id, steps)
+        return self.store.create_task_plan(
+            user_id, task_id, steps, workflow_ref=workflow_ref
+        )
+
+    def create_workflow_plan(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        registry,
+        workflow_id: str,
+        version: str,
+        expected_digest: str,
+    ) -> list[dict[str, Any]]:
+        """Resolve an exact registered definition and atomically pin its plan."""
+        definition = registry.get(workflow_id, version)
+        digest = registry.digest(workflow_id, version)
+        if digest != expected_digest:
+            raise ValueError("selected workflow digest does not match the registered definition")
+        return self.store.create_task_plan(
+            user_id,
+            task_id,
+            registry.plan_steps(workflow_id, version),
+            workflow_ref={
+                "workflow_id": workflow_id,
+                "version": version,
+                "digest": digest,
+            },
+        )
+
+    def validate_workflow_dispatch(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        registry,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> None:
+        """Fail closed on missing/changed workflow versions or altered steps/args."""
+        pin = self.store.get_task_workflow_pin(user_id, task_id)
+        if pin is None:
+            return
+        try:
+            definition = registry.get(pin["workflow_id"], pin["version"])
+            actual_digest = registry.digest(pin["workflow_id"], pin["version"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise PermissionError(
+                "WORKFLOW_PIN_UNAVAILABLE: the exact workflow version is unavailable; "
+                "no action was dispatched."
+            ) from exc
+        if actual_digest != pin["digest"]:
+            raise PermissionError(
+                "WORKFLOW_PIN_MISMATCH: the pinned workflow definition changed; "
+                "no action was dispatched."
+            )
+        task = self.store.get_task(user_id, task_id)
+        plan_steps = [
+            step for step in task["steps"]
+            if step.get("description") is not None
+        ]
+        if any(step.get("status") == "running" for step in plan_steps):
+            raise PermissionError(
+                "WORKFLOW_STEP_IN_PROGRESS: the current workflow step must reach a "
+                "known terminal state before another step can be dispatched."
+            )
+        if len(plan_steps) != len(definition.steps):
+            raise PermissionError(
+                "WORKFLOW_PLAN_MISMATCH: persisted steps do not match the pinned version."
+            )
+        for persisted, defined in zip(plan_steps, definition.steps):
+            if (
+                persisted.get("next_action") != f"dispatch:{defined.tool_name}"
+                or persisted.get("description") != defined.description
+                or persisted.get("completion_criteria") != defined.completion_criteria
+            ):
+                raise PermissionError(
+                    "WORKFLOW_PLAN_MISMATCH: persisted steps do not match the pinned version."
+                )
+        next_index = next(
+            (
+                index for index, step in enumerate(plan_steps)
+                if step.get("status") in {"ready", "pending"}
+            ),
+            None,
+        )
+        if next_index is None:
+            raise PermissionError("WORKFLOW_PLAN_COMPLETE: no further workflow action is dispatchable.")
+        expected_step = definition.steps[next_index]
+        if expected_step.tool_name != tool_name:
+            raise PermissionError(
+                f"WORKFLOW_STEP_ORDER: pinned workflow requires {expected_step.tool_name!r} next."
+            )
+        registry.validate_arguments(
+            pin["workflow_id"], pin["version"], next_index, arguments
+        )
 
     def has_plan(self, user_id: str, task_id: str) -> bool:
         return self.store.task_has_plan(user_id, task_id)
@@ -230,6 +330,8 @@ class TaskController:
         task = self.store.get_task(user_id, task_id)
         if task["status"] not in {"queued", "running"}:
             raise ValueError("task is not dispatchable")
+        if any(step["status"] == "running" for step in task["steps"]):
+            raise ValueError("an existing task step is still running")
         pending = next((step for step in task["steps"] if step["status"] == "pending"), None)
         if pending is not None:
             if pending.get("next_action") != f"dispatch:{tool_name}":

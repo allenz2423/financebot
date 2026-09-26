@@ -96,8 +96,93 @@ def test_task_plan_is_bounded_and_multi_action_policy_is_deterministic():
         steps["items"]["required"]
     )
     assert "task_plan" in llm.EXPECTED_TOOL_NAMES
+    parameters = schema["parameters"]
+    assert {
+        "workflow_id", "workflow_version", "workflow_digest", "steps",
+    } <= set(parameters["properties"])
+    assert parameters["additionalProperties"] is False
+    assert "never both" in schema["description"]
+    assert "pins the exact version/digest" in schema["description"]
     assert llm._requires_durable_plan("1. Search\n2. Read\n3. Summarize", set())
     assert llm._requires_durable_plan("Please create a PDF report", set())
+
+
+def test_task_plan_selects_either_manual_steps_or_an_exact_workflow_pin():
+    import src.services.llm as llm
+
+    workflow_id, version = "gmail.triage", "1.0.0"
+    digest = llm.WORKFLOW_REGISTRY.digest(workflow_id, version)
+    selected_steps, pin = llm._resolve_task_plan_selection(
+        {
+            "workflow_id": workflow_id,
+            "workflow_version": version,
+            "workflow_digest": digest,
+        },
+        llm.WORKFLOW_REGISTRY,
+    )
+    assert [step["tool_name"] for step in selected_steps] == [
+        "search_gmail", "read_gmail_message",
+    ]
+    assert pin == {
+        "workflow_id": workflow_id, "version": version, "digest": digest,
+    }
+
+    manual_steps = [
+        {"tool_name": "search_gmail", "description": "Search", "completion_criteria": "IDs"},
+        {"tool_name": "read_gmail_message", "description": "Read", "completion_criteria": "Bodies"},
+    ]
+    selected_manual, manual_pin = llm._resolve_task_plan_selection(
+        {"steps": manual_steps}, llm.WORKFLOW_REGISTRY
+    )
+    assert selected_manual == manual_steps
+    assert manual_pin is None
+
+    with pytest.raises(ValueError, match="requires only"):
+        llm._resolve_task_plan_selection(
+            {"steps": manual_steps, "workflow_id": workflow_id},
+            llm.WORKFLOW_REGISTRY,
+        )
+    with pytest.raises(ValueError, match="digest"):
+        llm._resolve_task_plan_selection(
+            {
+                "workflow_id": workflow_id,
+                "workflow_version": version,
+                "workflow_digest": "0" * 64,
+            },
+            llm.WORKFLOW_REGISTRY,
+        )
+
+    # Even a registry injected after startup cannot turn control tools into
+    # executable workflow steps.
+    from src.services.workflow_registry import WorkflowDefinition, WorkflowRegistry, WorkflowStep
+    control = WorkflowDefinition(
+        workflow_id="test.control", version="1.0.0",
+        trigger_hints=("test control selection",),
+        steps=(
+            WorkflowStep("explore_domain", "Explore", "Discovery completes."),
+            WorkflowStep("search_gmail", "Search", "Messages are found."),
+        ),
+        guardrails=("Normal authorization still applies.",),
+        result_schema={
+            "type": "object", "properties": {"summary": {"type": "string"}},
+            "required": ["summary"], "additionalProperties": False,
+        },
+    )
+    injected_registry = WorkflowRegistry(
+        {"explore_domain", "search_gmail"},
+    )
+    # Bypass normal registration to simulate stale/tampered in-memory state;
+    # selection must retain its own action-tool boundary.
+    injected_registry._definitions[(control.workflow_id, control.version)] = control
+    with pytest.raises(ValueError, match="plan-control tools"):
+        llm._resolve_task_plan_selection(
+            {
+                "workflow_id": control.workflow_id,
+                "workflow_version": control.version,
+                "workflow_digest": injected_registry.digest(control.workflow_id, control.version),
+            },
+            injected_registry,
+        )
     assert not llm._requires_durable_plan("What is my current balance?", set())
     assert llm._tool_requires_durable_plan("monitor_add_rule")
     assert llm._tool_requires_durable_plan("set_savings_goal")

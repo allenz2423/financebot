@@ -30,6 +30,32 @@ def test_search_tools_is_model_callable_control_tool_not_authority():
     assert "search_tools" in llm._PLAN_CONTROL_TOOLS
 
 
+def test_search_tools_returns_candidate_workflows_without_granting_or_mutating_scope():
+    allowed = {"search_gmail", "read_gmail_message"}
+
+    candidates = llm._workflow_candidates_for_discovery(
+        "check new email",
+        "summarize recent Gmail",
+        allowed,
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["workflow_id"] == "gmail.triage"
+    assert candidate["version"] == "1.0.0"
+    assert len(candidate["digest"]) == 64
+    assert candidate["required_tools"] == ["search_gmail", "read_gmail_message"]
+    assert [step["tool_name"] for step in candidate["steps"]] == candidate["required_tools"]
+    assert candidate["guardrails"]
+    assert candidate["result_schema"]["type"] == "object"
+    assert allowed == {"search_gmail", "read_gmail_message"}
+
+    # A workflow requiring a hidden tool is not suggested into this scope.
+    assert llm._workflow_candidates_for_discovery(
+        "check new email", "", {"search_gmail"}
+    ) == []
+
+
 def test_runtime_effect_labeler_never_calls_unclassified_tools_read_only():
     registry, _calls = _registry()
 

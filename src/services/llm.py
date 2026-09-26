@@ -43,6 +43,7 @@ from src.services.provider_protocol import parse_stream_line
 from src.services.route_profiles import AUTO_ROUTE_NAMES, parse_route_profiles, profile_for
 from src.services.tool_results import ToolResultEnvelope
 from src.services.tool_registry import ToolDefinition, ToolRegistry
+from src.services.workflow_registry import built_in_workflows
 from src.services.tool_catalog import validate_tool_catalog
 from src.services.tool_intent import infer_required_tools
 from src.services.autonomy_contract import (
@@ -506,6 +507,7 @@ def _list_durable_tasks(
             "status": task["status"],
             "lane": task.get("lane"),
             "updated_at": task.get("updated_at"),
+            "workflow": store.get_task_workflow_pin(user_id, task["task_id"]),
             "wait_reason": str(task.get("wait_reason") or "")[:200] or None,
             "steps": [
                 {
@@ -927,6 +929,52 @@ def _validate_plan_tool_names(steps: list[dict]) -> None:
             raise ValueError(
                 f"plan contains an unavailable or non-action tool: {planned_tool!r}"
             )
+
+
+def _resolve_task_plan_selection(
+    arguments: dict,
+    registry,
+) -> tuple[list[dict[str, str]], dict[str, str] | None]:
+    """Resolve either manual steps or one exact registered workflow version."""
+    if not isinstance(arguments, dict):
+        raise ValueError("task_plan arguments must be an object")
+    workflow_keys = {"workflow_id", "workflow_version", "workflow_digest"}
+    selected = workflow_keys.intersection(arguments)
+    if selected:
+        if set(arguments) != workflow_keys:
+            raise ValueError(
+                "workflow task_plan requires only workflow_id, workflow_version, "
+                "and workflow_digest"
+            )
+        workflow_id = str(arguments.get("workflow_id") or "")
+        version = str(arguments.get("workflow_version") or "")
+        expected_digest = str(arguments.get("workflow_digest") or "")
+        definition = registry.get(workflow_id, version)
+        digest = registry.digest(workflow_id, version)
+        if digest != expected_digest:
+            raise ValueError("selected workflow digest does not match the registered definition")
+        unavailable = set(definition.required_tools) - KNOWN_TOOLS
+        if unavailable:
+            raise ValueError(
+                f"selected workflow references a noncanonical tool: {sorted(unavailable)}"
+            )
+        controls = set(definition.required_tools) & _PLAN_CONTROL_TOOLS
+        if controls:
+            raise ValueError(
+                f"selected workflow contains plan-control tools: {sorted(controls)}"
+            )
+        return registry.plan_steps(workflow_id, version), {
+            "workflow_id": workflow_id,
+            "version": version,
+            "digest": digest,
+        }
+    if set(arguments) != {"steps"}:
+        raise ValueError(
+            "task_plan requires either steps or one exact workflow reference"
+        )
+    steps = arguments.get("steps")
+    _validate_plan_tool_names(steps)
+    return steps, None
 
 
 def _mark_gmail_turn_recall_excluded(user_id: str, turn_id: str) -> None:
@@ -2828,7 +2876,7 @@ BOT_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_tools",
-            "description": "Search Delilah's full callable tool catalog by meaning. Returns up to six matching schemas with availability and side-effect metadata. Discovery does not grant approval or permission; normal controller, grant, and receipt checks still apply when a tool is called.",
+            "description": "Search Delilah's callable tools and versioned declarative workflows by meaning. Returns up to six matching tool schemas plus bounded workflow candidates. Discovery does not grant approval or permission: workflow matches are suggestions only, and normal controller, grant, argument, and receipt checks still apply when a tool is called.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3790,15 +3838,20 @@ BOT_TOOLS_SCHEMA = [
         "function": {
             "name": "task_plan",
             "description": (
-                "Persist an ordered 2–20 step plan for the active durable task before its "
+                "Persist a versioned declarative workflow or an ordered 2–20 step plan for the active durable task before its "
                 "actions run. Each step names the exact tool to dispatch, a short description, "
                 "and observable completion criteria. This changes only Delilah task metadata; "
-                "it does not execute the listed tools. Call it alone before other tools when "
-                "a durable plan is required."
+                "it does not execute the listed tools. Select either `steps` OR an exact "
+                "workflow_id/workflow_version/workflow_digest returned by search_tools, never both. "
+                "The server derives workflow steps and pins the exact version/digest. Call it alone "
+                "before other tools when a durable plan is required."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "workflow_id": {"type": "string", "description": "Exact candidate workflow ID returned by search_tools."},
+                    "workflow_version": {"type": "string", "description": "Exact version returned by search_tools; never substitute a newer version."},
+                    "workflow_digest": {"type": "string", "description": "Exact SHA-256 digest returned by search_tools."},
                     "steps": {
                         "type": "array",
                         "minItems": 2,
@@ -3814,7 +3867,8 @@ BOT_TOOLS_SCHEMA = [
                         },
                     },
                 },
-                "required": ["steps"],
+                "required": [],
+                "additionalProperties": False,
             },
         },
     },
@@ -5177,6 +5231,31 @@ BOT_TOOLS_SCHEMA = [
 ] + NEW_50_TOOLS_SCHEMA
 
 SCHEMA_TOOL_NAMES = {tool["function"]["name"] for tool in BOT_TOOLS_SCHEMA}
+WORKFLOW_REGISTRY = built_in_workflows(SCHEMA_TOOL_NAMES)
+
+
+def _workflow_candidates_for_discovery(
+    query: str,
+    task_context: str,
+    allowed_names: set[str] | frozenset[str],
+    *,
+    registry=WORKFLOW_REGISTRY,
+) -> list[dict[str, object]]:
+    """Return bounded candidate metadata without changing tool authorization."""
+    search_text = (str(query or "") + " " + str(task_context or "")).strip()[:2000]
+    if not search_text:
+        return []
+    available = set(allowed_names)
+    candidates: list[dict[str, object]] = []
+    for workflow in registry.suggest(search_text, limit=3):
+        if not set(workflow.required_tools).issubset(available):
+            continue
+        record = workflow.to_dict()
+        record["digest"] = registry.digest(workflow.workflow_id, workflow.version)
+        candidates.append(record)
+    return candidates
+
+
 EXPECTED_TOOL_NAMES = {
     "scrape_rendered_page",
     "await_user",
@@ -10265,6 +10344,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         task_controller.validate_tool_dispatch(
                             uid, active_task_id, tool_name=func_name, arguments=args
                         )
+                    if active_task_id:
+                        task_controller.validate_workflow_dispatch(
+                            uid,
+                            active_task_id,
+                            registry=WORKFLOW_REGISTRY,
+                            tool_name=func_name,
+                            arguments=args,
+                        )
 
                     # Dynamic audit activation: a worklist/getter tool can activate
                     # the audit controller even when the original user prompt was
@@ -10621,6 +10708,11 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 availability_reasons=availability_reasons,
                                 limit=6,
                             )
+                            workflow_candidates = _workflow_candidates_for_discovery(
+                                discovery_query,
+                                task_context_text,
+                                discovery_allowed,
+                            )
                             discovered_names = [
                                 item["name"] for item in discovery_result["tools"]
                             ]
@@ -10629,7 +10721,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             db_result = json.dumps({
                                 "status": "ok",
                                 **discovery_result,
-                                "notice": "Discovery does not grant approval or bypass dispatch-time controller, grant, or receipt checks.",
+                                "workflows": workflow_candidates,
+                                "notice": "Workflow matches are candidates only, not authorization or consent. Selecting one persists its exact version/digest and derived plan; every action still passes dispatch-time tool, argument, grant, receipt, and controller checks.",
                             }, separators=(",", ":"))
                         except Exception as discovery_error:
                             # Discovery failure must not strand existing
@@ -11603,11 +11696,28 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             raise RuntimeError(
                                 "task_plan requires an active durable task; no plan was saved"
                             )
-                        steps = args.get("steps")
-                        _validate_plan_tool_names(steps)
-                        plan = TaskController(store).create_plan(uid, task_id, steps)
+                        controller = TaskController(store)
+                        steps, workflow_ref = _resolve_task_plan_selection(
+                            args, WORKFLOW_REGISTRY
+                        )
+                        if workflow_ref is not None:
+                            plan = controller.create_workflow_plan(
+                                uid,
+                                task_id,
+                                registry=WORKFLOW_REGISTRY,
+                                workflow_id=workflow_ref["workflow_id"],
+                                version=workflow_ref["version"],
+                                expected_digest=workflow_ref["digest"],
+                            )
+                        else:
+                            plan = controller.create_plan(uid, task_id, steps)
                         db_result = json.dumps(
-                            {"status": "saved", "task_id": task_id, "steps": plan},
+                            {
+                                "status": "saved",
+                                "task_id": task_id,
+                                "steps": plan,
+                                "workflow": workflow_ref,
+                            },
                             ensure_ascii=False, separators=(",", ":"),
                         )
                     elif func_name == "delegate_task":

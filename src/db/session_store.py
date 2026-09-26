@@ -74,6 +74,7 @@ _ALLOWED_TASK_EVENT_KEYS = {
     "toolname", "operation", "risk", "summary", "approvalexpiresat",
     "approvalstatus", "approvedby", "decidedat",
     "plannedstepids", "stepcount",
+    "workflowid", "workflowversion", "workflowdigest",
     "phase", "callcount", "toolnames", "providercallids", "childtaskid", "parenttaskid",
     "turnid", "delegationgrantid", "allowedtools", "budget", "maxsteps", "timeoutseconds", "maxtokens",
     "terminalchildids", "childtaskids",
@@ -1002,6 +1003,8 @@ class SessionStore:
         user_id: str,
         task_id: str,
         steps: list[Mapping[str, Any]],
+        *,
+        workflow_ref: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically seed an ordered plan on the task's canonical step rows."""
         owner = _required(user_id, "user_id")
@@ -1023,6 +1026,25 @@ class SessionStore:
                 "description": description,
                 "completion_criteria": criteria,
             })
+        workflow_pin: dict[str, str] | None = None
+        if workflow_ref is not None:
+            if not isinstance(workflow_ref, Mapping) or set(workflow_ref) != {
+                "workflow_id", "version", "digest",
+            }:
+                raise ValueError(
+                    "workflow_ref must contain exactly workflow_id, version, and digest"
+                )
+            workflow_pin = {
+                "workflow_id": _required(workflow_ref.get("workflow_id"), "workflow_id"),
+                "version": _required(workflow_ref.get("version"), "workflow_version"),
+                "digest": _required(workflow_ref.get("digest"), "workflow_digest"),
+            }
+            if (
+                len(workflow_pin["workflow_id"]) > 120
+                or len(workflow_pin["version"]) > 80
+                or re.fullmatch(r"[0-9a-f]{64}", workflow_pin["digest"]) is None
+            ):
+                raise ValueError("workflow pin fields are malformed")
         now = _now()
         with self._write() as conn:
             task = self._task_pk(conn, owner, task_key)
@@ -1060,6 +1082,14 @@ class SessionStore:
                     "status": "planned",
                     "step_count": len(normalized),
                     "planned_step_ids": [step["step_id"] for step in normalized],
+                    **(
+                        {
+                            "workflow_id": workflow_pin["workflow_id"],
+                            "workflow_version": workflow_pin["version"],
+                            "workflow_digest": workflow_pin["digest"],
+                        }
+                        if workflow_pin is not None else {}
+                    ),
                 },
             )
             return [
@@ -1072,6 +1102,38 @@ class SessionStore:
                 }
                 for order, step in enumerate(normalized)
             ]
+
+    def get_task_workflow_pin(
+        self, user_id: str, task_id: str
+    ) -> dict[str, str] | None:
+        """Return the immutable workflow reference pinned with the task plan."""
+        owner = _required(user_id, "user_id")
+        task_key = _required(task_id, "task_id")
+        with self._lock:
+            task = self._task_pk(self.connection, owner, task_key)
+            rows = self.connection.execute(
+                "SELECT payload_json FROM task_events "
+                "WHERE task_id=? AND event_type='task.plan_created' ORDER BY event_id",
+                (task["task_id"],),
+            ).fetchall()
+            if len(rows) > 1:
+                raise ValueError("task has more than one plan event")
+            if not rows:
+                return None
+            payload = _decode(rows[0]["payload_json"], {})
+            if not isinstance(payload, dict):
+                raise ValueError("task plan event payload is malformed")
+            keys = {"workflow_id", "workflow_version", "workflow_digest"}
+            present = keys.intersection(payload)
+            if not present:
+                return None
+            if present != keys:
+                raise ValueError("task workflow pin is incomplete")
+            return {
+                "workflow_id": str(payload["workflow_id"]),
+                "version": str(payload["workflow_version"]),
+                "digest": str(payload["workflow_digest"]),
+            }
 
     def task_has_plan(self, user_id: str, task_id: str) -> bool:
         owner = _required(user_id, "user_id")
@@ -1189,6 +1251,12 @@ class SessionStore:
                 raise TaskNotFound("task step is not present in the requested owner scope")
             if task["status"] != before or int(task["version"]) != task_version:
                 raise ConcurrentTaskUpdate("task status/version changed before step claim")
+            running_step = conn.execute(
+                "SELECT 1 FROM task_steps WHERE task_id=? AND status='running' LIMIT 1",
+                (task_key,),
+            ).fetchone()
+            if running_step is not None:
+                raise ConcurrentTaskUpdate("another task step is already running")
             if step["status"] != "pending":
                 raise ConcurrentTaskUpdate("only a pending step can be claimed")
             _call_pk, receipt_key = self._validate_task_links(
