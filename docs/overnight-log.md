@@ -2,16 +2,25 @@
 
 ## Current stopping summary
 
-- **Passed:** Steps 0–4 and roadmap items 1, 2, 4, 7, and 9. The Step 4 gate is pushed as `93cd834` on `agentic-roadmap/full-run`; `main` was not changed.
-- **In progress / next:** Roadmap item 3 — durable background execution and completion delivery. Start with the durable single-worker queue/claim/recovery path, then add completion delivery; startup rehydration should eventually remove the current “resume on next matching interaction” trigger.
-- **Remaining in recommended order:** item 3 in progress; group 4 items 11, 5, 6 pending; group 5 items 8, 12 pending; group 6 items 10, 13, 14, 15 pending.
+- **Passed:** Steps 0–4 and roadmap items 1, 2, 3, 4, 7, and 9. Item 3 is gated for one bot process per local task database, with configurable in-process workers. The Step 4 gate is pushed as `93cd834` on `agentic-roadmap/full-run`; `main` was not changed.
+- **In progress / next:** Roadmap item 11 — deterministic verification and repair gates. Item 3 does not support simultaneous bot processes or hosts sharing the task database/provider.
+- **Remaining in recommended order:** group 4 item 11, then items 5 and 6; group 5 items 8 and 12; group 6 items 10, 13, 14, and 15.
 - **Human decisions recorded:** (1) affirmative choice replies resume into planning as input-only; affirmative approvals require human grant confirmation before dispatch (fail-closed); (2) reconciliation notice delivery uses migration 008's atomic single-claim index `ux_task_reconciliation_notice_claimed_once`; (3) scheduler defaults are one worker, one active task per owner, and eight queued tasks per lane; model inference is scheduled at unit granularity; (4) children inherit a strict subset of parent tools, cannot delegate recursively, parents yield while awaiting children, and cancellation cascades. None of these decisions was reversed.
-- **Verification:** Step 4 focused suite: 114 passed. Full isolated suite: 676 passed, 1 skipped, 10 known clean-database/seed-data failures (budgeting, intelligence, reconciliation, rewards, and world-model fixtures); `.env` was disabled, dummy Discord credentials were used, and the live `data/finances.db` was not accessed.
-- **Latest pushed code gate:** `93cd834 [gate] Step 4 bounded delegation; 114 focused tests pass`.
-- **Deferred suggestions / constraints:** current recovery rehydrates safe queued children on the next interaction in the exact original conversation; moving that sweep to process/scheduler startup is part of Item 3. Delegation defaults are configurable via `DELEGATION_MAX_STEPS=5`, `DELEGATION_MAX_TIMEOUT_SECONDS=60`, and `DELEGATION_MAX_TOKENS=4096` (per generated response); scheduler/provider defaults remain authoritative. Independent model review and browser automation remain off by default.
-- **Review first:** inspect Step 4's restart/receipt/grant paths in `93cd834`, then continue Item 3's durable claims and completion delivery.
+- **Verification:** Item 3 focused recovery/store/delegation/process-lock suite: 73 passed. Full isolated suite: 721 passed, 1 skipped, 10 known clean-database/seed-data failures (budgeting, intelligence, reconciliation, rewards, and world-model fixtures); `.env` was disabled, dummy Discord credentials were used, and the live `data/finances.db` was not accessed.
+- **Latest pushed code gate:** `93cd834 [gate] Step 4 bounded delegation; 114 focused tests pass`. Item 3's gate is local and pending commit/push.
+- **Human decision needed:** whether to support simultaneous bot processes/hosts sharing a task database/provider. “Leases” is underspecified (topology, expiry, renewal, fencing, and shared provider-capacity semantics). Keep distributed execution disabled; do not invent a TTL.
+- **Deferred suggestions / constraints:** add an integration test showing direct delegation and startup recovery contending for the same owner's active-child cap. The per-owner semaphore is used in both paths and direct dispatch is tested. Delegation defaults are configurable via `DELEGATION_MAX_STEPS=5`, `DELEGATION_MAX_TIMEOUT_SECONDS=60`, and `DELEGATION_MAX_TOKENS=4096` (per generated response); independent model review and browser automation remain off by default.
+- **Review first:** inspect Item 3's recovery, reconciliation parking, and completion at-most-once paths, then begin Item 11.
 
 ## Progress
+
+### Item 3 — durable background execution and completion delivery — passed for single-process deployments
+
+- Added startup recovery and a recurring fair queue sweep for durable delegated child tasks, reusing `task_runs`/`task_steps` and existing call/receipt evidence. Added per-owner queued and active caps, configurable worker count, provider limits, pagination, and an OS-held database process lock; another bot process using the same local DB path fails closed.
+- Added restart-safe child completion notices with owner-scoped destination lookup, status-only content, atomic claim/start/delivered events, and no resend after a potentially ambiguous send. Invalid scopes, resume failures, and startup recovery failures atomically park the exact child/parent pair for reconciliation. Periodic recovery does not reinterpret live running tasks as stale.
+- Deployment boundary: multiple worker coroutines inside one Delilah process are supported; simultaneous processes/hosts sharing the DB/provider are not. This topology decision remains open; no TTL or fencing policy was invented.
+- Verification: final full isolated suite: 721 passed, 1 skipped, and 10 known clean-database/seed-data failures. `py_compile` and `git diff --check` passed. Fresh critic found no blockers in startup recovery/pagination fixes.
+- Deferred suggestion: add an integration test showing direct delegation and startup recovery contending for the same owner's active-child cap.
 
 ### Step 4 — bounded delegation as child tasks — passed
 
