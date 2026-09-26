@@ -1191,15 +1191,35 @@ CREATE TABLE IF NOT EXISTS kg_claims (
     parent_claim_ids TEXT,
     evidence_refs TEXT,
     is_scenario INTEGER DEFAULT 0,
-    immutable INTEGER DEFAULT 0
+    immutable INTEGER DEFAULT 0,
+    owner_user_id TEXT,
+    visibility TEXT NOT NULL DEFAULT 'legacy_private'
 )
 """)
 
-# Migration guard: pre-existing DBs created kg_claims without the immutable
-# column; CREATE TABLE IF NOT EXISTS never alters an existing table.
-_kg_claim_cols = {r[1] for r in c.execute("PRAGMA table_info(kg_claims)").fetchall()}
-if "immutable" not in _kg_claim_cols:
-    c.execute("ALTER TABLE kg_claims ADD COLUMN immutable INTEGER DEFAULT 0")
+def _ensure_kg_claim_scope_schema(database_conn):
+    """Additive migration for per-user claim ownership and legacy quarantine."""
+    columns = {
+        row[1] for row in database_conn.execute("PRAGMA table_info(kg_claims)").fetchall()
+    }
+    if "immutable" not in columns:
+        database_conn.execute("ALTER TABLE kg_claims ADD COLUMN immutable INTEGER DEFAULT 0")
+    if "owner_user_id" not in columns:
+        database_conn.execute("ALTER TABLE kg_claims ADD COLUMN owner_user_id TEXT")
+    if "visibility" not in columns:
+        # Existing ownership is unknowable. Quarantine old claims by default;
+        # user-anchor legacy claims remain available only to that same owner.
+        database_conn.execute(
+            "ALTER TABLE kg_claims ADD COLUMN visibility TEXT NOT NULL "
+            "DEFAULT 'legacy_private'"
+        )
+    database_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_claims_owner_active "
+        "ON kg_claims(owner_user_id, visibility, tx_retracted_at, subject_id)"
+    )
+
+
+_ensure_kg_claim_scope_schema(conn)
 
 # Immutable web knowledge pins: a user (or Delilah, with user sign-off) can
 # pin a researched URL so it is treated as authoritative without re-verification.
@@ -1230,9 +1250,32 @@ CREATE TABLE IF NOT EXISTS kg_dossiers (
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     tags TEXT,
-    updated_at TEXT DEFAULT (datetime('now'))
+    updated_at TEXT DEFAULT (datetime('now')),
+    owner_user_id TEXT,
+    visibility TEXT NOT NULL DEFAULT 'legacy_private'
 )
 """)
+
+
+def _ensure_kg_dossier_scope_schema(database_conn):
+    """Add owner visibility to dossiers; unknown legacy ownership stays private."""
+    columns = {
+        row[1] for row in database_conn.execute("PRAGMA table_info(kg_dossiers)").fetchall()
+    }
+    if "owner_user_id" not in columns:
+        database_conn.execute("ALTER TABLE kg_dossiers ADD COLUMN owner_user_id TEXT")
+    if "visibility" not in columns:
+        database_conn.execute(
+            "ALTER TABLE kg_dossiers ADD COLUMN visibility TEXT NOT NULL "
+            "DEFAULT 'legacy_private'"
+        )
+    database_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dossiers_owner_visibility "
+        "ON kg_dossiers(owner_user_id, visibility, primary_entity_id)"
+    )
+
+
+_ensure_kg_dossier_scope_schema(conn)
 
 c.execute("""
 CREATE VIRTUAL TABLE IF NOT EXISTS kg_search_fts USING fts5(

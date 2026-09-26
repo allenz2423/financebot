@@ -21,6 +21,7 @@ normal approval, authorization, and receipt controls.
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 from typing import Literal, Mapping
 
@@ -197,6 +198,21 @@ _TASK_STEER_REQUEST = re.compile(
     r"(?P<correction>[\s\S]{2,500})\s*$",
     re.IGNORECASE,
 )
+_PROFILE_FIELD_NAMES = (
+    "risk_tolerance|autonomy_limits|notification_preferences|"
+    "preferred_model|presentation_style|inferred_preference_learning"
+)
+_PROFILE_SET_REQUEST = re.compile(
+    r"^\s*(?:please\s+)?set\s+my\s+(?:operating\s+)?profile\s+field\s+"
+    rf"(?P<field>{_PROFILE_FIELD_NAMES})\s+(?:to|=)\s*(?P<value>[\s\S]{{1,500}}?)"
+    r"\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+_PROFILE_FORGET_REQUEST = re.compile(
+    r"^\s*(?:please\s+)?forget\s+my\s+(?:operating\s+)?profile"
+    rf"(?:\s+field\s+(?P<field>{_PROFILE_FIELD_NAMES}))?\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
 _PULL_ONLY_PERMISSION = MutationPermission(
     tool_name="sync_plaid_accounting",
     exact_arguments=(
@@ -318,6 +334,58 @@ def build_autonomy_contract(
             "Obtain the user's specific decision before proceeding.",
             evidence=("A clear answer to the pending decision",),
             completion=("Record the decision as input; do not treat it as broader approval",),
+        )
+
+    profile_set_match = _PROFILE_SET_REQUEST.fullmatch(text)
+    if profile_set_match:
+        field = profile_set_match.group("field").casefold()
+        raw_value = profile_set_match.group("value").strip()
+        try:
+            if field in {"autonomy_limits", "notification_preferences"}:
+                value = json.loads(raw_value)
+            elif field == "inferred_preference_learning":
+                parsed = raw_value.casefold()
+                value = True if parsed == "true" else False if parsed == "false" else None
+            elif field in {"risk_tolerance", "presentation_style"}:
+                value = raw_value.casefold()
+            else:
+                value = raw_value
+        except (TypeError, ValueError):
+            value = None
+        if value is not None:
+            values = {field: value}
+            return _contract(
+                "execute",
+                "Change only the exact operating-profile field the user named.",
+                evidence=("A persisted owner-scoped profile value and provenance",),
+                completion=("Report the exact profile field that changed",),
+                permissions=(MutationPermission(
+                    "manage_user_profile",
+                    (("action", "set"), ("values", values)),
+                    target_scope="user_profile",
+                ),),
+                required_tools=frozenset({"manage_user_profile"}),
+                explicit_mutation_intent="manage_user_profile",
+            )
+
+    profile_forget_match = _PROFILE_FORGET_REQUEST.fullmatch(text)
+    if profile_forget_match:
+        field = profile_forget_match.group("field")
+        exact_arguments = {"action": "forget"}
+        if field:
+            exact_arguments["fields"] = [field.casefold()]
+        return _contract(
+            "execute",
+            "Forget only the exact operating-profile field or profile requested by the user.",
+            evidence=("An owner-scoped profile deletion result",),
+            completion=("Report which profile field or profile was forgotten",),
+            permissions=(MutationPermission(
+                "manage_user_profile",
+                tuple(sorted(exact_arguments.items())),
+                target_scope="user_profile",
+            ),),
+            required_tools=frozenset({"manage_user_profile"}),
+            explicit_mutation_intent="manage_user_profile",
         )
 
     task_cancel_match = _TASK_CANCEL_REQUEST.fullmatch(text)
@@ -515,6 +583,11 @@ def mutation_allowed(
                 and supplied.get("correction") == expected.get("correction")
                 and isinstance(supplied.get("correction"), str)
                 and 1 <= len(supplied["correction"]) <= 500
+            )
+        if permission.target_scope == "user_profile":
+            return (
+                tool_name == "manage_user_profile"
+                and dict(arguments) == dict(permission.exact_arguments)
             )
         if permission.target_scope == "exact_instruction":
             expected = dict(permission.exact_arguments)

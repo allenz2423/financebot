@@ -569,10 +569,18 @@ async def index_user_financial_profile(user_id: str) -> Dict[str, Any]:
     # 2. Knowledge Graph Claims Points
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     c = conn.cursor()
+    from src.services.world_model import (
+        _claim_visibility_clause,
+        _dossier_visibility_clause,
+    )
+    claim_visibility_sql, claim_visibility_params = _claim_visibility_clause(uid)
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     c.execute(
         "SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority "
-        "FROM kg_claims WHERE tx_retracted_at IS NULL AND (subject_id = ? OR subject_id LIKE ?)",
-        (f"user:{uid}", f"%{uid}%")
+        "FROM kg_claims WHERE tx_retracted_at IS NULL AND valid_from <= ? "
+        "AND (valid_to IS NULL OR valid_to > ?) AND "
+        f"{claim_visibility_sql}",
+        (now_utc, now_utc, *claim_visibility_params),
     )
     claims = c.fetchall()
 
@@ -597,12 +605,13 @@ async def index_user_financial_profile(user_id: str) -> Dict[str, Any]:
             }
         })
 
-    # 3. Dossiers (user-scoped: only index dossiers where primary_entity_id
-    #    references the current user, to prevent cross-user data leakage)
+    # 3. Dossiers follow the same owner/visibility policy as user-facing
+    #    World Model reads; SQLite, not the vector payload, is authoritative.
+    dossier_visibility_sql, dossier_visibility_params = _dossier_visibility_clause(uid)
     c.execute(
         "SELECT doc_id, primary_entity_id, title, content, tags FROM kg_dossiers "
-        "WHERE primary_entity_id = ? OR primary_entity_id LIKE ?",
-        (f"user:{uid}", f"%{uid}%")
+        f"WHERE {dossier_visibility_sql}",
+        dossier_visibility_params,
     )
     dossiers = c.fetchall()
     for row in dossiers:
@@ -1104,7 +1113,6 @@ async def user_vector_drift(user_id: str, collection_name: str = COLLECTION_NAME
 
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     c = conn.cursor()
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     c.execute(
         "SELECT claim_id FROM kg_claims "
         "WHERE tx_retracted_at IS NULL AND valid_from <= ? "
@@ -1170,29 +1178,22 @@ async def reconcile_user_vectors(user_id: str, collection_name: str = COLLECTION
         if p.get("domain") == "world_model_claim" and p.get("claim_id")
         and not (p.get("user_id") or "").strip()
     }
-    # Claims attributed to this user via point payload (non-user subjects like
-    # "perfume:X"); they are not in the user-subject active query but must not
-    # be treated as stale.
-    attributed_ids = {
-        p["claim_id"] for p in indexed_points
-        if p.get("domain") == "world_model_claim" and p.get("claim_id")
-        and (p.get("user_id") or "").strip() == uid
-    }
-
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     c = conn.cursor()
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    from src.services.world_model import _claim_visibility_clause
+    claim_visibility_sql, claim_visibility_params = _claim_visibility_clause(uid)
     c.execute(
         "SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority "
         "FROM kg_claims WHERE tx_retracted_at IS NULL AND valid_from <= ? "
         "AND (valid_to IS NULL OR valid_to > ?) "
-        "AND (subject_id = ? OR subject_id LIKE ?)",
-        (now_utc, now_utc, f"user:{uid}", f"%{uid}%")
+        f"AND {claim_visibility_sql}",
+        (now_utc, now_utc, *claim_visibility_params),
     )
     active_rows = c.fetchall()
 
-    # Claims behind orphan points: re-index them with proper attribution if
-    # they are active and not owned by a different user; otherwise delete.
+    # Adopt legacy orphan points only if the authoritative row is visible to
+    # this owner under the exact same policy as normal reads.
     orphan_active: Dict[str, tuple] = {}
     if orphan_claim_ids:
         placeholders = ",".join("?" for _ in orphan_claim_ids)
@@ -1200,13 +1201,10 @@ async def reconcile_user_vectors(user_id: str, collection_name: str = COLLECTION
             f"SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority "
             f"FROM kg_claims WHERE claim_id IN ({placeholders}) "
             f"AND tx_retracted_at IS NULL AND valid_from <= ? "
-            f"AND (valid_to IS NULL OR valid_to > ?)",
-            (*orphan_claim_ids, now_utc, now_utc),
+            f"AND (valid_to IS NULL OR valid_to > ?) AND {claim_visibility_sql}",
+            (*orphan_claim_ids, now_utc, now_utc, *claim_visibility_params),
         )
         for row in c.fetchall():
-            subj = row[1]
-            if subj.startswith("user:") and uid not in subj:
-                continue  # another user's claim — that user's reconcile owns it
             orphan_active[row[0]] = row
     conn.close()
 
@@ -1215,7 +1213,6 @@ async def reconcile_user_vectors(user_id: str, collection_name: str = COLLECTION
         p["id"] for p in indexed_points
         if p.get("domain") == "world_model_claim" and p.get("claim_id")
         and p["claim_id"] not in active_ids
-        and p["claim_id"] not in attributed_ids
         and p["claim_id"] not in orphan_active
     ]
 
@@ -1272,13 +1269,17 @@ async def vector_reconcile_loop(interval_seconds: Optional[int] = None):
             conn = sqlite3.connect(DB_PATH, timeout=10.0)
             c = conn.cursor()
             c.execute(
-                "SELECT DISTINCT subject_id FROM kg_claims "
+                "SELECT DISTINCT owner_user_id FROM kg_claims "
                 "WHERE tx_retracted_at IS NULL AND valid_from <= ? "
-                "AND (valid_to IS NULL OR valid_to > ?) "
-                "AND subject_id LIKE 'user:%'",
-                (now_utc, now_utc),
+                "AND (valid_to IS NULL OR valid_to > ?) AND owner_user_id IS NOT NULL "
+                "AND visibility = 'private' "
+                "UNION SELECT DISTINCT substr(subject_id, 6) FROM kg_claims "
+                "WHERE tx_retracted_at IS NULL AND valid_from <= ? "
+                "AND (valid_to IS NULL OR valid_to > ?) AND owner_user_id IS NULL "
+                "AND visibility = 'legacy_private' AND subject_id LIKE 'user:%'",
+                (now_utc, now_utc, now_utc, now_utc),
             )
-            users = [row[0].replace("user:", "", 1) for row in c.fetchall()]
+            users = [str(row[0]).strip() for row in c.fetchall() if row[0] and str(row[0]).strip()]
             conn.close()
             for uid in users:
                 try:
@@ -1293,4 +1294,3 @@ async def vector_reconcile_loop(interval_seconds: Optional[int] = None):
         except Exception as e:
             print(f" [VECTOR RECONCILE FAILED] user discovery error: {type(e).__name__}: {e}")
         await asyncio.sleep(interval_seconds)
-

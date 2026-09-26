@@ -4963,16 +4963,19 @@ async def inspect_memory(ctx: commands.Context):
 
     try:
         from src.core.state import get_db
+        from src.services.world_model import list_world_model_claims
+        visible_claims = list_world_model_claims(user_id=user_id, limit=500)
+        claims = [
+            (
+                row.get("claim_id"), row.get("subject_id"), row.get("predicate"),
+                row.get("object_id"), row.get("scalar_value"),
+                row.get("source_authority"), row.get("provenance_type"),
+                row.get("tx_asserted_at"),
+            )
+            for row in visible_claims.get("claims", [])
+        ]
         with get_db() as db:
             cur = db.cursor()
-            cur.execute("""
-                SELECT claim_id, subject_id, predicate, object_id, scalar_value, source_authority, provenance_type, tx_asserted_at
-                FROM kg_claims
-                WHERE tx_retracted_at IS NULL AND (subject_id = ? OR subject_id LIKE ?)
-                ORDER BY tx_asserted_at DESC
-            """, (f"user:{uid}", f"%{uid}%"))
-            claims = cur.fetchall()
-
             cur.execute("""
                 SELECT id, category, content, importance, created_at
                 FROM delilah_memories
@@ -4998,13 +5001,15 @@ async def inspect_memory(ctx: commands.Context):
             return
 
         body_parts = []
-        header = f"**Verified World Model Claims:** {len(claims)} active | **Legacy Notes:** {len(legacy_memories)}"
+        header = f"**Current World Model Claims:** {len(claims)} active | **Legacy Notes:** {len(legacy_memories)}"
+        if visible_claims.get("truncated"):
+            header += " | **Showing at most 500 claims**"
         if qdrant_count is not None:
             header += f" | **Vector-indexed:** {qdrant_count}"
         body_parts.append(header + "\n")
 
         if claims:
-            body_parts.append("### 📌 Active Ground-Truth Claims\n")
+            body_parts.append("### 📌 Active World Model Claims\n")
             for row in claims:
                 cid, subj, pred, obj_id, s_val, auth, prov, ts = row
                 val = obj_id or s_val
@@ -5023,7 +5028,7 @@ async def inspect_memory(ctx: commands.Context):
         report_body = "\n".join(body_parts)
         await _send_command_report(
             ctx,
-            title="🧠 Active Memory & World Model Ground Truth",
+            title="🧠 Active Memory & World Model",
             body=report_body,
             user_id=user_id,
             max_chars=900,
