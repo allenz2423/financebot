@@ -100,7 +100,8 @@ IMPORTANT: You are formulating empirical hypotheses. Ground every insight strict
 
         task_id = f"analyst_{uuid.uuid4().hex[:8]}"
         err, response_data = await schedule_work(
-            task_id, str(user_id), "background", _do_analyst, unit_type="inference"
+            task_id, str(user_id), "background", _do_analyst,
+            unit_type="inference", provider="ollama"
         )
         if err:
             return err

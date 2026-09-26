@@ -59,6 +59,78 @@ def test_get_global_scheduler_uses_agent_max_workers(monkeypatch):
     assert scheduler.max_queue_per_owner == 4
 
 
+def test_malformed_provider_concurrency_falls_back_to_safe_default(monkeypatch):
+    monkeypatch.setenv("MALFORMED_PROVIDER_CONCURRENCY", "not-an-int")
+    limiter = get_provider_limiter("malformed_provider")
+    assert limiter.max_concurrency == 1
+
+
+def test_metrics_latency_snapshot_is_bounded_and_contains_no_tenant_ids():
+    from src.agent.scheduler import SchedulerMetrics
+
+    metrics = SchedulerMetrics()
+    metrics.queue_wait_times.extend([0.010, 0.020, 0.030, float("nan"), -1])
+    metrics.inference_times.append(1.5)
+    report = metrics.latency_snapshot()
+
+    assert report["queue_wait"] == {
+        "count": 3, "p50_ms": 20.0, "p95_ms": 30.0, "max_ms": 30.0,
+    }
+    assert report["inference"] == {
+        "count": 1, "p50_ms": 1500.0, "p95_ms": 1500.0, "max_ms": 1500.0,
+    }
+    assert report["tool"]["count"] == 0
+    assert "owner_id" not in repr(report)
+    assert "task_id" not in repr(report)
+
+
+def test_operator_diagnostics_show_configured_limits_and_aggregated_activity():
+    scheduler = CapacityAwareScheduler(max_workers=1, max_queue_per_owner=8)
+    scheduler.metrics.record_queue_wait(0.25)
+    scheduler.metrics.record_inference(1.0)
+    scheduler.metrics.record_tool(0.2)
+    report = scheduler.diagnostics()
+
+    assert report["limits"]["workers"] == 1
+    assert report["limits"]["queue_per_owner_per_lane"] == 8
+    assert report["activity"]["queued_interactive"] == 0
+    assert report["latency_rolling_last_1000"]["queue_wait"]["p50_ms"] == 250.0
+    assert report["latency_rolling_last_1000"]["tool"]["p50_ms"] == 200.0
+    assert "owner_id" not in repr(report)
+    assert "task_id" not in repr(report)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_status_is_bot_owner_only_and_dms_process_metrics(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from discord.ext import commands
+    from src.bot.commands import bot
+
+    command = bot.get_command("schedulerstatus")
+    assert command is not None
+    author = SimpleNamespace(send=AsyncMock())
+    channel_send = AsyncMock()
+    ctx = SimpleNamespace(
+        author=author,
+        send=channel_send,
+        command=command,
+        bot=SimpleNamespace(is_owner=AsyncMock(return_value=False)),
+    )
+    assert command.checks
+    with pytest.raises(commands.NotOwner):
+        await command.checks[0](ctx)
+
+    from src.agent import scheduler as scheduler_module
+    monkeypatch.setattr(
+        scheduler_module, "get_global_scheduler", lambda: CapacityAwareScheduler()
+    )
+    await command.callback(ctx)
+    author.send.assert_awaited_once()
+    assert "Scheduler provider-capacity wait" in author.send.await_args.args[0]
+    channel_send.assert_not_awaited()
+
+
 @pytest.mark.parametrize("value", ["", "not-an-integer", "1.5"])
 def test_get_global_scheduler_invalid_worker_count_falls_back(monkeypatch, value):
     monkeypatch.setenv("AGENT_MAX_WORKERS", value)
@@ -542,6 +614,173 @@ async def test_multi_provider_capacity_isolation():
 
 
 @pytest.mark.asyncio
+async def test_saturated_provider_does_not_consume_workers_or_starve_other_provider():
+    scheduler = CapacityAwareScheduler(max_workers=2)
+    limited_slot_acquired = asyncio.Event()
+    release_limited_slot = asyncio.Event()
+
+    async def external_limited_request():
+        async with provider_capacity("saturated_provider", max_concurrency=1):
+            limited_slot_acquired.set()
+            await release_limited_slot.wait()
+
+    holder = asyncio.create_task(external_limited_request())
+    await limited_slot_acquired.wait()
+
+    ran_free_provider = asyncio.Event()
+
+    async def limited_job():
+        return "limited-done"
+
+    async def free_job():
+        ran_free_provider.set()
+        return "free-done"
+
+    await scheduler.start()
+    try:
+        limited_future = await scheduler.submit(
+            "limited-task", "owner-a", "background", limited_job,
+            provider="saturated_provider",
+        )
+        free_future = await scheduler.submit(
+            "free-task", "owner-b", "interactive", free_job,
+            provider="free_provider",
+        )
+
+        assert await asyncio.wait_for(free_future, timeout=1.0) == "free-done"
+        assert ran_free_provider.is_set()
+        assert not limited_future.done()
+
+        release_limited_slot.set()
+        assert await asyncio.wait_for(limited_future, timeout=1.0) == "limited-done"
+        await holder
+    finally:
+        release_limited_slot.set()
+        await holder
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_provider_slot_check_acquire_race_requeues_before_using_worker(monkeypatch):
+    scheduler = CapacityAwareScheduler(max_workers=1)
+    limiter = get_provider_limiter("racing_provider", max_concurrency=1)
+    original_try_acquire = limiter.try_acquire_nowait
+    first_attempt = True
+
+    def lose_first_acquisition_race():
+        nonlocal first_attempt
+        if first_attempt:
+            first_attempt = False
+            return False
+        return original_try_acquire()
+
+    monkeypatch.setattr(limiter, "try_acquire_nowait", lose_first_acquisition_race)
+    free_provider_ran = asyncio.Event()
+
+    async def racing_job():
+        return "racing-done"
+
+    async def free_job():
+        free_provider_ran.set()
+        return "free-done"
+
+    await scheduler.start()
+    try:
+        racing_future = await scheduler.submit(
+            "race-task", "owner-a", "background", racing_job,
+            provider="racing_provider",
+        )
+        free_future = await scheduler.submit(
+            "free-task", "owner-b", "interactive", free_job,
+            provider="other_provider",
+        )
+        assert await asyncio.wait_for(free_future, timeout=1.0) == "free-done"
+        assert free_provider_ran.is_set()
+        assert await asyncio.wait_for(racing_future, timeout=1.0) == "racing-done"
+        assert scheduler.metrics.latency_snapshot()["provider_wait"]["count"] == 1
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_provider_wait_is_separate_from_inference_work():
+    scheduler = CapacityAwareScheduler(max_workers=1)
+    provider = "latency_separation_provider"
+    limiter = get_provider_limiter(provider, max_concurrency=1)
+
+    async def short_inference():
+        await asyncio.sleep(0.01)
+        return "done"
+
+    await scheduler.start()
+    provider_held = False
+    try:
+        assert limiter.try_acquire_nowait()
+        provider_held = True
+        future = await scheduler.submit(
+            "latency-task", "latency-owner", "background", short_inference,
+            unit_type="inference", provider=provider,
+        )
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while True:
+            queue = scheduler.get_owner_queue("latency-owner")
+            unit = queue.background_lane[0]
+            if unit.provider_blocked_since is not None:
+                break
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.05)
+        limiter.release_reserved_slot()
+        provider_held = False
+
+        assert await asyncio.wait_for(future, timeout=1.0) == "done"
+        latency = scheduler.metrics.latency_snapshot()
+        assert latency["provider_wait"]["count"] == 1
+        assert latency["provider_wait"]["p50_ms"] > 30
+        assert 0 < latency["inference"]["p50_ms"] < latency["provider_wait"]["p50_ms"]
+    finally:
+        if provider_held:
+            limiter.release_reserved_slot()
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_reserved_context_enters_releases_provider_slot(monkeypatch):
+    scheduler = CapacityAwareScheduler(max_workers=1)
+    limiter = get_provider_limiter("cancel_reserved_provider", max_concurrency=1)
+    context_entered = asyncio.Event()
+
+    class BlockingEnter:
+        async def __aenter__(self):
+            context_entered.set()
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(limiter, "use_reserved_slot", lambda: BlockingEnter())
+
+    async def job():
+        return "not-reached"
+
+    future = await scheduler.submit(
+        "cancel-reserved", "owner", "interactive", job,
+        provider="cancel_reserved_provider",
+    )
+    dispatch = asyncio.create_task(scheduler.dispatch_once())
+    await asyncio.wait_for(context_entered.wait(), timeout=1.0)
+    assert limiter.active_count == 1
+
+    dispatch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+
+    assert limiter.active_count == 0
+    assert limiter._semaphore._value == limiter.max_concurrency
+    assert future.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_cancel_owner_work():
     """Verify cancel_owner_work flags all pending queued units for an owner."""
     scheduler = CapacityAwareScheduler(max_workers=1)
@@ -839,4 +1078,3 @@ async def test_qdrant_get_embeddings_gated_with_provider_limiter(monkeypatch):
     res = await qdrant_client.get_embeddings(["text 1", "text 2"])
     assert len(res) == 2
     assert acquired is True
-

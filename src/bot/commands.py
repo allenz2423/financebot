@@ -5499,6 +5499,69 @@ async def _send_thinking_placeholder(message: discord.Message, handle: _AdvisorR
         print(f" [MESSAGE] Thinking placeholder failed: {type(exc).__name__}: {exc}")
 
 
+@bot.command(name="schedulerstatus", aliases=["scheduler"])
+@commands.is_owner()
+async def scheduler_status_command(ctx: commands.Context):
+    """DM the bot owner privacy-safe queue/provider latency and capacity data."""
+    from src.agent.scheduler import get_global_scheduler
+
+    report = get_global_scheduler().diagnostics()
+    activity = report["activity"]
+    limits = report["limits"]
+    latency = report["latency_rolling_last_1000"]
+
+    def line(label: str, sample: dict[str, float | int]) -> str:
+        return (
+            f"{label}: n={sample['count']}, p50={sample['p50_ms']} ms, "
+            f"p95={sample['p95_ms']} ms, max={sample['max_ms']} ms"
+        )
+
+    providers = limits["providers"] or [{
+        "provider": "default", "limit": 1, "active": 0, "waiting": 0,
+    }]
+    provider_lines = [
+        f"{item['provider']}: {item['active']}/{item['limit']} active, "
+        f"{item['waiting']} waiting"
+        for item in providers
+    ]
+    text = "\n".join([
+        "Scheduler status (since process start; latency window is last 1,000 samples)",
+        f"Limits: workers={limits['workers']}, active/owner="
+        f"{limits['active_tasks_per_owner']}, queued/owner/lane="
+        f"{limits['queue_per_owner_per_lane']}",
+        "Providers: " + "; ".join(provider_lines),
+        f"Queue now: {activity['queued_interactive']} interactive, "
+        f"{activity['queued_background']} background; "
+        f"{activity['active_workers']} active worker(s), "
+        f"{activity['owners_with_queued_work']} owner(s) waiting",
+        line("Queue/admission wait (includes provider wait)", latency["queue_wait"]),
+        line("Scheduler provider-capacity wait", latency["provider_wait"]),
+        line("Scheduled inference work (provider wait excluded)", latency["inference"]),
+        line("Tool dispatch/receipt path", latency["tool"]),
+        f"Cancellations: {activity['cancellations_since_start']}; dispatches: "
+        f"{activity['dispatches_by_lane_since_start']}",
+        "Tool duration is measured from receipt start; calls interrupted before "
+        "completion may not contribute a sample.",
+        "Tune AGENT_MAX_WORKERS, AGENT_MAX_ACTIVE_TASKS_PER_OWNER, "
+        "AGENT_MAX_QUEUE_PER_OWNER, or <PROVIDER>_CONCURRENCY in .env; "
+        "restart Delilah for changes to take effect.",
+    ])
+    try:
+        await ctx.author.send(text[:1900])
+    except discord.Forbidden:
+        await ctx.send("I couldn't DM scheduler diagnostics. Enable direct messages and try again.")
+
+
+@scheduler_status_command.error
+async def scheduler_status_command_error(
+    ctx: commands.Context, error: commands.CommandError
+):
+    if isinstance(error, commands.NotOwner):
+        await ctx.send("Only the configured bot owner can view process-wide scheduler diagnostics.")
+    else:
+        await ctx.send(f"Scheduler diagnostics unavailable: `{type(error).__name__}`")
+
+
 @bot.command(name="resume")
 async def resume_task_command(ctx: commands.Context, task_id: str, *, response: str = ""):
     """Explicitly continue an interrupted task or answer its persisted question.

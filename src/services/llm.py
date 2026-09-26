@@ -170,6 +170,16 @@ def _park_undispatchable_background_child(
 _BACKGROUND_COMPLETION_DELIVERY = None
 
 
+def _configured_llm_provider(value: str, *, setting: str) -> str:
+    """Validate provider names before using them for routing or admission."""
+    provider = str(value or "").strip().lower()
+    if provider not in {"ollama", "openai"}:
+        raise ValueError(
+            f"{setting} must be 'ollama' or 'openai'; got {provider or '(empty)'}"
+        )
+    return provider
+
+
 def set_background_completion_delivery(callback) -> None:
     """Install the host application's scoped terminal-notice delivery adapter."""
     global _BACKGROUND_COMPLETION_DELIVERY
@@ -2037,7 +2047,8 @@ async def maybe_flag_spending_concern(*,user_id: str):
                     return res.json().get("message", {}).get("content", "").strip()
 
         content = await schedule_work(
-            f"concern_{uuid.uuid4().hex[:8]}", str(user_id), "background", _do_nudge, unit_type="inference"
+            f"concern_{uuid.uuid4().hex[:8]}", str(user_id), "background", _do_nudge,
+            unit_type="inference", provider="ollama"
         )
     except Exception as e:
         print(f" [maybe_flag_spending_concern] LLM call failed: {e}")
@@ -2380,7 +2391,8 @@ async def maybe_flag_windfall(merchant, amount, *, user_id: str):
                     return res.json().get("message", {}).get("content", "").strip()
 
         llm_response = await schedule_work(
-            f"windfall_{uuid.uuid4().hex[:8]}", str(user_id), "background", _do_windfall, unit_type="inference"
+            f"windfall_{uuid.uuid4().hex[:8]}", str(user_id), "background", _do_windfall,
+            unit_type="inference", provider="ollama"
         )
     except Exception as e:
         print(f" [maybe_flag_windfall] LLM call failed: {e}")
@@ -2629,7 +2641,8 @@ async def classify_transaction_batch(
                     return res.json().get("message", {}).get("content", "").strip()
 
         raw_content = await schedule_work(
-            f"classify_batch_{uuid.uuid4().hex[:8]}", owner_id, "background", _do_batch_classify, unit_type="inference"
+            f"classify_batch_{uuid.uuid4().hex[:8]}", owner_id, "background", _do_batch_classify,
+            unit_type="inference", provider="ollama"
         )
         if not raw_content:
             print(" [LLM Error] Ollama returned an empty message content field.")
@@ -7927,9 +7940,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
         if is_autonomous_wakeup:
             # Autonomous wakeups default to local inference so a broken
             # continuation cannot consume paid inference indefinitely.
-            llm_provider = os.getenv(
-                "WAKEUP_PROVIDER",
-                "ollama",
+            llm_provider = _configured_llm_provider(
+                os.getenv("WAKEUP_PROVIDER", "ollama"),
+                setting="WAKEUP_PROVIDER",
             ).strip().lower()
 
             wakeup_model = os.getenv(
@@ -7942,7 +7955,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
                 f"model={wakeup_model or '(provider default)'}"
             )
         else:
-            llm_provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+            llm_provider = _configured_llm_provider(
+                os.getenv("LLM_PROVIDER", "openai"), setting="LLM_PROVIDER"
+            )
             wakeup_model = None
 
         route_profile_name = os.getenv("DELILAH_ROUTE_PROFILE", "").strip()
@@ -14808,7 +14823,9 @@ async def auto_extract_and_persist_claims(prompt_text: str, user_id: str):
     user_msg = f"<untrusted_user_message>\n{prompt_text}\n</untrusted_user_message>"
 
     try:
-        provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        provider = _configured_llm_provider(
+            os.getenv("LLM_PROVIDER", "openai"), setting="LLM_PROVIDER"
+        )
 
         async def _do_extract_claims():
             claims = []
@@ -14997,7 +15014,9 @@ async def _summarize_history_block(block_text: str, uid: str = "system") -> str:
     )
     user_msg = f"Conversation block:\n{block_text}"
     try:
-        provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        provider = _configured_llm_provider(
+            os.getenv("LLM_PROVIDER", "openai"), setting="LLM_PROVIDER"
+        )
 
         async def _do_summarize():
             if provider == "openai":

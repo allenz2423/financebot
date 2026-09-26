@@ -155,7 +155,8 @@ async def classify_with_local_llm(
 
         task_id = f"classify_{uuid.uuid4().hex[:8]}"
         return await schedule_work(
-            task_id, owner_id, "background", _do_classify, unit_type="inference"
+            task_id, owner_id, "background", _do_classify,
+            unit_type="inference", provider="ollama"
         )
     except Exception as exc:
         return [LocalClassification(str(item.get("id") or item.get("transaction_row_id") or ""), None, "error", model=effective_model, error=f"{type(exc).__name__}: {exc}") for item in items]

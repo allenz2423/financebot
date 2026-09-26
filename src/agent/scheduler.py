@@ -16,6 +16,7 @@ import asyncio
 import collections
 import contextlib
 import contextvars
+import math
 from dataclasses import dataclass, field
 import os
 import threading
@@ -61,10 +62,35 @@ class ProviderLimiter:
         """Context manager to acquire provider concurrency slot."""
         return _ProviderSlotContext(self)
 
+    def try_acquire_nowait(self) -> bool:
+        """Atomically reserve a free slot on the current event loop.
+
+        Scheduler admission uses this before claiming a worker so a direct
+        provider caller cannot win a check-then-acquire race. asyncio.Semaphore
+        has no public nonblocking acquire; keep the private counter access
+        isolated here and covered by the provider/scheduler concurrency tests.
+        """
+        semaphore = self._semaphore
+        if semaphore._value <= 0 or self._waiting_count > 0:
+            return False
+        semaphore._value -= 1
+        self._active_count += 1
+        return True
+
+    def use_reserved_slot(self) -> _ProviderSlotContext:
+        """Enter a slot atomically reserved by try_acquire_nowait()."""
+        return _ProviderSlotContext(self, pre_acquired=True)
+
+    def release_reserved_slot(self) -> None:
+        """Release a reservation if cancellation occurs before its context enters."""
+        self._active_count -= 1
+        self._semaphore.release()
+
 
 class _ProviderSlotContext:
-    def __init__(self, limiter: ProviderLimiter) -> None:
+    def __init__(self, limiter: ProviderLimiter, *, pre_acquired: bool = False) -> None:
         self.limiter = limiter
+        self._pre_acquired = pre_acquired
         self._already_held = False
         self._reset_token: contextvars.Token[frozenset[str]] | None = None
 
@@ -74,13 +100,14 @@ class _ProviderSlotContext:
             self._already_held = True
             return self
 
-        self.limiter._waiting_count += 1
-        try:
-            await self.limiter._semaphore.acquire()
-        finally:
-            self.limiter._waiting_count -= 1
+        if not self._pre_acquired:
+            self.limiter._waiting_count += 1
+            try:
+                await self.limiter._semaphore.acquire()
+            finally:
+                self.limiter._waiting_count -= 1
 
-        self.limiter._active_count += 1
+            self.limiter._active_count += 1
         self._reset_token = _HELD_PROVIDER_SLOTS.set(held | {self.limiter.name})
         return self
 
@@ -124,13 +151,30 @@ class ProviderCapacityController:
         key = (provider or "ollama").strip().lower()
         with self._registry_lock:
             if key not in self._limiters:
-                concurrency = (
-                    max_concurrency
+                default = (
+                    int(max_concurrency)
                     if max_concurrency is not None
-                    else int(os.getenv(f"{key.upper()}_CONCURRENCY", str(self.default_concurrency)))
+                    else self.default_concurrency
+                )
+                concurrency = _bounded_env_int(
+                    f"{key.upper()}_CONCURRENCY", default
                 )
                 self._limiters[key] = ProviderLimiter(key, max_concurrency=concurrency)
             return self._limiters[key]
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return privacy-safe provider capacity state without task/owner IDs."""
+        with self._registry_lock:
+            limiters = list(self._limiters.values())
+        return [
+            {
+                "provider": limiter.name,
+                "limit": limiter.max_concurrency,
+                "active": limiter.active_count,
+                "waiting": limiter.waiting_count,
+            }
+            for limiter in sorted(limiters, key=lambda item: item.name)
+        ]
 
 
 def get_provider_limiter(
@@ -166,6 +210,8 @@ class WorkUnit:
     cancellation_requested: bool = False
     context: contextvars.Context = field(default_factory=contextvars.copy_context)
     metadata: dict[str, Any] = field(default_factory=dict)
+    provider_slot_reserved: bool = False
+    provider_blocked_since: float | None = None
     future: asyncio.Future = field(default_factory=_make_default_future)
 
 
@@ -177,6 +223,9 @@ class SchedulerMetrics:
         default_factory=lambda: collections.deque(maxlen=1000)
     )
     inference_times: collections.deque[float] = field(
+        default_factory=lambda: collections.deque(maxlen=1000)
+    )
+    provider_wait_times: collections.deque[float] = field(
         default_factory=lambda: collections.deque(maxlen=1000)
     )
     tool_times: collections.deque[float] = field(
@@ -197,6 +246,9 @@ class SchedulerMetrics:
     def record_inference(self, duration: float) -> None:
         self.inference_times.append(duration)
 
+    def record_provider_wait(self, duration: float) -> None:
+        self.provider_wait_times.append(duration)
+
     def record_tool(self, duration: float) -> None:
         self.tool_times.append(duration)
 
@@ -216,6 +268,35 @@ class SchedulerMetrics:
             "queue_wait": queue_wait,
             "timestamp": time.monotonic(),
         })
+
+    @staticmethod
+    def _latency_summary(samples: Sequence[float]) -> dict[str, float | int]:
+        values = sorted(
+            float(sample) for sample in samples
+            if math.isfinite(float(sample)) and float(sample) >= 0
+        )
+        if not values:
+            return {"count": 0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+
+        def percentile(fraction: float) -> float:
+            index = max(0, math.ceil(fraction * len(values)) - 1)
+            return values[index] * 1000.0
+
+        return {
+            "count": len(values),
+            "p50_ms": round(percentile(0.50), 1),
+            "p95_ms": round(percentile(0.95), 1),
+            "max_ms": round(values[-1] * 1000.0, 1),
+        }
+
+    def latency_snapshot(self) -> dict[str, dict[str, float | int]]:
+        """Summarize bounded rolling latency samples; reveal no owner/task IDs."""
+        return {
+            "queue_wait": self._latency_summary(self.queue_wait_times),
+            "provider_wait": self._latency_summary(self.provider_wait_times),
+            "inference": self._latency_summary(self.inference_times),
+            "tool": self._latency_summary(self.tool_times),
+        }
 
 
 class OwnerQueue:
@@ -387,11 +468,45 @@ class CapacityAwareScheduler:
             owner_queue = self._owners.get(owner_id)
             if (
                 owner_queue is not None
-                and owner_queue.has_ready_work()
+                and self._owner_has_dispatchable_work(owner_queue)
                 and owner_queue.active_task_count < self.max_active_tasks_per_owner
             ):
                 return True
         return False
+
+    def _lane_has_provider_capacity(
+        self, lane: collections.deque[WorkUnit]
+    ) -> bool:
+        """Whether the FIFO head can acquire its provider without blocking a worker."""
+        while lane:
+            unit = lane[0]
+            if not unit.cancellation_requested and not (
+                unit.future is not None and unit.future.cancelled()
+            ):
+                break
+            lane.popleft()
+            self.metrics.record_cancellation()
+            if unit.future is not None and not unit.future.done():
+                unit.future.cancel()
+
+        if not lane:
+            return False
+        unit = lane[0]
+        if not unit.provider:
+            return True
+        limiter = get_provider_limiter(unit.provider)
+        if limiter.name in unit.context.run(_HELD_PROVIDER_SLOTS.get):
+            return True
+        available = limiter.active_count < limiter.max_concurrency
+        if not available and unit.provider_blocked_since is None:
+            unit.provider_blocked_since = time.monotonic()
+        return available
+
+    def _owner_has_dispatchable_work(self, owner_queue: OwnerQueue) -> bool:
+        return (
+            self._lane_has_provider_capacity(owner_queue.interactive_lane)
+            or self._lane_has_provider_capacity(owner_queue.background_lane)
+        )
 
     def _select_next_unit(self) -> tuple[WorkUnit, OwnerQueue] | None:
         """Select the next work unit per fair owner rotation and lane rules.
@@ -415,8 +530,15 @@ class CapacityAwareScheduler:
                 # they will re-enter at the back of rotation.
                 continue
 
-            has_i = len(owner_queue.interactive_lane) > 0
-            has_b = len(owner_queue.background_lane) > 0
+            has_i = self._lane_has_provider_capacity(owner_queue.interactive_lane)
+            has_b = self._lane_has_provider_capacity(owner_queue.background_lane)
+            if not has_i and not has_b:
+                # Keep provider-saturated work in the fair rotation. It remains
+                # queued, consumes no worker, and becomes eligible when capacity
+                # is released (the worker loop performs a bounded recheck).
+                if owner_queue.has_ready_work() and owner_id not in self._owner_rotation:
+                    self._owner_rotation.append(owner_id)
+                continue
 
             selected_lane: Literal["interactive", "background"]
             if has_i and has_b:
@@ -460,7 +582,27 @@ class CapacityAwareScheduler:
                     self._owner_rotation.append(owner_id)
                 continue
 
-            # Record dispatch state
+            if unit.provider:
+                limiter = get_provider_limiter(unit.provider)
+                already_held = limiter.name in unit.context.run(_HELD_PROVIDER_SLOTS.get)
+                if not already_held and not limiter.try_acquire_nowait():
+                    # An external provider caller won the race after our
+                    # availability check. Put this unit back at the lane head
+                    # and let a different provider/owner use the worker.
+                    if unit.provider_blocked_since is None:
+                        unit.provider_blocked_since = time.monotonic()
+                    target_queue.appendleft(unit)
+                    if owner_id not in self._owner_rotation:
+                        self._owner_rotation.append(owner_id)
+                    continue
+                unit.provider_slot_reserved = not already_held
+                if unit.provider_slot_reserved and unit.provider_blocked_since is not None:
+                    self.metrics.record_provider_wait(
+                        time.monotonic() - unit.provider_blocked_since
+                    )
+                    unit.provider_blocked_since = None
+
+            # Record dispatch state only after all provider capacity is owned.
             owner_queue.last_dispatched_at[selected_lane] = now
             owner_queue.active_task_count += 1
             self._active_workers += 1
@@ -494,21 +636,32 @@ class CapacityAwareScheduler:
 
             # Non-preemptive execution under provider semaphore when provider is specified.
             # Running inside unit.context via asyncio.create_task propagates contextvars across worker tasks.
-            start_time = time.monotonic()
             try:
+                async def _call_and_measure() -> Any:
+                    started_at = time.monotonic()
+                    try:
+                        result = unit.fn()
+                        if asyncio.iscoroutine(result):
+                            return await result
+                        return result
+                    finally:
+                        duration = time.monotonic() - started_at
+                        if unit.unit_type == "inference":
+                            self.metrics.record_inference(duration)
+                        elif unit.unit_type == "tool_step":
+                            self.metrics.record_tool(duration)
+
                 async def _run_work() -> Any:
                     limiter = get_provider_limiter(unit.provider) if unit.provider else None
                     if limiter:
-                        async with limiter.acquire():
-                            res = unit.fn()
-                            if asyncio.iscoroutine(res):
-                                return await res
-                            return res
-                    else:
-                        res = unit.fn()
-                        if asyncio.iscoroutine(res):
-                            return await res
-                        return res
+                        if unit.provider_slot_reserved:
+                            slot_context = limiter.use_reserved_slot()
+                        else:
+                            slot_context = limiter.acquire()
+                        async with slot_context:
+                            unit.provider_slot_reserved = False
+                            return await _call_and_measure()
+                    return await _call_and_measure()
 
                 work_task = asyncio.create_task(_run_work(), context=unit.context)
                 try:
@@ -521,12 +674,6 @@ class CapacityAwareScheduler:
                         pass
                     raise
 
-                duration = time.monotonic() - start_time
-                if unit.unit_type == "inference":
-                    self.metrics.record_inference(duration)
-                elif unit.unit_type == "tool_step":
-                    self.metrics.record_tool(duration)
-
                 if not unit.future.done():
                     unit.future.set_result(result)
             except asyncio.CancelledError:
@@ -535,14 +682,12 @@ class CapacityAwareScheduler:
                     unit.future.cancel()
                 raise
             except Exception as exc:
-                duration = time.monotonic() - start_time
-                if unit.unit_type == "inference":
-                    self.metrics.record_inference(duration)
-                elif unit.unit_type == "tool_step":
-                    self.metrics.record_tool(duration)
                 if not unit.future.done():
                     unit.future.set_exception(exc)
         finally:
+            if unit.provider_slot_reserved and unit.provider:
+                get_provider_limiter(unit.provider).release_reserved_slot()
+                unit.provider_slot_reserved = False
             async with self._condition:
                 self._active_workers -= 1
                 owner_queue.active_task_count -= 1
@@ -557,7 +702,14 @@ class CapacityAwareScheduler:
         while self._running:
             async with self._condition:
                 while self._running and not self._has_ready_work_unlocked():
-                    await self._condition.wait()
+                    try:
+                        # Provider slots can be released by direct provider
+                        # callers that do not own this scheduler condition.
+                        # A bounded recheck prevents their queued work from
+                        # sleeping forever without tying up a scheduler worker.
+                        await asyncio.wait_for(self._condition.wait(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        pass
                 if not self._running:
                     break
 
@@ -592,6 +744,30 @@ class CapacityAwareScheduler:
 
     def get_metrics(self) -> SchedulerMetrics:
         return self.metrics
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return bounded operator diagnostics without tenant identifiers."""
+        queued_interactive = sum(len(q.interactive_lane) for q in self._owners.values())
+        queued_background = sum(len(q.background_lane) for q in self._owners.values())
+        return {
+            "limits": {
+                "workers": self.max_workers,
+                "active_tasks_per_owner": self.max_active_tasks_per_owner,
+                "queue_per_owner_per_lane": self.max_queue_per_owner,
+                "providers": ProviderCapacityController.get_instance().snapshot(),
+            },
+            "activity": {
+                "active_workers": self._active_workers,
+                "queued_interactive": queued_interactive,
+                "queued_background": queued_background,
+                "owners_with_queued_work": sum(
+                    1 for q in self._owners.values() if q.has_ready_work()
+                ),
+                "cancellations_since_start": self.metrics.cancellations_count,
+                "dispatches_by_lane_since_start": dict(self.metrics.dispatches_by_lane),
+            },
+            "latency_rolling_last_1000": self.metrics.latency_snapshot(),
+        }
 
 
 _GLOBAL_SCHEDULER: CapacityAwareScheduler | None = None
