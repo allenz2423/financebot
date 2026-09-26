@@ -968,6 +968,13 @@ class TaskController:
         task = self.store.get_task(user_id, task_id)
         if task["status"] in {"succeeded", "partial", "failed", "cancelled"}:
             return task
+
+        # Cascade cancellation to any active child tasks
+        child_tasks = self.store.get_child_tasks(user_id, task_id)
+        for child in child_tasks:
+            if child["status"] not in {"succeeded", "partial", "failed", "cancelled"}:
+                self.cancel(user_id, child["task_id"])
+
         return self.store.transition_task_run(
             user_id, task_id, expected_status=task["status"],
             expected_version=int(task["version"]), new_status="cancelled",

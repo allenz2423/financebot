@@ -1549,6 +1549,19 @@ class SessionStore:
                 ]
             return result
 
+    def get_child_tasks(self, user_id: str, parent_task_id: str) -> list[dict[str, Any]]:
+        owner = _required(user_id, "user_id")
+        parent_key = _required(parent_task_id, "parent_task_id")
+        with self._lock:
+            rows = self.connection.execute(
+                """SELECT t.*, s.session_key, s.channel_id, s.thread_id
+                   FROM task_runs t JOIN sessions s ON s.id=t.session_id
+                   WHERE t.parent_task_id=? AND t.user_id=? AND s.user_id=?
+                   ORDER BY t.created_at ASC""",
+                (parent_key, owner, owner),
+            ).fetchall()
+            return [self._row(r) for r in rows]
+
     def list_assistant_tool_call_blocks(
         self, user_id: str, task_id: str, *, limit: int = 500
     ) -> list[dict[str, Any]]:
