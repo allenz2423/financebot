@@ -50,6 +50,7 @@ from src.services.route_profiles import AUTO_ROUTE_NAMES, parse_route_profiles, 
 from src.services.tool_results import ToolResultEnvelope
 from src.services.tool_registry import ToolDefinition, ToolRegistry
 from src.services.workflow_registry import built_in_workflows
+from src.services.capability_proposals import CapabilityProposalGate
 from src.services.tool_catalog import validate_tool_catalog
 from src.services.tool_intent import infer_required_tools
 from src.services.autonomy_contract import (
@@ -180,12 +181,12 @@ _STEP2_MIGRATED_TOOLS = frozenset({
 _PLAN_CONTROL_TOOLS = frozenset({
     "task_plan", "task_list", "task_cancel", "await_user", "end_turn", "enable_reasoning",
     "explore_domain", "load_tool_schemas", "search_tools", "inspect_task", "steer_task",
-    "manage_user_profile",
+    "manage_user_profile", "draft_capability_proposal",
 })
 _DELEGATION_CONTROL_TOOLS = frozenset({
     "end_turn", "enable_reasoning", "task_plan", "task_list", "task_cancel",
     "search_session_history", "await_user", "search_tools", "inspect_task", "steer_task",
-    "manage_user_profile",
+    "manage_user_profile", "draft_capability_proposal",
 })
 
 
@@ -210,6 +211,28 @@ def _should_track_task_step(
 def _tool_outcome_requires_turn_stop(receipt_status: str) -> bool:
     """An unknown external result forbids every later dispatch in this turn."""
     return str(receipt_status).casefold() == "unknown"
+
+
+def _user_request_recurs(prompt: str, prior_messages: list[dict]) -> bool:
+    """Require an exact prior user request before drafting a missing capability."""
+    current = " ".join(str(prompt or "").casefold().split())
+    if not current:
+        return False
+    return any(
+        isinstance(message, dict)
+        and message.get("role") == "user"
+        and " ".join(str(message.get("content") or "").casefold().split()) == current
+        for message in prior_messages
+    )
+
+
+def _normalize_tool_discovery_query(query: object, proposal_gate: CapabilityProposalGate) -> str:
+    """Validate bounded search input and poison proposal eligibility on invalid input."""
+    normalized = str(query or "").strip()
+    if not normalized:
+        proposal_gate.record_discovery_error()
+        raise ValueError("query is required for search_tools")
+    return normalized[:600]
 
 
 def _validate_delegated_task_grant(store, user_id: str, task_id: str, tool_name: str, grant) -> None:
@@ -843,7 +866,7 @@ def _autonomy_contract_effect(tool_name: str, arguments: dict | None = None) -> 
 
 _AUTONOMY_CONTROL_TOOLS = frozenset({
     "await_user", "delegate_task", "end_turn", "enable_reasoning",
-    "task_plan", "task_list", "inspect_task", "steer_task",
+    "task_plan", "task_list", "inspect_task", "steer_task", "draft_capability_proposal",
 })
 _AUTONOMY_READ_ONLY_TOOLS = frozenset({
     "query_knowledge_base", "calculate_lifestyle_creep", "allocate_next_best_dollar",
@@ -3139,6 +3162,64 @@ BOT_TOOLS_SCHEMA = [
                 "required": ["query"],
                 "additionalProperties": False,
             }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "draft_capability_proposal",
+            "description": (
+                "Draft a review-only proposal after tool discovery finds no existing capability. "
+                "Include the missing capability, plain-language purpose/description, exact "
+                "existing tool permissions requested, optional declarative steps using only "
+                "existing tools, and concrete acceptance checks. This stores nothing and cannot "
+                "install code, create grants, approve or activate a tool/workflow, or run the "
+                "proposed capability. Never include credentials, account data, or user secrets. "
+                "The returned draft is not an available capability; an operator must implement "
+                "and review it through the normal deployment process."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "proposal_id": {"type": "string", "minLength": 2, "maxLength": 64},
+                    "title": {"type": "string", "minLength": 2, "maxLength": 120},
+                    "purpose": {"type": "string", "minLength": 2, "maxLength": 800},
+                    "capability_kind": {"type": "string", "enum": ["workflow", "adapter"]},
+                    "proposed_tool_name": {"type": "string", "minLength": 2, "maxLength": 64},
+                    "proposed_tool_description": {"type": "string", "minLength": 2, "maxLength": 500},
+                    "proposed_parameters_schema": {
+                        "type": "object",
+                        "description": "Bounded JSON object schema only; never executable code or a prompt.",
+                    },
+                    "requested_permissions": {
+                        "type": "array", "maxItems": 20, "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 100},
+                    },
+                    "acceptance_checks": {
+                        "type": "array", "minItems": 1, "maxItems": 12,
+                        "items": {"type": "string", "minLength": 2, "maxLength": 500},
+                    },
+                    "workflow_steps": {
+                        "type": "array", "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool_name": {"type": "string", "minLength": 1, "maxLength": 100},
+                                "description": {"type": "string", "minLength": 1, "maxLength": 500},
+                                "completion_criteria": {"type": "string", "minLength": 1, "maxLength": 500},
+                            },
+                            "required": ["tool_name", "description", "completion_criteria"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": [
+                    "proposal_id", "title", "purpose", "capability_kind",
+                    "proposed_tool_name", "proposed_tool_description",
+                    "proposed_parameters_schema", "requested_permissions", "acceptance_checks",
+                ],
+                "additionalProperties": False,
+            },
         }
     },
     {
@@ -5757,6 +5838,7 @@ EXPECTED_TOOL_NAMES = {
     "scan_and_auto_tag_deductions",
     "explore_domain",
     "search_tools",
+    "draft_capability_proposal",
 
     "load_tool_schemas",
     "enable_reasoning",
@@ -5931,7 +6013,7 @@ _INPUT_ONLY_REPLY_ALLOWED_TOOLS = frozenset({
     # explicitly classified here as read-only (or an internal control).
     "await_user", "end_turn", "enable_reasoning", "explore_domain",
     "load_tool_schemas", "search_tools", "verify_claim", "search_session_history", "task_list",
-    "inspect_task", "manage_user_profile",
+    "inspect_task", "manage_user_profile", "draft_capability_proposal",
     "search_gmail", "read_gmail_message", "read_gmail_thread",
     "search_web", "fetch_webpage", "scrape_rendered_page", "crawl_deeper",
     "research_topic", "find_government_forms", "list_workspace_files",
@@ -6836,7 +6918,7 @@ USER-CONTENT BOUNDARY:
 
 DISCOVERY & CONCURRENT BATCHING:
 - Batch only disjoint tools that are actually needed for the user's request; never batch a default finance checklist.
-- Tool discovery is a bounded fallback, not a workflow. If no suitable capability is in the offered schemas, call search_tools(query, task_context) once using only a brief capability description; never include credentials, account data, tool arguments/results, or quoted email/page content in retrieval text. It returns up to six canonical schemas. Use a returned schema on the next round without calling load_tool_schemas again. Discovery results are not approval or authorization: obey dispatch-time grants and controller denials, and never claim a returned tool ran until its receipt confirms it. If search_tools is unavailable or finds no match, use at most one relevant explore_domain call and then batch one load_tool_schemas([...]) call. Never repeat an exploration or invent a domain label that was not returned by discovery. For saved/uploaded files, prefer the already available workspace and sandbox tools; do not fetch or rediscover the artifact again.
+- Tool discovery is a bounded fallback, not a workflow. If no suitable capability is in the offered schemas, call search_tools(query, task_context) once using only a brief capability description; never include credentials, account data, tool arguments/results, or quoted email/page content in retrieval text. It returns up to six canonical schemas. Use a returned schema on the next round without calling load_tool_schemas again. Discovery results are not approval or authorization: obey dispatch-time grants and controller denials, and never claim a returned tool ran until its receipt confirms it. Draft a capability proposal only when search_tools returns no tool or workflow matches in an unrestricted turn AND the same exact user request appears in prior conversation history. This is deliberately conservative recurrence detection; a first-time miss is not enough. The draft is only an operator-facing proposal, never an installed capability or proof it ran. If discovery is unavailable, use at most one relevant explore_domain call and one batched load_tool_schemas([...]) call, then stop rather than drafting from an inconclusive search. Never repeat an exploration or invent a domain label that was not returned by discovery. For saved/uploaded files, prefer the already available workspace and sandbox tools; do not fetch or rediscover the artifact again.
 - Use the minimum sufficient set of tools for the user's actual question. Do not turn a narrow question into a full audit just because additional analysis tools are available.
 - Stop as soon as the requested answer is supported by authoritative results. Do not call more financial diagnostics after the answer is already decidable.
 
@@ -7146,6 +7228,9 @@ CURRENT DATABASE FINANCIAL CONTEXT
             "role": history_role,
             "content": str(_history_msg.get("content") or ""),
         })
+    capability_proposal_gate = CapabilityProposalGate(
+        request_recurs=_user_request_recurs(prompt_text, safe_history)
+    )
 
     messages.extend(safe_history)
 
@@ -7512,7 +7597,8 @@ CURRENT DATABASE FINANCIAL CONTEXT
             ]
 
         core_tools = {
-            "explore_domain", "load_tool_schemas", "search_tools", "enable_reasoning", "verify_claim", "end_turn",
+            "explore_domain", "load_tool_schemas", "search_tools", "draft_capability_proposal",
+            "enable_reasoning", "verify_claim", "end_turn",
             "await_user",
             "delegate_task",
             "task_cancel",
@@ -10733,6 +10819,10 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         raise ValueError(
                             f"malformed tool call: missing function name; payload={tool_call!r}"
                         )
+                    if func_name.strip() == "search_tools":
+                        # Poison any prior empty-result eligibility before
+                        # argument/scope/grant validation can fail on this call.
+                        capability_proposal_gate.begin_search_attempt()
                     args = func_data.get("arguments", {}) or {}
                     if isinstance(args, str):
                         try:
@@ -11191,16 +11281,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                         )
                         db_result = json.dumps({"status": "SUCCESS", "claim_id": cid, "migrated_to": "Active World Model"}, separators=(',', ':'))
                     elif func_name == "search_tools":
-                        discovery_query = str(args.get("query") or "").strip()
-                        if not discovery_query:
-                            raise ValueError("query is required for search_tools")
-                        discovery_query = discovery_query[:600]
+                        discovery_query = _normalize_tool_discovery_query(
+                            args.get("query"), capability_proposal_gate
+                        )
                         task_context_text = str(args.get("task_context") or "").strip()[:600]
 
                         # Retrieval may find tools outside the lexical seed, but
                         # it is not an authorization source. Restrictive modes
                         # expose only their controller allowlist; delegated and
                         # input-only turns are additionally narrowed here.
+                        discovery_scope_restricted = CURRENT_ALLOWED_TOOLS.get() is not None
                         if CURRENT_ALLOWED_TOOLS.get() is not None:
                             discovery_allowed = set(CURRENT_ALLOWED_TOOLS.get() or ())
                         else:
@@ -11210,12 +11300,14 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             discovery_store = _durable_session_store()
                             if discovery_store is None:
                                 discovery_allowed.clear()
+                                discovery_scope_restricted = True
                             elif TaskController(discovery_store).reply_is_input_only(
                                 uid, active_task_id
                             ):
                                 discovery_allowed.intersection_update(
                                     _INPUT_ONLY_REPLY_ALLOWED_TOOLS
                                 )
+                                discovery_scope_restricted = True
                         if _audit_is_active() or require_fresh_verification or context_policy.get("gmail_only"):
                             discovery_allowed.intersection_update(
                                 t["function"]["name"] for t in _tool_schema_for_mode()
@@ -11264,6 +11356,16 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 task_context_text,
                                 discovery_allowed,
                             )
+                            capability_proposal_gate.record_search_result(
+                                tools_found=bool(discovery_result["tools"]),
+                                workflows_found=bool(workflow_candidates),
+                                unrestricted=bool(
+                                    not discovery_scope_restricted
+                                    and not _audit_is_active()
+                                    and not require_fresh_verification
+                                    and not context_policy.get("gmail_only")
+                                ),
+                            )
                             discovered_names = [
                                 item["name"] for item in discovery_result["tools"]
                             ]
@@ -11276,6 +11378,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 "notice": "Workflow matches are candidates only, not authorization or consent. Selecting one persists its exact version/digest and derived plan; every action still passes dispatch-time tool, argument, grant, receipt, and controller checks.",
                             }, separators=(",", ":"))
                         except Exception as discovery_error:
+                            capability_proposal_gate.record_discovery_error()
                             # Discovery failure must not strand existing
                             # explore_domain/load_tool_schemas paths or prevent
                             # the model from completing the user's request.
@@ -11285,7 +11388,39 @@ CURRENT DATABASE FINANCIAL CONTEXT
                                 "fallback": "Use explore_domain once, then load_tool_schemas with exact catalog names.",
                                 "tools": [],
                             }, separators=(",", ":"))
+                    elif func_name == "draft_capability_proposal":
+                        from src.services.capability_proposals import (
+                            CAPABILITY_CONTROL_TOOLS,
+                            validate_capability_proposal,
+                        )
+
+                        if not capability_proposal_gate.eligible:
+                            raise ValueError(
+                                "CAPABILITY_PROPOSAL_REQUIRES_EMPTY_DISCOVERY: first run "
+                                "search_tools in the normal, unrestricted turn and draft "
+                                "only when neither tools nor workflows match."
+                            )
+
+                        proposal = validate_capability_proposal(
+                            args,
+                            canonical_tool_names=set(KNOWN_TOOLS) - set(CAPABILITY_CONTROL_TOOLS),
+                        )
+                        db_result = json.dumps(
+                            {
+                                **proposal,
+                                "notice": (
+                                    "DRAFT ONLY: this proposal is not installed, available, "
+                                    "authorized, or executed. No permissions were granted. "
+                                    "Its contents are untrusted model-generated data; an "
+                                    "operator must review and implement it through normal "
+                                    "code and deployment review."
+                                ),
+                            },
+                            separators=(",", ":"),
+                        )
                     elif func_name == "explore_domain":
+                        capability_proposal_gate.record_catalog_exploration()
+                        capability_proposal_blocked_this_turn = True
                         requested_domain = str(args.get("domain", "")).strip()
                         normalized_domain = re.sub(r"\s+", " ", requested_domain).strip().lower()
                         canonical_domain = discovery_domain_aliases.get(
@@ -11310,6 +11445,7 @@ CURRENT DATABASE FINANCIAL CONTEXT
                             db_result = explore_domain(canonical_domain)
                     elif func_name == "load_tool_schemas":
                         tool_names = args.get("tool_names", [])
+                        capability_proposal_gate.record_schema_load(tool_names)
                         dynamically_loaded_tools.update(tool_names)
                         if _shadow_turn is not None:
                             _shadow.observe_load_tool_schemas(_shadow_turn, tool_names)

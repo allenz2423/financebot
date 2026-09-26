@@ -110,6 +110,136 @@ def test_inspect_and_steer_tools_are_bounded_control_tools():
     assert "never dispatches or retries" in steer_schema["description"]
 
 
+def test_capability_proposal_is_draft_only_and_never_authorizes_execution():
+    import src.services.llm as llm
+    from src.services.capability_proposals import CAPABILITY_CONTROL_TOOLS, CapabilityProposalGate
+
+    name = "draft_capability_proposal"
+    assert name in llm.KNOWN_TOOLS
+    assert name in llm.EXPECTED_TOOL_NAMES
+    assert name in llm._PLAN_CONTROL_TOOLS
+    assert name in llm._AUTONOMY_CONTROL_TOOLS
+    assert name in llm._INPUT_ONLY_REPLY_ALLOWED_TOOLS
+    assert name not in llm.MUTATION_TOOLS
+    assert not llm._tool_requires_durable_plan(name)
+    schema = next(
+        item["function"] for item in llm.BOT_TOOLS_SCHEMA
+        if item["function"]["name"] == name
+    )
+    assert schema["parameters"]["additionalProperties"] is False
+    assert schema["parameters"]["properties"]["acceptance_checks"]["minItems"] == 1
+    properties = schema["parameters"]["properties"]
+    assert properties["proposal_id"]["maxLength"] == 64
+    assert properties["title"]["maxLength"] == 120
+    assert properties["purpose"]["maxLength"] == 800
+    assert properties["proposed_tool_description"]["maxLength"] == 500
+    assert properties["requested_permissions"]["maxItems"] == 20
+    assert properties["workflow_steps"]["maxItems"] == 20
+    assert "cannot" in schema["description"] and "activate" in schema["description"]
+    assert llm._autonomy_contract_effect(name, {}) == "read"
+    assert not llm._user_request_recurs("Find vendor status", [])
+    assert llm._user_request_recurs(
+        " Find   vendor status ",
+        [{"role": "user", "content": "find vendor status"}],
+    )
+    assert not llm._user_request_recurs(
+        "Find vendor status",
+        [{"role": "assistant", "content": "Find vendor status"}],
+    )
+    assert (
+        llm._PLAN_CONTROL_TOOLS
+        | llm._AUTONOMY_CONTROL_TOOLS
+        | llm._DELEGATION_CONTROL_TOOLS
+    ) <= CAPABILITY_CONTROL_TOOLS
+
+    gate = CapabilityProposalGate(request_recurs=True)
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert gate.eligible
+    gate.record_catalog_exploration()
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert not gate.eligible
+    gate = CapabilityProposalGate(request_recurs=True)
+    gate.begin_search_attempt()
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert gate.eligible
+    gate.begin_search_attempt()  # Any later pre-dispatch denial invalidates the old miss.
+    assert not gate.eligible
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert not gate.eligible
+
+    for interrupt in (
+        lambda current: current.record_discovery_error(),
+        lambda current: current.record_schema_load([]),
+    ):
+        gate = CapabilityProposalGate(request_recurs=True)
+        gate.record_search_result(
+            tools_found=False, workflows_found=False, unrestricted=True
+        )
+        interrupt(gate)
+        gate.record_search_result(
+            tools_found=False, workflows_found=False, unrestricted=True
+        )
+        assert not gate.eligible
+
+    gate = CapabilityProposalGate(request_recurs=True)
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    gate.record_schema_load(["search_gmail"])
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert not gate.eligible
+
+    for constraints in (
+        {"tools_found": True}, {"workflows_found": True}, {"unrestricted": False},
+    ):
+        gate = CapabilityProposalGate(request_recurs=True)
+        gate.record_search_result(
+            tools_found=constraints.get("tools_found", False),
+            workflows_found=constraints.get("workflows_found", False),
+            unrestricted=constraints.get("unrestricted", True),
+        )
+        assert not gate.eligible
+
+    gate = CapabilityProposalGate(request_recurs=True)
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=False
+    )
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert not gate.eligible
+
+    gate = CapabilityProposalGate(request_recurs=False)
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert not gate.eligible
+
+    gate = CapabilityProposalGate(request_recurs=True)
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    with pytest.raises(ValueError, match="query is required"):
+        llm._normalize_tool_discovery_query("   ", gate)
+    gate.record_search_result(
+        tools_found=False, workflows_found=False, unrestricted=True
+    )
+    assert not gate.eligible
+
+
 def test_task_plan_is_bounded_and_multi_action_policy_is_deterministic():
     import src.services.llm as llm
 
